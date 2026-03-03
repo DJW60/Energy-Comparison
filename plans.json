@@ -1,0 +1,301 @@
+[
+  {
+    "name": "Alinta Energy Home Deal",
+    "supply_cents_per_day": 117.007,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 15.323,
+    "feed_in_flat_cents_per_kwh": 4.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 24.706,
+          "days": "all",
+          "start": "00:00",
+          "end": "07:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 28.952,
+          "days": "wkday",
+          "start": "07:00",
+          "end": "16:00"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 38.445,
+          "days": "wkday",
+          "start": "16:00",
+          "end": "20:00"
+        },
+        {
+          "name": "off peak",
+          "cents_per_kwh": 24.706,
+          "days": "all",
+          "start": "22:00",
+          "end": "00:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 28.952,
+          "days": "wkend",
+          "start": "07:00",
+          "end": "22:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 28.952,
+          "days": "wkday",
+          "start": "20:00",
+          "end": "22:00"
+        }
+      ]
+    },
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Energy Australia",
+    "supply_cents_per_day": 141.46,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 18.57,
+    "feed_in_flat_cents_per_kwh": 4.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": {
+      "cents_per_kwh": 35.36
+    },
+    "tou": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Globird Energy",
+    "supply_cents_per_day": 126.5,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 15.95,
+    "feed_in_flat_cents_per_kwh": 3.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 23.1,
+          "days": "all",
+          "start": "09:00",
+          "end": "16:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 23.1,
+          "days": "all",
+          "start": "21:00",
+          "end": "23:59"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 39.6,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 23.1,
+          "days": "all",
+          "start": "00:00",
+          "end": "09:00"
+        }
+      ]
+    },
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Alinta Solar Bal Max",
+    "supply_cents_per_day": 135.333,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 17.721,
+    "feed_in_flat_cents_per_kwh": 0.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 28.578,
+          "days": "all",
+          "start": "00:00",
+          "end": "07:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 33.484,
+          "days": "wkday",
+          "start": "07:00",
+          "end": "16:00"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 44.473,
+          "days": "wkday",
+          "start": "16:00",
+          "end": "20:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 33.484,
+          "days": "wkday",
+          "start": "20:00",
+          "end": "22:00"
+        },
+        {
+          "name": "off peak",
+          "cents_per_kwh": 28.578,
+          "days": "all",
+          "start": "22:00",
+          "end": "00:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 33.484,
+          "days": "wkend",
+          "start": "07:00",
+          "end": "22:00"
+        }
+      ]
+    },
+    "feed_in_tiered": {
+      "high_rate_cents": 10.0,
+      "high_kwh_per_day": 10.0,
+      "low_rate_cents": 4.0
+    },
+    "feed_in_tou": null
+  },
+  {
+    "name": "Alinta Single Rate + CL",
+    "supply_cents_per_day": 129.35,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 15.32,
+    "feed_in_flat_cents_per_kwh": 4.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": {
+      "cents_per_kwh": 28.39
+    },
+    "tou": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Origin Boost",
+    "supply_cents_per_day": 142.868,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 3.971,
+    "controlled_cents_per_kwh": 17.765,
+    "feed_in_flat_cents_per_kwh": 0.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": {
+      "cents_per_kwh": 35.244
+    },
+    "tou": null,
+    "feed_in_tiered": {
+      "high_rate_cents": 10.0,
+      "high_kwh_per_day": 10.0,
+      "low_rate_cents": 3.0
+    },
+    "feed_in_tou": null
+  },
+  {
+    "name": "AGL Ned",
+    "supply_cents_per_day": 86.0,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 0.0,
+    "feed_in_flat_cents_per_kwh": 5.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": {
+      "cents_per_kwh": 26.0
+    },
+    "tou": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Origin Battery Maximiser",
+    "supply_cents_per_day": 146.85,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 3.97,
+    "controlled_cents_per_kwh": 17.78,
+    "feed_in_flat_cents_per_kwh": 7.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 18.7,
+          "days": "all",
+          "start": "21:00",
+          "end": "00:00"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 34.1,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        },
+        {
+          "name": "off peak",
+          "cents_per_kwh": 18.7,
+          "days": "all",
+          "start": "00:00",
+          "end": "16:00"
+        }
+      ]
+    },
+    "feed_in_tiered": null,
+    "feed_in_tou": {
+      "bands": [
+        {
+          "name": "bonus night",
+          "cents_per_kwh": 22.0,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        }
+      ]
+    }
+  },
+  {
+    "name": "Origin Go Variable (Sign on bonus)",
+    "supply_cents_per_day": 135.73,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 3.78,
+    "controlled_cents_per_kwh": 16.88,
+    "feed_in_flat_cents_per_kwh": 3.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 20000.0,
+    "flat": {
+      "cents_per_kwh": 33.49
+    },
+    "tou": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  }
+]
