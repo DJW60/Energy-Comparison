@@ -14,6 +14,8 @@
 #   pip install streamlit pandas
 #   python -m streamlit run app.py
 
+from __future__ import annotations
+
 import csv
 import datetime as dt
 import json
@@ -329,6 +331,12 @@ def _norm_time_str(s: str) -> str:
 # ---------------------------
 BASE_DIR = Path(__file__).parent
 PLANS_FILE = BASE_DIR / "plans.json"
+LAST_PLANS_LOAD_STATUS = {
+    "source": "defaults",
+    "reason": "not_loaded",
+    "count": 0,
+    "skipped": 0,
+}
 
 
 # ---------------------------
@@ -340,6 +348,9 @@ def read_nem12_5min(uploaded_file) -> pd.DataFrame:
     Returns tidy dataframe: register, timestamp, kwh
     Assumes 5-minute intervals => 288 values on each 300 line (common in NEM12).
     """
+    if uploaded_file is None:
+        return pd.DataFrame(columns=["register", "timestamp", "kwh"])
+
     rows = []
     current_register = None
 
@@ -622,7 +633,15 @@ def load_plans(defaults: list[Plan]) -> list[Plan]:
     - If JSON is invalid, keep the broken file as a timestamped .broken copy and fall back to defaults.
     - If duplicate plan names exist, keep the first and rename later duplicates with ' (2)', ' (3)', ... so nothing disappears.
     """
+    global LAST_PLANS_LOAD_STATUS
+
     if not PLANS_FILE.exists():
+        LAST_PLANS_LOAD_STATUS = {
+            "source": "defaults",
+            "reason": "missing_file",
+            "count": len(defaults),
+            "skipped": 0,
+        }
         return defaults
 
     raw = PLANS_FILE.read_text(encoding="utf-8")
@@ -639,15 +658,23 @@ def load_plans(defaults: list[Plan]) -> list[Plan]:
             broken.write_text(raw, encoding="utf-8")
         except Exception:
             pass
+        LAST_PLANS_LOAD_STATUS = {
+            "source": "defaults",
+            "reason": "invalid_json",
+            "count": len(defaults),
+            "skipped": 0,
+        }
         return defaults
 
     plans: list[Plan] = []
     name_counts: dict[str, int] = {}
+    skipped = 0
 
     for item in data:
         try:
             p = _dict_to_plan(item)
         except Exception:
+            skipped += 1
             continue
 
         base = (p.name or "").strip()
@@ -664,7 +691,22 @@ def load_plans(defaults: list[Plan]) -> list[Plan]:
 
         plans.append(p)
 
-    return plans if plans else defaults
+    if plans:
+        LAST_PLANS_LOAD_STATUS = {
+            "source": "file",
+            "reason": "ok",
+            "count": len(plans),
+            "skipped": skipped,
+        }
+        return plans
+
+    LAST_PLANS_LOAD_STATUS = {
+        "source": "defaults",
+        "reason": "no_valid_plans",
+        "count": len(defaults),
+        "skipped": skipped,
+    }
+    return defaults
 
 
 
@@ -2217,6 +2259,16 @@ def render_help_and_glossary() -> None:
             "- `Plan Library`: Create, duplicate, edit, export, and import plans."
         )
 
+    with st.expander("Operational rules (Plan Library on Streamlit Cloud)", expanded=False):
+        st.markdown(
+            "1. **Shared app library**: Plan Library changes are app-level on the running instance, not per-user accounts.\n"
+            "2. **Non-durable storage**: Streamlit Cloud local files can reset on reboot/redeploy.\n"
+            "3. **Default startup source**: If repo `plans.json` is missing/invalid, app starts with built-in defaults.\n"
+            "4. **Best practice for users**: After edits, use `Download plans.json` as personal backup.\n"
+            "5. **Restore workflow**: Use `Upload plans.json to replace library` to restore full plan sets.\n"
+            "6. **Admin rule**: Keep the canonical `plans.json` committed to GitHub `main` for stable startup."
+        )
+
     with st.expander("Glossary", expanded=False):
         st.markdown(
             "- `NEM12`: Australian interval metering format used for consumption/export data.\n"
@@ -2324,6 +2376,19 @@ if not plans:
 plans_lib = plans
 
 st.caption(f"Plans file: {PLANS_FILE}")
+st.caption(f"Plans loaded: {len(plans)}")
+if LAST_PLANS_LOAD_STATUS.get("source") != "file":
+    reason = str(LAST_PLANS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
+    st.warning(
+        "Using built-in default plans only. "
+        f"Reason: {reason}. "
+        "Add `plans.json` to your GitHub repo or import it in Plan Library."
+    )
+elif int(LAST_PLANS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
+    st.info(
+        f"Loaded {LAST_PLANS_LOAD_STATUS.get('count', len(plans))} plans from file; "
+        f"skipped {LAST_PLANS_LOAD_STATUS.get('skipped', 0)} invalid entries."
+    )
 
 
 # ---------------------------
