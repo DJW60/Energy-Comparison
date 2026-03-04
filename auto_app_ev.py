@@ -333,6 +333,7 @@ def _norm_time_str(s: str) -> str:
 BASE_DIR = Path(__file__).parent
 PLANS_FILE = BASE_DIR / "plans.json"
 BATTERY_ASSUMPTIONS_FILE = BASE_DIR / "battery_assumptions.json"
+PLAN_ADDONS_FILE = BASE_DIR / "plan_addons.json"
 LAST_PLANS_LOAD_STATUS = {
     "source": "defaults",
     "reason": "not_loaded",
@@ -340,6 +341,12 @@ LAST_PLANS_LOAD_STATUS = {
     "skipped": 0,
 }
 LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS = {
+    "source": "defaults",
+    "reason": "not_loaded",
+    "count": 0,
+    "skipped": 0,
+}
+LAST_PLAN_ADDONS_LOAD_STATUS = {
     "source": "defaults",
     "reason": "not_loaded",
     "count": 0,
@@ -371,6 +378,79 @@ DEFAULT_BATTERY_ASSUMPTIONS_CONFIG = {
             "notes": "Optimistic assumption for strong cycling warranties.",
         },
     ],
+}
+
+DEFAULT_PLAN_ADDONS_CONFIG = {
+    "addons": [
+        {
+            "provider": "Origin",
+            "addon_name": "Origin Loop VPP credit (illustrative)",
+            "addon_type": "vpp",
+            "eligible_base_plans": [
+                "Origin Boost",
+                "Origin Battery Maximiser",
+                "Origin Go Variable (Sign on bonus)",
+            ],
+            "requires_home_battery": True,
+            "min_battery_kwh": 8.0,
+            "requires_solar": True,
+            "min_solar_kw": 3.0,
+            "requires_ev": False,
+            "requires_vpp_opt_in": True,
+            "value_type": "annual_credit",
+            "annual_value_aud": 180.0,
+            "active": True,
+            "as_of": "2026-03-04",
+            "source": "Internal starter preset",
+            "source_url": "https://www.originenergy.com.au/",
+            "notes": "Starter placeholder. Replace with current market terms before decision use.",
+        },
+        {
+            "provider": "Origin",
+            "addon_name": "Origin EV Power Up 8c charging (illustrative)",
+            "addon_type": "ev",
+            "eligible_base_plans": [
+                "Origin Go Variable (Sign on bonus)",
+                "Origin Boost",
+            ],
+            "requires_home_battery": False,
+            "min_battery_kwh": 0.0,
+            "requires_solar": False,
+            "min_solar_kw": 0.0,
+            "requires_ev": True,
+            "requires_vpp_opt_in": False,
+            "value_type": "ev_rate_discount",
+            "annual_value_aud": 0.0,
+            "ev_target_rate_c_per_kwh": 8.0,
+            "ev_eligible_share_pct": 85.0,
+            "active": True,
+            "as_of": "2026-03-04",
+            "source": "Internal starter preset",
+            "source_url": "https://www.originenergy.com.au/",
+            "notes": "Calculated from EV kWh, target charging rate, and eligible-share assumption. Replace plan eligibility and terms from current retailer offer.",
+        },
+        {
+            "provider": "AGL",
+            "addon_name": "AGL VPP annual credit (illustrative)",
+            "addon_type": "vpp",
+            "eligible_base_plans": [
+                "AGL Ned",
+            ],
+            "requires_home_battery": True,
+            "min_battery_kwh": 8.0,
+            "requires_solar": True,
+            "min_solar_kw": 3.0,
+            "requires_ev": False,
+            "requires_vpp_opt_in": True,
+            "value_type": "annual_credit",
+            "annual_value_aud": 80.0,
+            "active": True,
+            "as_of": "2026-03-04",
+            "source": "Internal starter preset",
+            "source_url": "https://www.agl.com.au/residential/solar-and-batteries/virtual-power-plant",
+            "notes": "Starter placeholder based on recurring annual credit style only. Excludes one-off join credits and event-variable upside.",
+        }
+    ]
 }
 
 
@@ -850,6 +930,185 @@ def load_battery_assumptions_config() -> dict:
     }
 
 
+def _default_plan_addons_config() -> dict:
+    return copy.deepcopy(DEFAULT_PLAN_ADDONS_CONFIG)
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off"):
+            return False
+    return bool(default)
+
+
+def _normalize_plan_addon(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+
+    addon_name = str(item.get("addon_name", "")).strip()
+    if not addon_name:
+        return None
+
+    provider = str(item.get("provider", "")).strip()
+    addon_type = str(item.get("addon_type", "other")).strip() or "other"
+
+    eligible_raw = item.get("eligible_base_plans", [])
+    eligible_base_plans: list[str] = []
+    if isinstance(eligible_raw, list):
+        seen: set[str] = set()
+        for v in eligible_raw:
+            nm = str(v).strip()
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            eligible_base_plans.append(nm)
+
+    try:
+        min_battery_kwh = float(item.get("min_battery_kwh", 0.0) or 0.0)
+    except Exception:
+        min_battery_kwh = 0.0
+    try:
+        min_solar_kw = float(item.get("min_solar_kw", 0.0) or 0.0)
+    except Exception:
+        min_solar_kw = 0.0
+    try:
+        annual_value_aud = float(item.get("annual_value_aud", 0.0) or 0.0)
+    except Exception:
+        annual_value_aud = 0.0
+    try:
+        ev_target_rate_c_per_kwh = float(item.get("ev_target_rate_c_per_kwh", 8.0) or 8.0)
+    except Exception:
+        ev_target_rate_c_per_kwh = 8.0
+    try:
+        ev_eligible_share_pct = float(item.get("ev_eligible_share_pct", 100.0) or 100.0)
+    except Exception:
+        ev_eligible_share_pct = 100.0
+
+    value_type = str(item.get("value_type", "annual_credit")).strip().lower()
+    if value_type not in ("annual_credit", "ev_rate_discount"):
+        value_type = "annual_credit"
+
+    return {
+        "provider": provider,
+        "addon_name": addon_name,
+        "addon_type": addon_type,
+        "eligible_base_plans": eligible_base_plans,
+        "requires_home_battery": _parse_bool(item.get("requires_home_battery", False), default=False),
+        "min_battery_kwh": max(float(min_battery_kwh), 0.0),
+        "requires_solar": _parse_bool(item.get("requires_solar", False), default=False),
+        "min_solar_kw": max(float(min_solar_kw), 0.0),
+        "requires_ev": _parse_bool(item.get("requires_ev", False), default=False),
+        "requires_vpp_opt_in": _parse_bool(item.get("requires_vpp_opt_in", False), default=False),
+        "value_type": value_type,
+        "annual_value_aud": float(annual_value_aud),
+        "ev_target_rate_c_per_kwh": max(float(ev_target_rate_c_per_kwh), 0.0),
+        "ev_eligible_share_pct": max(min(float(ev_eligible_share_pct), 100.0), 0.0),
+        "active": _parse_bool(item.get("active", True), default=True),
+        "as_of": str(item.get("as_of", "")).strip(),
+        "source": str(item.get("source", "")).strip(),
+        "source_url": str(item.get("source_url", "")).strip(),
+        "notes": str(item.get("notes", "")).strip(),
+    }
+
+
+def load_plan_addons_config() -> dict:
+    """Load plan add-ons from plan_addons.json."""
+    global LAST_PLAN_ADDONS_LOAD_STATUS
+    defaults = _default_plan_addons_config()
+
+    if not PLAN_ADDONS_FILE.exists():
+        LAST_PLAN_ADDONS_LOAD_STATUS = {
+            "source": "defaults",
+            "reason": "missing_file",
+            "count": len(defaults.get("addons", [])),
+            "skipped": 0,
+        }
+        return defaults
+
+    raw = PLAN_ADDONS_FILE.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("plan_addons.json must be a JSON object")
+        addons_raw = data.get("addons")
+        if not isinstance(addons_raw, list):
+            raise ValueError("plan_addons.json.addons must be a list")
+    except Exception:
+        LAST_PLAN_ADDONS_LOAD_STATUS = {
+            "source": "defaults",
+            "reason": "invalid_json",
+            "count": len(defaults.get("addons", [])),
+            "skipped": 0,
+        }
+        return defaults
+
+    addons: list[dict] = []
+    skipped = 0
+    name_counts: dict[str, int] = {}
+    for item in addons_raw:
+        addon = _normalize_plan_addon(item)
+        if addon is None:
+            skipped += 1
+            continue
+        base = str(addon.get("addon_name", "")).strip() or "Unnamed add-on"
+        n = name_counts.get(base, 0) + 1
+        name_counts[base] = n
+        if n > 1:
+            addon["addon_name"] = f"{base} ({n})"
+        addons.append(addon)
+
+    if not addons:
+        LAST_PLAN_ADDONS_LOAD_STATUS = {
+            "source": "defaults",
+            "reason": "no_valid_addons",
+            "count": len(defaults.get("addons", [])),
+            "skipped": skipped,
+        }
+        return defaults
+
+    LAST_PLAN_ADDONS_LOAD_STATUS = {
+        "source": "file",
+        "reason": "ok",
+        "count": len(addons),
+        "skipped": skipped,
+    }
+    return {"addons": addons}
+
+
+def save_plan_addons_config(config: dict) -> None:
+    """Save normalized add-ons to plan_addons.json."""
+    global LAST_PLAN_ADDONS_LOAD_STATUS
+    addons_raw = config.get("addons", []) if isinstance(config, dict) else []
+    addons_clean: list[dict] = []
+    name_counts: dict[str, int] = {}
+    for item in addons_raw:
+        addon = _normalize_plan_addon(item) if isinstance(item, dict) else None
+        if addon is None:
+            continue
+        base = str(addon.get("addon_name", "")).strip() or "Unnamed add-on"
+        n = name_counts.get(base, 0) + 1
+        name_counts[base] = n
+        if n > 1:
+            addon["addon_name"] = f"{base} ({n})"
+        addons_clean.append(addon)
+
+    payload = {"addons": addons_clean}
+    PLAN_ADDONS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    LAST_PLAN_ADDONS_LOAD_STATUS = {
+        "source": "file",
+        "reason": "ok",
+        "count": len(addons_clean),
+        "skipped": 0,
+    }
+
+
 # ---------------------------
 # Register mapping (confirmed)
 # ---------------------------
@@ -1151,6 +1410,96 @@ def _battery_dependent_plan_reason(plan: Plan) -> str | None:
     if any(tok in nm for tok in ("battery", "powerwall", "vpp", "virtual power")):
         return "Plan name indicates a battery-targeted offer."
     return None
+
+
+def _addon_label(addon: dict) -> str:
+    provider = str(addon.get("provider", "")).strip()
+    nm = str(addon.get("addon_name", "")).strip()
+    if provider and nm:
+        return f"{provider} - {nm}"
+    return nm or provider or "Add-on"
+
+
+def _plan_addon_eligibility(plan_name: str, addon: dict, profile: dict) -> tuple[bool, str]:
+    if not bool(addon.get("active", True)):
+        return False, "Inactive"
+
+    allowed_plans = [str(x).strip() for x in (addon.get("eligible_base_plans", []) or []) if str(x).strip()]
+    if allowed_plans and str(plan_name) not in allowed_plans:
+        return False, "Plan not in add-on list"
+
+    battery_kwh = float(profile.get("battery_kwh", 0.0) or 0.0)
+    solar_kw = float(profile.get("solar_kw", 0.0) or 0.0)
+    ev_enabled = bool(profile.get("ev_enabled", False))
+    has_home_battery = bool(profile.get("has_home_battery", False))
+    vpp_opt_in = bool(profile.get("vpp_opt_in", False))
+
+    if bool(addon.get("requires_home_battery", False)) and (not has_home_battery):
+        return False, "Requires home battery"
+    if battery_kwh < float(addon.get("min_battery_kwh", 0.0) or 0.0):
+        return False, f"Requires >= {float(addon.get('min_battery_kwh', 0.0) or 0.0):.1f} kWh battery"
+    if bool(addon.get("requires_solar", False)) and (solar_kw <= 0.0):
+        return False, "Requires solar"
+    if solar_kw < float(addon.get("min_solar_kw", 0.0) or 0.0):
+        return False, f"Requires >= {float(addon.get('min_solar_kw', 0.0) or 0.0):.1f} kW solar"
+    if bool(addon.get("requires_ev", False)) and (not ev_enabled):
+        return False, "Requires EV"
+    if bool(addon.get("requires_vpp_opt_in", False)) and (not vpp_opt_in):
+        return False, "Requires VPP opt-in"
+    if str(addon.get("value_type", "annual_credit")).strip().lower() == "ev_rate_discount":
+        if not ev_enabled:
+            return False, "Requires EV profile"
+        annual_ev_kwh = float(profile.get("ev_annual_kwh", 0.0) or 0.0)
+        if annual_ev_kwh <= 0.0:
+            return False, "No EV kWh estimate"
+
+    return True, ""
+
+
+def _plan_addon_period_value(addon: dict, days: float, profile: dict | None = None, plan_context: dict | None = None) -> float:
+    mode = str(addon.get("value_type", "annual_credit")).strip().lower()
+    if mode == "annual_credit":
+        annual = float(addon.get("annual_value_aud", 0.0) or 0.0)
+        return max(0.0, annual) * max(0.0, float(days or 0.0)) / 365.25
+    if mode == "ev_rate_discount":
+        profile = profile or {}
+        plan_context = plan_context or {}
+        annual_ev_kwh = max(float(profile.get("ev_annual_kwh", 0.0) or 0.0), 0.0)
+        if annual_ev_kwh <= 0.0:
+            return 0.0
+        eligible_share_pct = float(addon.get("ev_eligible_share_pct", 100.0) or 100.0)
+        eligible_share_frac = max(min(eligible_share_pct / 100.0, 1.0), 0.0)
+        target_rate_c = max(float(addon.get("ev_target_rate_c_per_kwh", 0.0) or 0.0), 0.0)
+        baseline_rate_c = max(float(plan_context.get("import_usage_rate_c_per_kwh", 0.0) or 0.0), 0.0)
+        delta_c = max(baseline_rate_c - target_rate_c, 0.0)
+        annual_value = annual_ev_kwh * eligible_share_frac * (delta_c / 100.0)
+        return max(0.0, annual_value) * max(0.0, float(days or 0.0)) / 365.25
+    return 0.0
+
+
+def evaluate_plan_addons_for_plan(
+    plan_name: str,
+    addons_cfg: dict,
+    profile: dict,
+    days: float,
+    plan_context: dict | None = None,
+) -> dict:
+    addons = addons_cfg.get("addons", []) if isinstance(addons_cfg, dict) else []
+    eligible_labels: list[str] = []
+    benefit = 0.0
+    for addon in addons:
+        if not isinstance(addon, dict):
+            continue
+        ok, _reason = _plan_addon_eligibility(plan_name, addon, profile)
+        if not ok:
+            continue
+        eligible_labels.append(_addon_label(addon))
+        benefit += _plan_addon_period_value(addon, days, profile=profile, plan_context=plan_context)
+
+    return {
+        "eligible_labels": eligible_labels,
+        "benefit": float(benefit),
+    }
 
 
 def _flat_plan_uses_single_import_rate(plan: Plan) -> bool:
@@ -2604,9 +2953,12 @@ if "plans_lib" not in st.session_state:
     st.session_state["plans_lib"] = load_plans(defaults)
 if "battery_assumptions_cfg" not in st.session_state:
     st.session_state["battery_assumptions_cfg"] = load_battery_assumptions_config()
+if "plan_addons_cfg" not in st.session_state:
+    st.session_state["plan_addons_cfg"] = load_plan_addons_config()
 
 plans = st.session_state["plans_lib"]
 battery_assumptions_cfg = st.session_state["battery_assumptions_cfg"]
+plan_addons_cfg = st.session_state["plan_addons_cfg"]
 
 # Back-compat alias (some sections refer to `plans_lib`)
 plans_lib = plans
@@ -2642,6 +2994,19 @@ elif int(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
     st.caption(
         f"Battery assumptions loaded from file; "
         f"skipped {LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get('skipped', 0)} invalid preset entries."
+    )
+
+st.caption(f"Plan add-ons file: {PLAN_ADDONS_FILE}")
+if LAST_PLAN_ADDONS_LOAD_STATUS.get("source") != "file":
+    reason = str(LAST_PLAN_ADDONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
+    st.caption(
+        f"Plan add-ons using built-in defaults ({reason}). "
+        "Edit plan_addons.json to add or update EV/VPP offers."
+    )
+elif int(LAST_PLAN_ADDONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
+    st.caption(
+        f"Plan add-ons loaded from file; "
+        f"skipped {LAST_PLAN_ADDONS_LOAD_STATUS.get('skipped', 0)} invalid entries."
     )
 
 
@@ -2844,10 +3209,12 @@ if "current_setup_ev_enabled" not in st.session_state:
     st.session_state["current_setup_ev_enabled"] = bool(ev_enabled)
 if "current_setup_ev_km_yr" not in st.session_state:
     st.session_state["current_setup_ev_km_yr"] = float(ev_annual_km)
+if "current_setup_vpp_opt_in" not in st.session_state:
+    st.session_state["current_setup_vpp_opt_in"] = True
 
 with st.sidebar.expander("Current setup profile", expanded=False):
     st.caption(
-        "Used to prefill What-if inputs (auto-updates when you change these values). "
+        "Used to prefill What-if inputs and assess add-on eligibility (auto-updates when changed). "
         "Battery size defaults to 0 kWh when home battery is off, and can still be overridden."
     )
     st.number_input(
@@ -2878,6 +3245,12 @@ with st.sidebar.expander("Current setup profile", expanded=False):
         "Current EV enabled",
         value=bool(st.session_state.get("current_setup_ev_enabled", False)),
         key="current_setup_ev_enabled",
+    )
+    st.checkbox(
+        "Open to VPP participation",
+        value=bool(st.session_state.get("current_setup_vpp_opt_in", True)),
+        key="current_setup_vpp_opt_in",
+        help="Used to determine whether VPP-style add-on offers are treated as eligible.",
     )
     st.number_input(
         "Current EV km/yr",
@@ -3165,6 +3538,30 @@ if (not bool(has_home_battery)) and (not bool(include_battery_dependent_in_compa
 
 rows = []
 base_totals_by_plan = {}
+addon_profile = {
+    "has_home_battery": bool(has_home_battery),
+    "battery_kwh": float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0),
+    "solar_kw": float(st.session_state.get("current_setup_solar_kw", 0.0) or 0.0),
+    "ev_enabled": bool(st.session_state.get("current_setup_ev_enabled", False)),
+    "vpp_opt_in": bool(st.session_state.get("current_setup_vpp_opt_in", True)),
+}
+try:
+    addon_ev_km = float(st.session_state.get("current_setup_ev_km_yr", ev_annual_km) or 0.0)
+except Exception:
+    addon_ev_km = float(ev_annual_km) if "ev_annual_km" in locals() else 0.0
+try:
+    addon_ev_cons = float(ev_consumption)
+except Exception:
+    addon_ev_cons = float(st.session_state.get("ev_consumption_kwh_per_100km", 17.0) or 17.0)
+try:
+    addon_ev_loss_pct = float(ev_loss_pct)
+except Exception:
+    addon_ev_loss_pct = float(st.session_state.get("ev_charge_loss_pct", 10.0) or 10.0)
+addon_ev_wall_kwh_annual = 0.0
+if bool(addon_profile.get("ev_enabled", False)):
+    addon_ev_drive_kwh = max(addon_ev_km, 0.0) * max(addon_ev_cons, 0.0) / 100.0
+    addon_ev_wall_kwh_annual = addon_ev_drive_kwh / max(1e-9, (1.0 - max(addon_ev_loss_pct, 0.0) / 100.0))
+addon_profile["ev_annual_kwh"] = float(max(addon_ev_wall_kwh_annual, 0.0))
 for p in comparison_plans:
     sim = simulate_plan(df_int, p, include_signup_credit=True)
     if ev_summary.get("enabled"):
@@ -3185,6 +3582,16 @@ for p in comparison_plans:
     controlled_supply_cents = float(sim["controlled_supply_cents"])
     total_cents = float(sim["total_cents"])
     days = int(sim["days"])
+    import_usage_rate_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
+    addon_eval = evaluate_plan_addons_for_plan(
+        plan_name=str(p.name),
+        addons_cfg=plan_addons_cfg,
+        profile=addon_profile,
+        days=float(days),
+        plan_context={"import_usage_rate_c_per_kwh": float(import_usage_rate_c_per_kwh)},
+    )
+    addon_benefit = float(addon_eval.get("benefit", 0.0) or 0.0)
+    addon_labels = addon_eval.get("eligible_labels", []) or []
     single_rate_all_import = bool(sim.get("flat_applies_to_all_import", False))
     night_fit_bonus = _fit_tou_has_night_bonus_rows(
         [b.__dict__ for b in (p.feed_in_tou.bands if p.feed_in_tou else [])],
@@ -3220,9 +3627,37 @@ for p in comparison_plans:
         "FiT credit ($)": round(float(sim["export_credit_cents"]) / 100.0, 2),
         "Sign-up credit ($)": round(signup_credit_cents / 100.0, 2),
         "Total ($)": round(total_cents / 100.0, 2),
+        "Add-on eligible programs": "; ".join(str(v) for v in addon_labels) if addon_labels else "-",
+        "Add-on benefit ($)": round(addon_benefit, 2),
+        "Net total incl add-ons ($)": round((total_cents / 100.0) - addon_benefit, 2),
     })
 
-res = pd.DataFrame(rows).sort_values("Total ($)")
+res = pd.DataFrame(rows)
+if res.empty:
+    st.info("No plans available after current filtering.")
+    st.stop()
+
+rank_options = ["Base plan only", "Base + eligible add-ons"]
+if ("comparison_rank_mode" not in st.session_state) or (st.session_state.get("comparison_rank_mode") not in rank_options):
+    st.session_state["comparison_rank_mode"] = rank_options[0]
+comparison_rank_mode = st.radio(
+    "Ranking basis",
+    rank_options,
+    horizontal=True,
+    key="comparison_rank_mode",
+    help="Use base bill only, or include eligible EV/VPP add-on value estimates.",
+)
+rank_col = "Total ($)" if comparison_rank_mode == "Base plan only" else "Net total incl add-ons ($)"
+res = res.sort_values(rank_col).reset_index(drop=True)
+if comparison_rank_mode == "Base + eligible add-ons":
+    any_addon_value = bool(pd.to_numeric(res["Add-on benefit ($)"], errors="coerce").fillna(0.0).gt(0.0).any())
+    if any_addon_value:
+        st.caption(
+            "Add-on values are applied over the dataset period: annual-credit rows are prorated; "
+            "EV rate-discount rows are computed from EV kWh, target rate, and eligible-share assumptions."
+        )
+    else:
+        st.caption("No eligible add-on value detected under current setup assumptions.")
 
 night_bonus_mask = (res["Night FiT bonus window"] == "Yes") & (res["Night bonus export kWh"] <= 0.0)
 if night_bonus_mask.any():
@@ -3253,11 +3688,13 @@ if "Plan" in res_display.columns:
 # Callout: current plan vs cheapest (over this dataset period)
 cur_name = st.session_state.get("current_retailer", None)
 if cur_name and (cur_name in list(res["Plan"])):
-    cur_total = float(res.loc[res["Plan"] == cur_name, "Total ($)"].iloc[0])
-    best_total = float(res["Total ($)"].iloc[0])
+    cur_total = float(res.loc[res["Plan"] == cur_name, rank_col].iloc[0])
+    best_total = float(res[rank_col].iloc[0])
     best_plan = str(res["Plan"].iloc[0])
     delta = cur_total - best_total
+    rank_label = "Base bill total" if rank_col == "Total ($)" else "Net total incl add-ons"
     st.info(
+        f"**Ranking basis:** {rank_label}\n\n"
         f"**Your current retailer:** {cur_name} - **${cur_total:,.2f}**\n\n"
         f"**Cheapest in this run:** {best_plan} - **${best_total:,.2f}**\n\n"
         f"**Difference:** **${delta:,.2f}** over the period shown."
@@ -3277,6 +3714,9 @@ if view == "Summary":
         "Night FiT bonus window",
         "Night bonus export kWh",
         "Total ($)",
+        "Add-on eligible programs",
+        "Add-on benefit ($)",
+        "Net total incl add-ons ($)",
         "Supply ($)",
         "Import Usage ($)",
         "Import kWh (E1+E2)",
@@ -3315,9 +3755,11 @@ if ev_summary.get("enabled") and base_totals_by_plan:
 
 winner = res.iloc[0]["Plan"]
 st.success(f"Cheapest for this dataset: **{winner}**")
+if rank_col != "Total ($)":
+    st.caption("Cheapest is based on net total including eligible add-on value.")
 
 if len(res) >= 2:
-    diff = float(res.iloc[1]["Total ($)"]) - float(res.iloc[0]["Total ($)"])
+    diff = float(res.iloc[1][rank_col]) - float(res.iloc[0][rank_col])
     st.info(f"Savings vs next best: **${diff:.2f}** over this period.")
 
 if show_comparison_only:
@@ -4352,19 +4794,29 @@ with tab8:
                         f"(implied: {implied_life_disp} yrs, modelled life: {model_life_disp} yrs)"
                     )
             else:
-                st.info("Run **Retailer + solar + battery decision optimiser** (subtab 3) to generate a recommendation here.")
+                st.info("Run **Retailer + solar + battery decision optimiser** in **Best overall retailer + solar + battery** to generate a recommendation here.")
 
 
-            sub_compare, sub_opt, sub_joint, sub_whatif = st.tabs(
-                [
-                    "Quick comparison",
-                    "Battery economics (selected retailer)",
-                    "Best overall retailer + solar + battery",
-                    "What-if: current vs optimised",
-                ]
+            battery_subtab_options = [
+                "Quick comparison",
+                "Battery economics (selected retailer)",
+                "Best overall retailer + solar + battery",
+                "What-if: current vs optimised",
+            ]
+            if ("battery_subtab" not in st.session_state) or (st.session_state.get("battery_subtab") not in battery_subtab_options):
+                st.session_state["battery_subtab"] = battery_subtab_options[0]
+            selected_battery_subtab = st.radio(
+                "Battery results view",
+                battery_subtab_options,
+                horizontal=True,
+                key="battery_subtab",
             )
+            sub_compare = selected_battery_subtab == battery_subtab_options[0]
+            sub_opt = selected_battery_subtab == battery_subtab_options[1]
+            sub_joint = selected_battery_subtab == battery_subtab_options[2]
+            sub_whatif = selected_battery_subtab == battery_subtab_options[3]
 
-            with sub_compare:
+            if sub_compare:
                 st.markdown("**Quick comparison (pick a few battery sizes to compare):**")
                 size_options = [0.0, 3.0, 5.0, 7.0, 10.0, 13.5, 15.0, 20.0]
                 chosen_sizes = st.multiselect("Sizes", size_options, default=[0.0, 5.0, 10.0, 13.5], key="batt_sizes_compare")
@@ -4524,7 +4976,7 @@ with tab8:
                 else:
                     st.info("Run comparison to generate results.")
 
-            with sub_opt:
+            if sub_opt:
                 st.markdown("**Battery economics (selected retailer):**")
                 st.caption("Explore how battery size changes savings, NPV and IRR for the selected retailer.")
                 o1, o2, o3 = st.columns(3)
@@ -4688,7 +5140,7 @@ with tab8:
                     st.line_chart(df_opt[["Battery (kWh)", "NPV ($)"]].copy().set_index("Battery (kWh)"))
                 else:
                     st.info("Run battery economics to generate results.")
-            with sub_joint:
+            if sub_joint:
                 st.markdown("**Best overall retailer + solar + battery (decision wizard):**")
                 st.caption("Sweeps battery sizes for each retailer and optionally solar sizes, then ranks combinations by lowest PV lifetime cost.")
 
@@ -5057,7 +5509,7 @@ with tab8:
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
                     st.info("Run 'Find best retailer + solar + battery' to generate results.")
-            with sub_whatif:
+            if sub_whatif:
                 st.markdown("**What-if: current vs optimised:**")
                 st.caption(
                     "Simple mode: compare your current setup against one what-if scenario, "
@@ -5963,5 +6415,475 @@ with tab9:
             st.error(f"Could not import: {e}")
 
     st.divider()
+    st.markdown("### Plan Add-ons (EV / VPP offers)")
+    st.caption(
+        "Use this table to maintain EV/VPP add-on offers used in Comparison when ranking basis is "
+        "'Base + eligible add-ons'. Battery optimiser logic is unchanged."
+    )
+    st.caption("Tip: set `value_type` to `ev_rate_discount` for offers like 8c/kWh EV charging.")
+    st.caption(f"Add-ons file: {PLAN_ADDONS_FILE}")
 
+    addon_columns = [
+        "active",
+        "provider",
+        "addon_name",
+        "addon_type",
+        "eligible_base_plans",
+        "requires_home_battery",
+        "min_battery_kwh",
+        "requires_solar",
+        "min_solar_kw",
+        "requires_ev",
+        "requires_vpp_opt_in",
+        "value_type",
+        "annual_value_aud",
+        "ev_target_rate_c_per_kwh",
+        "ev_eligible_share_pct",
+        "as_of",
+        "source",
+        "source_url",
+        "notes",
+    ]
 
+    addon_row_defaults = {
+        "active": True,
+        "provider": "",
+        "addon_name": "",
+        "addon_type": "vpp",
+        "eligible_base_plans": "",
+        "requires_home_battery": False,
+        "min_battery_kwh": 0.0,
+        "requires_solar": False,
+        "min_solar_kw": 0.0,
+        "requires_ev": False,
+        "requires_vpp_opt_in": False,
+        "value_type": "annual_credit",
+        "annual_value_aud": 0.0,
+        "ev_target_rate_c_per_kwh": 8.0,
+        "ev_eligible_share_pct": 100.0,
+        "as_of": "",
+        "source": "",
+        "source_url": "",
+        "notes": "",
+    }
+
+    def _addon_to_editor_row(addon: dict) -> dict:
+        if not isinstance(addon, dict):
+            return dict(addon_row_defaults)
+        return {
+            "active": bool(addon.get("active", True)),
+            "provider": str(addon.get("provider", "")).strip(),
+            "addon_name": str(addon.get("addon_name", "")).strip(),
+            "addon_type": str(addon.get("addon_type", "other")).strip() or "other",
+            "eligible_base_plans": ", ".join(str(x).strip() for x in (addon.get("eligible_base_plans", []) or []) if str(x).strip()),
+            "requires_home_battery": bool(addon.get("requires_home_battery", False)),
+            "min_battery_kwh": float(addon.get("min_battery_kwh", 0.0) or 0.0),
+            "requires_solar": bool(addon.get("requires_solar", False)),
+            "min_solar_kw": float(addon.get("min_solar_kw", 0.0) or 0.0),
+            "requires_ev": bool(addon.get("requires_ev", False)),
+            "requires_vpp_opt_in": bool(addon.get("requires_vpp_opt_in", False)),
+            "value_type": str(addon.get("value_type", "annual_credit")).strip() or "annual_credit",
+            "annual_value_aud": float(addon.get("annual_value_aud", 0.0) or 0.0),
+            "ev_target_rate_c_per_kwh": float(addon.get("ev_target_rate_c_per_kwh", 8.0) or 8.0),
+            "ev_eligible_share_pct": float(addon.get("ev_eligible_share_pct", 100.0) or 100.0),
+            "as_of": str(addon.get("as_of", "")).strip(),
+            "source": str(addon.get("source", "")).strip(),
+            "source_url": str(addon.get("source_url", "")).strip(),
+            "notes": str(addon.get("notes", "")).strip(),
+        }
+
+    addon_editor_rows_key = "plan_addons_editor_rows"
+    addon_rows_seed: list[dict] = []
+    addon_rows_state = st.session_state.get(addon_editor_rows_key)
+    if isinstance(addon_rows_state, list):
+        for row in addon_rows_state:
+            if not isinstance(row, dict):
+                continue
+            merged = dict(addon_row_defaults)
+            merged.update({k: row.get(k) for k in addon_columns if k in row})
+            addon_rows_seed.append(merged)
+    else:
+        for addon in (plan_addons_cfg.get("addons", []) if isinstance(plan_addons_cfg, dict) else []):
+            if not isinstance(addon, dict):
+                continue
+            addon_rows_seed.append(_addon_to_editor_row(addon))
+
+    if not addon_rows_seed:
+        addon_rows_seed = [dict(addon_row_defaults)]
+
+    addon_editor_df = pd.DataFrame(addon_rows_seed, columns=addon_columns)
+    st.caption("Hover each column header for field guidance.")
+    addon_column_config = {
+        "active": st.column_config.CheckboxColumn(
+            "Active",
+            help="Only active rows are considered in comparison ranking.",
+            default=True,
+        ),
+        "provider": st.column_config.TextColumn(
+            "Provider",
+            help="Retailer or provider name, e.g. Origin.",
+            max_chars=60,
+        ),
+        "addon_name": st.column_config.TextColumn(
+            "Add-on name",
+            help="User-facing offer name, e.g. Origin Loop.",
+            max_chars=120,
+        ),
+        "addon_type": st.column_config.SelectboxColumn(
+            "Type",
+            help="Offer type used for grouping and readability.",
+            options=["vpp", "ev", "solar", "other"],
+            required=True,
+        ),
+        "eligible_base_plans": st.column_config.TextColumn(
+            "Eligible base plans",
+            help="Comma-separated plan names from your plans library. Leave blank to allow any plan.",
+            max_chars=500,
+        ),
+        "requires_home_battery": st.column_config.CheckboxColumn(
+            "Needs battery",
+            help="If true, user must have a home battery to qualify.",
+            default=False,
+        ),
+        "min_battery_kwh": st.column_config.NumberColumn(
+            "Min battery (kWh)",
+            help="Minimum battery size required for eligibility.",
+            min_value=0.0,
+            step=0.5,
+            format="%.1f",
+        ),
+        "requires_solar": st.column_config.CheckboxColumn(
+            "Needs solar",
+            help="If true, user must have solar to qualify.",
+            default=False,
+        ),
+        "min_solar_kw": st.column_config.NumberColumn(
+            "Min solar (kW)",
+            help="Minimum solar size required for eligibility.",
+            min_value=0.0,
+            step=0.1,
+            format="%.1f",
+        ),
+        "requires_ev": st.column_config.CheckboxColumn(
+            "Needs EV",
+            help="If true, user must have EV enabled in setup profile.",
+            default=False,
+        ),
+        "requires_vpp_opt_in": st.column_config.CheckboxColumn(
+            "Needs VPP opt-in",
+            help="If true, user must be open to VPP participation in setup profile.",
+            default=False,
+        ),
+        "value_type": st.column_config.SelectboxColumn(
+            "Value method",
+            help="annual_credit uses fixed annual value. ev_rate_discount auto-calculates from EV kWh and rate delta.",
+            options=["annual_credit", "ev_rate_discount"],
+            required=True,
+        ),
+        "annual_value_aud": st.column_config.NumberColumn(
+            "Annual value ($/yr)",
+            help="Used for annual_credit mode. App prorates this to the uploaded data period.",
+            min_value=0.0,
+            step=10.0,
+            format="%.2f",
+        ),
+        "ev_target_rate_c_per_kwh": st.column_config.NumberColumn(
+            "EV target rate (c/kWh)",
+            help="Used for ev_rate_discount mode (e.g. 8.0 c/kWh).",
+            min_value=0.0,
+            step=0.1,
+            format="%.2f",
+        ),
+        "ev_eligible_share_pct": st.column_config.NumberColumn(
+            "EV eligible share (%)",
+            help="Used for ev_rate_discount mode. Portion of EV kWh expected to receive the target rate vs the plan's import usage rate.",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            format="%.1f",
+        ),
+        "as_of": st.column_config.TextColumn(
+            "As of",
+            help="Date these terms were last verified (YYYY-MM-DD).",
+            max_chars=20,
+        ),
+        "source": st.column_config.TextColumn(
+            "Source",
+            help="Short source label, e.g. Retailer factsheet.",
+            max_chars=200,
+        ),
+        "source_url": st.column_config.TextColumn(
+            "Source URL",
+            help="Link to offer page or terms for future verification.",
+            max_chars=500,
+        ),
+        "notes": st.column_config.TextColumn(
+            "Notes",
+            help="Optional context, assumptions, or caveats.",
+            max_chars=1000,
+        ),
+    }
+    addon_editor_out = st.data_editor(
+        addon_editor_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="plan_addons_editor_table",
+        column_config=addon_column_config,
+    )
+    st.session_state[addon_editor_rows_key] = addon_editor_out.to_dict("records")
+
+    def _addon_to_float(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _addon_row_is_blank(row: dict) -> bool:
+        if not isinstance(row, dict):
+            return True
+        text_any = any(
+            str(row.get(k, "")).strip()
+            for k in ("provider", "addon_name", "eligible_base_plans", "as_of", "source", "source_url", "notes")
+        )
+        num_any = (
+            abs(_addon_to_float(row.get("min_battery_kwh", 0.0))) > 0.0
+            or abs(_addon_to_float(row.get("min_solar_kw", 0.0))) > 0.0
+            or abs(_addon_to_float(row.get("annual_value_aud", 0.0))) > 0.0
+        )
+        bool_any = any(
+            bool(row.get(k, False))
+            for k in ("requires_home_battery", "requires_solar", "requires_ev", "requires_vpp_opt_in")
+        )
+        return (not text_any) and (not num_any) and (not bool_any)
+
+    with st.expander("Annual value estimator (low / mid / high)", expanded=False):
+        st.caption(
+            "Use this helper to estimate annual add-on value from fixed credit and expected event energy. "
+            "Apply one scenario directly to a table row (primarily for annual_credit rows)."
+        )
+        est_c1, est_c2, est_c3 = st.columns(3)
+        with est_c1:
+            est_guaranteed = st.number_input(
+                "Guaranteed credit ($/yr)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_guaranteed_credit", 0.0) or 0.0),
+                step=10.0,
+                format="%.2f",
+                key="addon_est_guaranteed_credit",
+            )
+            est_value_per_kwh = st.number_input(
+                "Event value ($/kWh)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_value_per_kwh", 0.6) or 0.6),
+                step=0.05,
+                format="%.2f",
+                key="addon_est_value_per_kwh",
+                help="Net value from eligible event energy (after any costs).",
+            )
+        with est_c2:
+            est_kwh_low = st.number_input(
+                "Event energy low (kWh/yr)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_kwh_low", 50.0) or 50.0),
+                step=10.0,
+                format="%.1f",
+                key="addon_est_kwh_low",
+            )
+            est_kwh_mid = st.number_input(
+                "Event energy mid (kWh/yr)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_kwh_mid", 120.0) or 120.0),
+                step=10.0,
+                format="%.1f",
+                key="addon_est_kwh_mid",
+            )
+            est_kwh_high = st.number_input(
+                "Event energy high (kWh/yr)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_kwh_high", 220.0) or 220.0),
+                step=10.0,
+                format="%.1f",
+                key="addon_est_kwh_high",
+            )
+        with est_c3:
+            est_annual_cost = st.number_input(
+                "Annual costs/offsets ($/yr)",
+                min_value=0.0,
+                value=float(st.session_state.get("addon_est_annual_cost", 0.0) or 0.0),
+                step=10.0,
+                format="%.2f",
+                key="addon_est_annual_cost",
+                help="Subtract expected annual costs or negative adjustments.",
+            )
+
+        est_low = float(est_guaranteed) + float(est_kwh_low) * float(est_value_per_kwh) - float(est_annual_cost)
+        est_mid = float(est_guaranteed) + float(est_kwh_mid) * float(est_value_per_kwh) - float(est_annual_cost)
+        est_high = float(est_guaranteed) + float(est_kwh_high) * float(est_value_per_kwh) - float(est_annual_cost)
+
+        m_low, m_mid, m_high = st.columns(3)
+        m_low.metric("Low annual value", f"${est_low:,.2f}/yr")
+        m_mid.metric("Mid annual value", f"${est_mid:,.2f}/yr")
+        m_high.metric("High annual value", f"${est_high:,.2f}/yr")
+
+        addon_rows_current = addon_editor_out.to_dict("records")
+        row_options = list(range(len(addon_rows_current))) if addon_rows_current else [0]
+
+        def _row_label(i: int) -> str:
+            if i >= len(addon_rows_current):
+                return f"Row {i + 1}"
+            rr = addon_rows_current[i] if isinstance(addon_rows_current[i], dict) else {}
+            provider_v = str(rr.get("provider", "") or "").strip()
+            name_v = str(rr.get("addon_name", "") or "").strip()
+            label_v = name_v if name_v else "(new add-on)"
+            if provider_v:
+                return f"Row {i + 1}: {provider_v} - {label_v}"
+            return f"Row {i + 1}: {label_v}"
+
+        est_a1, est_a2, est_a3 = st.columns([2, 1, 1])
+        with est_a1:
+            target_row_idx = int(
+                st.selectbox(
+                    "Apply estimate to row",
+                    options=row_options,
+                    index=min(int(st.session_state.get("addon_est_target_row", 0) or 0), max(len(row_options) - 1, 0)),
+                    format_func=_row_label,
+                    key="addon_est_target_row",
+                )
+            )
+        with est_a2:
+            apply_scenario = st.selectbox(
+                "Scenario",
+                options=["Low", "Mid", "High"],
+                index=1,
+                key="addon_est_apply_scenario",
+            )
+        with est_a3:
+            st.caption("")
+            st.caption("")
+            if st.button("Apply to row", use_container_width=True, key="btn_apply_addon_estimate"):
+                annual_value_map = {"Low": est_low, "Mid": est_mid, "High": est_high}
+                chosen_val = float(annual_value_map.get(str(apply_scenario), est_mid))
+                rows_for_apply = addon_editor_out.to_dict("records")
+                if not rows_for_apply:
+                    rows_for_apply = [dict(addon_row_defaults)]
+                while target_row_idx >= len(rows_for_apply):
+                    rows_for_apply.append(dict(addon_row_defaults))
+                row_target = rows_for_apply[target_row_idx] if isinstance(rows_for_apply[target_row_idx], dict) else dict(addon_row_defaults)
+                row_target["annual_value_aud"] = round(chosen_val, 2)
+                rows_for_apply[target_row_idx] = row_target
+                st.session_state[addon_editor_rows_key] = rows_for_apply
+                st.success(
+                    f"Applied {apply_scenario.lower()} estimate (${chosen_val:,.2f}/yr) to row {target_row_idx + 1}. "
+                    "Click 'Save add-ons library' to persist."
+                )
+                st.rerun()
+
+    add_c1, add_c2 = st.columns([2, 1])
+    with add_c1:
+        if st.button("Save add-ons library", type="primary", use_container_width=True, key="btn_save_plan_addons"):
+            clean_addons: list[dict] = []
+            invalid_rows: list[int] = []
+            for idx_row, row in enumerate(addon_editor_out.to_dict("records"), start=1):
+                if _addon_row_is_blank(row):
+                    continue
+                item = {
+                    "active": bool(row.get("active", True)),
+                    "provider": str(row.get("provider", "")).strip(),
+                    "addon_name": str(row.get("addon_name", "")).strip(),
+                    "addon_type": str(row.get("addon_type", "other")).strip() or "other",
+                    "eligible_base_plans": [
+                        s.strip()
+                        for s in str(row.get("eligible_base_plans", "")).split(",")
+                        if s.strip()
+                    ],
+                    "requires_home_battery": bool(row.get("requires_home_battery", False)),
+                    "min_battery_kwh": _addon_to_float(row.get("min_battery_kwh", 0.0)),
+                    "requires_solar": bool(row.get("requires_solar", False)),
+                    "min_solar_kw": _addon_to_float(row.get("min_solar_kw", 0.0)),
+                    "requires_ev": bool(row.get("requires_ev", False)),
+                    "requires_vpp_opt_in": bool(row.get("requires_vpp_opt_in", False)),
+                    "value_type": str(row.get("value_type", "annual_credit")).strip() or "annual_credit",
+                    "annual_value_aud": _addon_to_float(row.get("annual_value_aud", 0.0)),
+                    "ev_target_rate_c_per_kwh": _addon_to_float(row.get("ev_target_rate_c_per_kwh", 8.0)),
+                    "ev_eligible_share_pct": _addon_to_float(row.get("ev_eligible_share_pct", 100.0)),
+                    "as_of": str(row.get("as_of", "")).strip(),
+                    "source": str(row.get("source", "")).strip(),
+                    "source_url": str(row.get("source_url", "")).strip(),
+                    "notes": str(row.get("notes", "")).strip(),
+                }
+                normalized = _normalize_plan_addon(item)
+                if normalized is None:
+                    invalid_rows.append(idx_row)
+                    continue
+                clean_addons.append(normalized)
+
+            if invalid_rows:
+                st.error(
+                    "Could not save add-ons. Check required fields on row(s): "
+                    + ", ".join(str(r) for r in invalid_rows)
+                    + "."
+                )
+            else:
+                new_cfg = {"addons": clean_addons}
+                save_plan_addons_config(new_cfg)
+                st.session_state["plan_addons_cfg"] = new_cfg
+                st.session_state[addon_editor_rows_key] = [_addon_to_editor_row(x) for x in clean_addons]
+                st.success(f"Saved add-ons library ({len(clean_addons)} active rows) to plan_addons.json.")
+                st.rerun()
+
+    with add_c2:
+        if st.button("Reload add-ons file", use_container_width=True, key="btn_reload_plan_addons"):
+            reloaded_cfg = load_plan_addons_config()
+            st.session_state["plan_addons_cfg"] = reloaded_cfg
+            st.session_state[addon_editor_rows_key] = [
+                _addon_to_editor_row(x)
+                for x in (reloaded_cfg.get("addons", []) if isinstance(reloaded_cfg, dict) else [])
+                if isinstance(x, dict)
+            ]
+            st.success("Reloaded add-ons from file.")
+            st.rerun()
+
+    addon_export_json = json.dumps(plan_addons_cfg, indent=2)
+    st.download_button(
+        "Download plan_addons.json",
+        addon_export_json,
+        file_name="plan_addons.json",
+        mime="application/json",
+        key="btn_download_plan_addons_json",
+    )
+
+    uploaded_addons = st.file_uploader(
+        "Upload plan_addons.json to replace add-ons library",
+        type=["json"],
+        key="plan_addons_upload",
+    )
+    if uploaded_addons is not None:
+        try:
+            raw_addons = json.loads(uploaded_addons.getvalue().decode("utf-8"))
+            if not isinstance(raw_addons, dict):
+                raise ValueError("plan_addons.json must be a JSON object with an 'addons' list.")
+            rows_raw = raw_addons.get("addons")
+            if not isinstance(rows_raw, list):
+                raise ValueError("plan_addons.json.addons must be a list.")
+
+            imported_clean: list[dict] = []
+            skipped_rows = 0
+            for row in rows_raw:
+                normalized = _normalize_plan_addon(row) if isinstance(row, dict) else None
+                if normalized is None:
+                    skipped_rows += 1
+                    continue
+                imported_clean.append(normalized)
+
+            imported_cfg = {"addons": imported_clean}
+            save_plan_addons_config(imported_cfg)
+            st.session_state["plan_addons_cfg"] = imported_cfg
+            st.session_state[addon_editor_rows_key] = [_addon_to_editor_row(x) for x in imported_clean]
+            st.success(
+                f"Imported add-ons library ({len(imported_clean)} rows saved, {skipped_rows} rows skipped)."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not import add-ons: {e}")
+
+    st.divider()

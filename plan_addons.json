@@ -1,0 +1,77 @@
+{
+  "addons": [
+    {
+      "provider": "Origin",
+      "addon_name": "Origin Loop VPP credit (illustrative)",
+      "addon_type": "vpp",
+      "eligible_base_plans": [
+        "Origin Boost",
+        "Origin Battery Maximiser",
+        "Origin Go Variable (Sign on bonus)"
+      ],
+      "requires_home_battery": true,
+      "min_battery_kwh": 8.0,
+      "requires_solar": true,
+      "min_solar_kw": 3.0,
+      "requires_ev": false,
+      "requires_vpp_opt_in": true,
+      "value_type": "annual_credit",
+      "annual_value_aud": 132.0,
+      "ev_target_rate_c_per_kwh": 8.0,
+      "ev_eligible_share_pct": 100.0,
+      "active": true,
+      "as_of": "2026-03-04",
+      "source": "Internal starter preset",
+      "source_url": "https://www.originenergy.com.au/",
+      "notes": "Starter placeholder. Replace with current market terms before decision use."
+    },
+    {
+      "provider": "AGL",
+      "addon_name": "AGL VPP annual credit (illustrative)",
+      "addon_type": "vpp",
+      "eligible_base_plans": [
+        "AGL Ned"
+      ],
+      "requires_home_battery": true,
+      "min_battery_kwh": 8.0,
+      "requires_solar": true,
+      "min_solar_kw": 3.0,
+      "requires_ev": false,
+      "requires_vpp_opt_in": true,
+      "value_type": "annual_credit",
+      "annual_value_aud": 80.0,
+      "ev_target_rate_c_per_kwh": 8.0,
+      "ev_eligible_share_pct": 100.0,
+      "active": true,
+      "as_of": "2026-03-04",
+      "source": "Internal starter preset",
+      "source_url": "https://www.agl.com.au/residential/solar-and-batteries/virtual-power-plant",
+      "notes": "Starter placeholder based on recurring annual credit style only. Excludes one-off join credits and event-variable upside."
+    },
+    {
+      "provider": "Origin",
+      "addon_name": "Origin EV Power Up",
+      "addon_type": "ev",
+      "eligible_base_plans": [
+        "Origin Boost",
+        "Origin Battery Maximiser",
+        "Origin Go Variable (Sign on bonus)"
+      ],
+      "requires_home_battery": false,
+      "min_battery_kwh": NaN,
+      "requires_solar": false,
+      "min_solar_kw": NaN,
+      "requires_ev": true,
+      "requires_vpp_opt_in": false,
+      "value_type": "ev_rate_discount",
+      "annual_value_aud": NaN,
+      "ev_target_rate_c_per_kwh": 8.0,
+      "ev_eligible_share_pct": 85.0,
+      "active": true,
+      "as_of": "2026-03-04",
+      "source": "None",
+      "source_url": "None",
+      "notes": "None"
+    }
+  ]
+}
