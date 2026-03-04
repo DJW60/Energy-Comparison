@@ -1,0 +1,26 @@
+{
+  "default_preset": "General Li-ion (typical)",
+  "presets": [
+    {
+      "name": "General Li-ion (typical)",
+      "cycle_life_efc": 6000,
+      "eol_capacity_pct": 80,
+      "source": "Internal default",
+      "notes": "Generic baseline for modern residential Li-ion batteries."
+    },
+    {
+      "name": "Conservative aging",
+      "cycle_life_efc": 5000,
+      "eol_capacity_pct": 75,
+      "source": "Internal default",
+      "notes": "Stress-test assumptions when warranty evidence is limited."
+    },
+    {
+      "name": "High-cycle Li-ion",
+      "cycle_life_efc": 8000,
+      "eol_capacity_pct": 80,
+      "source": "Internal default",
+      "notes": "Optimistic assumption for strong cycling warranties."
+    }
+  ]
+}
