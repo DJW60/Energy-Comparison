@@ -1718,7 +1718,7 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
 
 
 # =========================
-# Battery simulation (Level 1 dispatch, no grid charging)
+# Battery and Solar Simulator (Level 1 dispatch, no grid charging)
 # =========================
 
 @dataclass
@@ -2843,7 +2843,7 @@ def render_help_and_glossary() -> None:
             "- `Overview`: Dataset sanity checks, totals, and demand profile.\n"
             "- `Comparison`: Fast ranking of plans by estimated total cost.\n"
             "- `Breakdowns`: Daily totals, TOU bands, invoice-style line items, forecast, risk, sensitivity, battery outputs.\n"
-            "- `Battery simulation`: Detailed battery economics and dispatch results.\n"
+            "- `Battery and Solar Simulator`: Detailed battery economics and dispatch results.\n"
             "- `Plan Library`: Create, duplicate, edit, export, and import plans."
         )
 
@@ -2905,12 +2905,12 @@ st.set_page_config(page_title="Energex Retailer Comparator", layout='wide')
 # --- Navigation (pro polish) ---
 section = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Comparison", "Breakdowns", "Battery simulation", "Plan Library", "Help & Glossary"],
+    ["Overview", "Comparison", "Breakdowns", "Battery and Solar Simulator", "Plan Library", "Help & Glossary"],
     index=0,
 )
 show_overview_only = section == "Overview"
 show_comparison_only = section == "Comparison"
-show_battery_only = section == "Battery simulation"
+show_battery_only = section == "Battery and Solar Simulator"
 show_plan_library_only = section == "Plan Library"
 show_help_only = section == "Help & Glossary"
 st.title("Electricity plan comparator (Energex) - NEM12 5-minute CSV")
@@ -3048,7 +3048,7 @@ has_home_battery = st.sidebar.checkbox(
     key="has_home_battery",
     help=(
         "Used to keep retailer ranking fair. If off, battery-dependent plans are excluded by default "
-        "from Comparison results."
+        "from Comparison, Risk & volatility, and Scenario & sensitivity views."
     ),
 )
 if has_home_battery:
@@ -3062,7 +3062,11 @@ else:
         help="Turn on to force these plans back into the no-battery comparison table.",
     )
 
-with st.sidebar.expander("EV charging scenario", expanded=False):
+with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
+    st.caption(
+        "This modifies interval load/export across the app. "
+        "It is separate from the Current setup profile EV fields used for What-if defaults and add-on eligibility."
+    )
     ev_enabled = st.checkbox(
         "Include EV charging",
         value=False,
@@ -3214,7 +3218,7 @@ if "current_setup_vpp_opt_in" not in st.session_state:
 
 with st.sidebar.expander("Current setup profile", expanded=False):
     st.caption(
-        "Used to prefill What-if inputs and assess add-on eligibility (auto-updates when changed). "
+        "Used to prefill What-if inputs and assess add-on eligibility only (does not alter interval data). "
         "Battery size defaults to 0 kWh when home battery is off, and can still be overridden."
     )
     st.number_input(
@@ -3242,7 +3246,7 @@ with st.sidebar.expander("Current setup profile", expanded=False):
         key="current_setup_battery_power_kw",
     )
     st.checkbox(
-        "Current EV enabled",
+        "Current household has EV",
         value=bool(st.session_state.get("current_setup_ev_enabled", False)),
         key="current_setup_ev_enabled",
     )
@@ -3253,7 +3257,7 @@ with st.sidebar.expander("Current setup profile", expanded=False):
         help="Used to determine whether VPP-style add-on offers are treated as eligible.",
     )
     st.number_input(
-        "Current EV km/yr",
+        "Current EV driving (km/yr)",
         min_value=0.0,
         max_value=100000.0,
         value=float(st.session_state.get("current_setup_ev_km_yr", 12000.0)),
@@ -3677,7 +3681,7 @@ if excluded_battery_dependent_plans:
         )
         _show_comparison_with_frozen_plan(df_excluded, plan_col="Plan")
     st.caption(
-        "Battery simulation and optimiser tabs still use the full plan library, including battery-dependent plans."
+        "Battery and Solar Simulator tab and optimiser views still use the full plan library, including battery-dependent plans."
     )
 
 # Highlight current retailer in displayed tables
@@ -3771,15 +3775,15 @@ if show_comparison_only:
 st.subheader("Breakdowns")
 if show_plan_library_only:
     tab9, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-        ["Plan Library", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery"]
+        ["Plan Library", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery and Solar Simulator"]
     )
 elif show_battery_only:
     tab8, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab9 = st.tabs(
-        ["Battery", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Plan Library"]
+        ["Battery and Solar Simulator", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Plan Library"]
     )
 else:
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-    ["Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery", "Plan Library"]
+    ["Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery and Solar Simulator", "Plan Library"]
     )
 
 with tab1:
@@ -3802,12 +3806,17 @@ with tab1:
     st.dataframe(dwin.tail(14), use_container_width=True)
 
 with tab2:
-    selected_name = st.selectbox("Select a plan to view TOU breakdown", [p.name for p in plans], index=_default_plan_index([p.name for p in plans], 0))
-    selected_plan = next(p for p in plans if p.name == selected_name)
-
-    if selected_plan.import_type != "tou":
-        st.info("This plan is not TOU (no peak/shoulder/off-peak breakdown).")
+    tou_plans = [p for p in plans if p.import_type == "tou" and p.tou is not None]
+    if not tou_plans:
+        st.info("No TOU plans are available in the current library.")
     else:
+        tou_names = [p.name for p in tou_plans]
+        selected_name = st.selectbox(
+            "Select a plan to view TOU breakdown",
+            tou_names,
+            index=_default_plan_index(tou_names, 0),
+        )
+        selected_plan = next(p for p in tou_plans if p.name == selected_name)
         bd = tou_breakdown_general(df_int, selected_plan.tou).copy()
         if bd.empty:
             st.warning("No general usage data found for E1.")
@@ -4088,16 +4097,43 @@ def _unique_name(existing: list[str], base: str) -> str:
     return f"{base} ({i})"
 
 
+# No-battery filter applied to Risk & volatility and Scenario & sensitivity tabs.
+risk_scenario_plans = list(plans)
+excluded_battery_dependent_risk_scenario: list[tuple[Plan, str]] = []
+if not bool(has_home_battery):
+    _risk_scenario_filtered: list[Plan] = []
+    for _plan in plans:
+        _reason = _battery_dependent_plan_reason(_plan)
+        if _reason:
+            excluded_battery_dependent_risk_scenario.append((_plan, _reason))
+        else:
+            _risk_scenario_filtered.append(_plan)
+    if _risk_scenario_filtered:
+        risk_scenario_plans = _risk_scenario_filtered
+    else:
+        risk_scenario_plans = list(plans)
+        excluded_battery_dependent_risk_scenario = []
+
+
 
 
 with tab6:
     st.subheader("Risk & volatility analysis")
     st.caption("Shows how bills vary month-to-month for each plan (useful for solar households assessing downside risk, not just averages).")
+    if excluded_battery_dependent_risk_scenario:
+        st.info(
+            f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
+        )
+        with st.expander("Show excluded plans for this tab"):
+            st.dataframe(
+                pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
+                use_container_width=True,
+            )
 
     risk_rows = []
     monthly_wide = None
 
-    for p in plans:
+    for p in risk_scenario_plans:
         m = monthly_totals(df_int, p)
         if m.empty:
             continue
@@ -4153,6 +4189,15 @@ with tab6:
 with tab7:
     st.subheader("Scenario & sensitivity")
     st.caption("Stress-test plan rankings for solar households by adjusting usage/export and escalating tariffs.")
+    if excluded_battery_dependent_risk_scenario:
+        st.info(
+            f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
+        )
+        with st.expander("Show excluded plans for this tab"):
+            st.dataframe(
+                pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
+                use_container_width=True,
+            )
 
     if df_int is None or df_int.empty:
         st.info("Upload a dataset to enable scenarios.")
@@ -4234,7 +4279,7 @@ with tab7:
             return pp
 
         rows_scn = []
-        for p in plans:
+        for p in risk_scenario_plans:
             p_scn = _uplift_plan(p)
             sim_scn = simulate_plan(df_scn, p_scn, include_signup_credit=True)
 
@@ -4281,13 +4326,13 @@ with tab7:
 
 
 with tab8:
-    st.subheader("Battery simulation (Level 1: solar-only charging)")
+    st.subheader("Battery and Solar Simulator (Level 1: solar-only charging)")
     st.caption("Simulates a behind-the-meter battery that **only charges from PV surplus (reduces export)** and discharges to offset imports during high-rate periods (no grid charging).")
     st.caption("Battery economics and optimizer metrics exclude one-time plan sign-up credits.")
     if not bool(st.session_state.get("has_home_battery", False)):
         st.info(
             "Battery optimiser still includes battery-only and battery-dependent plans. "
-            "The no-battery filter only affects the Comparison results table."
+            "No-battery filtering applies to Comparison, Risk & volatility, and Scenario & sensitivity."
         )
     if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
         st.info(
@@ -4296,7 +4341,7 @@ with tab8:
         )
 
     if df_int is None or df_int.empty:
-        st.info("Upload a dataset to enable battery simulation.")
+        st.info("Upload a dataset to enable Battery and Solar Simulator.")
     else:
         plan_names = [p.name for p in plans_lib] if plans_lib else []
         if not plan_names:
@@ -4388,13 +4433,13 @@ with tab8:
             st.markdown("**Battery cost & payback:**")
             cost_mode = st.radio(
                 "Cost input",
-                ["$/kWh (installed)", "Total battery cost ($)"],
+                ["$/kWh (installed)", "Total Quoted Battery Cost ($)"],
                 index=0,
                 horizontal=True,
                 key="battery_cost_mode",
-                help="Use $/kWh for scalable sizing assumptions, or Total battery cost for a fixed installed quote.",
+                help="Use direct $/kWh, or use Total Quoted Battery Cost for limited/indicative multi-size comparisons by deriving an implied $/kWh from the quoted size.",
             )
-            c_cost1, c_cost2 = st.columns(2)
+            c_cost1, c_cost2, c_cost3 = st.columns(3)
             with c_cost1:
                 cost_per_kwh = st.number_input(
                     "Cost per kWh ($/kWh)",
@@ -4406,13 +4451,42 @@ with tab8:
                 )
             with c_cost2:
                 total_cost_fixed = st.number_input(
-                    "Total battery cost ($)",
+                    "Total quoted battery cost ($)",
                     min_value=0.0,
                     value=12000.0,
                     step=500.0,
                     key="battery_total_cost_fixed",
-                    help="Used when Cost input is Total battery cost ($).",
+                    help="Used with quoted size when Cost input is Total Quoted Battery Cost ($).",
                 )
+            with c_cost3:
+                total_cost_quote_kwh = st.number_input(
+                    "Total-cost quoted size (kWh)",
+                    min_value=0.1,
+                    max_value=120.0,
+                    value=13.5,
+                    step=0.5,
+                    key="battery_total_cost_quote_kwh",
+                    disabled=cost_mode.startswith("$/kWh"),
+                    help="When using Total Quoted Battery Cost, this quoted size is used to convert the total into an implied $/kWh for limited/indicative size comparisons.",
+                )
+
+            if cost_mode.startswith("$/kWh"):
+                battery_cost_rate_per_kwh = float(cost_per_kwh)
+                st.caption(f"Effective battery capex rate for all tested sizes: **${battery_cost_rate_per_kwh:,.2f}/kWh**.")
+            else:
+                quote_kwh = max(float(total_cost_quote_kwh or 0.0), 0.0)
+                battery_cost_rate_per_kwh = (float(total_cost_fixed) / quote_kwh) if quote_kwh > 0 else 0.0
+                st.caption(
+                    "Derived capex rate for size comparisons: "
+                    f"**${battery_cost_rate_per_kwh:,.2f}/kWh** "
+                    f"(= ${float(total_cost_fixed):,.0f} / {quote_kwh:.1f} kWh)."
+                )
+
+            def _battery_capex_for_size(size_kwh: float) -> float:
+                size = max(float(size_kwh or 0.0), 0.0)
+                if size <= 0.0:
+                    return 0.0
+                return float(size * battery_cost_rate_per_kwh)
 
             st.markdown("**Financial assumptions:**")
 
@@ -4701,6 +4775,8 @@ with tab8:
                 "cost_mode": str(cost_mode),
                 "cost_per_kwh": round(float(cost_per_kwh), 4),
                 "total_cost_fixed": round(float(total_cost_fixed), 4),
+                "total_cost_quote_kwh": round(float(total_cost_quote_kwh), 4),
+                "effective_battery_cost_rate_per_kwh": round(float(battery_cost_rate_per_kwh), 6),
                 "scenario": str(st.session_state.get("scenario_preset", "Typical")),
                 "battery_aging_model": str(aging_model),
                 "battery_assumption_preset": str(assumption_preset_name),
@@ -4797,26 +4873,16 @@ with tab8:
                 st.info("Run **Retailer + solar + battery decision optimiser** in **Best overall retailer + solar + battery** to generate a recommendation here.")
 
 
-            battery_subtab_options = [
-                "Quick comparison",
-                "Battery economics (selected retailer)",
-                "Best overall retailer + solar + battery",
-                "What-if: current vs optimised",
-            ]
-            if ("battery_subtab" not in st.session_state) or (st.session_state.get("battery_subtab") not in battery_subtab_options):
-                st.session_state["battery_subtab"] = battery_subtab_options[0]
-            selected_battery_subtab = st.radio(
-                "Battery results view",
-                battery_subtab_options,
-                horizontal=True,
-                key="battery_subtab",
+            batt_tab_compare, batt_tab_opt, batt_tab_joint, batt_tab_whatif = st.tabs(
+                [
+                    "Quick comparison",
+                    "Battery economics (selected retailer)",
+                    "Best overall retailer + solar + battery",
+                    "What-if: current vs optimised",
+                ]
             )
-            sub_compare = selected_battery_subtab == battery_subtab_options[0]
-            sub_opt = selected_battery_subtab == battery_subtab_options[1]
-            sub_joint = selected_battery_subtab == battery_subtab_options[2]
-            sub_whatif = selected_battery_subtab == battery_subtab_options[3]
 
-            if sub_compare:
+            with batt_tab_compare:
                 st.markdown("**Quick comparison (pick a few battery sizes to compare):**")
                 size_options = [0.0, 3.0, 5.0, 7.0, 10.0, 13.5, 15.0, 20.0]
                 chosen_sizes = st.multiselect("Sizes", size_options, default=[0.0, 5.0, 10.0, 13.5], key="batt_sizes_compare")
@@ -4862,10 +4928,7 @@ with tab8:
                             savings = (base_total - tot) / 100.0
                             annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
 
-                            if cost_mode.startswith("$/kWh"):
-                                batt_cost = float(cap) * float(cost_per_kwh)
-                            else:
-                                batt_cost = float(total_cost_fixed)
+                            batt_cost = _battery_capex_for_size(cap)
 
                             battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
                             cycle_metrics = _battery_cycle_metrics(
@@ -4976,7 +5039,7 @@ with tab8:
                 else:
                     st.info("Run comparison to generate results.")
 
-            if sub_opt:
+            with batt_tab_opt:
                 st.markdown("**Battery economics (selected retailer):**")
                 st.caption("Explore how battery size changes savings, NPV and IRR for the selected retailer.")
                 o1, o2, o3 = st.columns(3)
@@ -5048,7 +5111,7 @@ with tab8:
                             tot = float(sim_b.get("total_cents", 0.0))
                             savings = (base_total - tot) / 100.0
                             annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
-                            batt_cost = float(cap) * float(cost_per_kwh) if cost_mode.startswith("$/kWh") else float(total_cost_fixed)
+                            batt_cost = _battery_capex_for_size(cap)
                             battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
                             cycle_metrics = _battery_cycle_metrics(
                                 battery_cycles_equiv=battery_cycles_equiv,
@@ -5140,7 +5203,7 @@ with tab8:
                     st.line_chart(df_opt[["Battery (kWh)", "NPV ($)"]].copy().set_index("Battery (kWh)"))
                 else:
                     st.info("Run battery economics to generate results.")
-            if sub_joint:
+            with batt_tab_joint:
                 st.markdown("**Best overall retailer + solar + battery (decision wizard):**")
                 st.caption("Sweeps battery sizes for each retailer and optionally solar sizes, then ranks combinations by lowest PV lifetime cost.")
 
@@ -5345,7 +5408,7 @@ with tab8:
                                     tot = float(sim_b.get("total_cents", 0.0))
                                     savings = (base_total - tot) / 100.0
                                     annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
-                                    batt_cost = float(cap) * float(cost_per_kwh) if cost_mode.startswith("$/kWh") else float(total_cost_fixed)
+                                    batt_cost = _battery_capex_for_size(cap)
 
                                     battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
                                     cycle_metrics = _battery_cycle_metrics(
@@ -5509,11 +5572,15 @@ with tab8:
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
                     st.info("Run 'Find best retailer + solar + battery' to generate results.")
-            if sub_whatif:
+            with batt_tab_whatif:
                 st.markdown("**What-if: current vs optimised:**")
                 st.caption(
                     "Simple mode: compare your current setup against one what-if scenario, "
                     "then benchmark against the optimizer recommendation."
+                )
+                st.caption(
+                    "EV timing/charger assumptions come from the sidebar Global EV charging model. "
+                    "Fields below control EV presence and annual driving in each What-if case."
                 )
 
                 plan_options_whatif = [p.name for p in plans_lib] if plans_lib else []
@@ -5629,13 +5696,13 @@ with tab8:
                         )
                     with c5:
                         current_ev_enabled_input = st.checkbox(
-                            "EV charging enabled",
+                            "EV enabled in this case",
                             value=bool(st.session_state.get("whatif_simple_current_ev_enabled", default_ev_profile_enabled)),
                             key="whatif_simple_current_ev_enabled",
                         )
                     with c6:
                         current_ev_km_input = st.number_input(
-                            "EV km/yr",
+                            "EV driving in this case (km/yr)",
                             min_value=0.0,
                             max_value=100000.0,
                             value=float(st.session_state.get("whatif_simple_current_ev_km", default_ev_profile_km)),
@@ -5648,7 +5715,7 @@ with tab8:
                         "What-if scenario",
                         [
                             "Current setup only",
-                            "Higher EV use (+25%)",
+                            "Higher EV driving (+25%)",
                             "Bigger battery (+5 kWh)",
                             "No battery",
                             "Custom",
@@ -5699,13 +5766,13 @@ with tab8:
                                 )
                             with cc5:
                                 custom_ev_enabled = st.checkbox(
-                                    "What-if EV enabled",
+                                    "What-if EV enabled in this case",
                                     value=bool(current_ev_enabled_input),
                                     key="whatif_simple_custom_ev_enabled",
                                 )
                             with cc6:
                                 custom_ev_km = st.number_input(
-                                    "What-if EV km/yr",
+                                    "What-if EV driving (km/yr)",
                                     min_value=0.0,
                                     max_value=100000.0,
                                     value=float(current_ev_km_input),
@@ -5722,6 +5789,62 @@ with tab8:
                             "ev_km": float(custom_ev_km),
                         }
 
+                    whatif_run_signature_current = {
+                        "current_plan": str(current_plan_input),
+                        "current_solar_kw": round(float(current_solar_kw_input), 4),
+                        "current_batt_kwh": round(float(current_batt_kwh_input), 4),
+                        "current_batt_power_kw": round(float(current_batt_power_kw_input), 4),
+                        "current_ev_enabled": bool(current_ev_enabled_input),
+                        "current_ev_km": round(float(current_ev_km_input), 2),
+                        "whatif_choice": str(whatif_choice),
+                        "whatif_custom": (
+                            {
+                                "plan": str(custom_params.get("plan", "")),
+                                "solar_kw": round(float(custom_params.get("solar_kw", 0.0)), 4),
+                                "batt_kwh": round(float(custom_params.get("batt_kwh", 0.0)), 4),
+                                "batt_power_kw": round(float(custom_params.get("batt_power_kw", 0.0)), 4),
+                                "ev_enabled": bool(custom_params.get("ev_enabled", False)),
+                                "ev_km": round(float(custom_params.get("ev_km", 0.0)), 2),
+                            }
+                            if isinstance(custom_params, dict)
+                            else None
+                        ),
+                        "global_ev_model": {
+                            "enabled": bool(ev_enabled),
+                            "annual_km": round(float(ev_annual_km), 2),
+                            "consumption_kwh_per_100km": round(float(ev_consumption), 4),
+                            "charging_loss_pct": round(float(ev_loss_pct), 4),
+                            "charger_kw": round(float(ev_charger_kw), 4),
+                            "charge_days": str(ev_charge_days_label),
+                            "strategy": str(ev_strategy_label),
+                            "timer_start": ev_timer_start_t.strftime("%H:%M"),
+                            "timer_end": ev_timer_end_t.strftime("%H:%M"),
+                            "solar_start": ev_solar_start_t.strftime("%H:%M"),
+                            "solar_end": ev_solar_end_t.strftime("%H:%M"),
+                            "backup_start": ev_backup_start_t.strftime("%H:%M"),
+                            "backup_end": ev_backup_end_t.strftime("%H:%M"),
+                        },
+                        "battery_model": {
+                            "roundtrip_eff": round(float(roundtrip_eff), 6),
+                            "reserve_pct": round(float(reserve_pct), 4),
+                            "init_soc_pct": round(float(init_soc_pct), 4),
+                            "cost_mode": str(cost_mode),
+                            "cost_per_kwh": round(float(cost_per_kwh), 4),
+                            "total_cost_fixed": round(float(total_cost_fixed), 4),
+                            "total_cost_quote_kwh": round(float(total_cost_quote_kwh), 4),
+                            "effective_battery_cost_rate_per_kwh": round(float(battery_cost_rate_per_kwh), 6),
+                            "battery_life_years": int(battery_life_years),
+                            "discount_rate": round(float(discount_rate), 6),
+                            "degradation_rate": round(float(degradation_rate), 6),
+                            "price_growth_rate": round(float(price_growth_rate), 6),
+                            "cycle_aware": bool(cycle_aware),
+                            "cycle_life_efc": round(float(cycle_life_efc), 4),
+                            "eol_capacity_frac": round(float(eol_capacity_frac), 6),
+                        },
+                        "has_solar_profile": bool(has_solar_profile),
+                        "base_solar_kw_for_scaling": round(float(base_solar_kw_for_scaling), 4),
+                    }
+
                     def _run_simple_case(
                         case_name: str,
                         plan_name: str,
@@ -5734,9 +5857,11 @@ with tab8:
                         plan_case = next((p for p in plans_lib if p.name == plan_name), None)
                         if plan_case is None:
                             return None, f"{case_name}: plan '{plan_name}' not found."
+                        ev_enabled_flag = bool(ev_enabled_case)
+                        ev_km_display = float(ev_km_case) if ev_enabled_flag else 0.0
 
                         ev_case = EVParams(
-                            enabled=bool(ev_enabled_case),
+                            enabled=ev_enabled_flag,
                             annual_km=float(ev_km_case),
                             consumption_kwh_per_100km=float(ev_consumption),
                             charging_loss_frac=float(ev_loss_pct) / 100.0,
@@ -5795,12 +5920,7 @@ with tab8:
                         annual_savings_case = (savings_case * (365.0 / days_case)) if days_case > 0 else 0.0
                         annual_bill_with_batt_case = ((total_case / 100.0) * (365.0 / days_case)) if days_case > 0 else (total_case / 100.0)
 
-                        if float(batt_kwh) <= 0:
-                            batt_cost_case = 0.0
-                        elif cost_mode.startswith("$/kWh"):
-                            batt_cost_case = float(batt_kwh) * float(cost_per_kwh)
-                        else:
-                            batt_cost_case = float(total_cost_fixed)
+                        batt_cost_case = _battery_capex_for_size(batt_kwh)
 
                         cycle_metrics_case = _battery_cycle_metrics(
                             battery_cycles_equiv=float(sim_case.get("battery_cycles_equiv", 0.0) or 0.0),
@@ -5828,7 +5948,8 @@ with tab8:
                             "Plan": str(plan_name),
                             "Solar size (kW)": round(float(solar_kw), 2),
                             "Battery (kWh)": round(float(batt_kwh), 2),
-                            "EV km/yr": round(float(ev_km_case), 0),
+                            "EV enabled": ("Yes" if ev_enabled_flag else "No"),
+                            "EV km/yr": round(float(ev_km_display), 0),
                             "Annual bill with battery ($/yr)": round(float(annual_bill_with_batt_case), 0),
                             "Annualised savings ($/yr)": round(float(annual_savings_case), 0),
                             "NPV ($)": round(float(npv_case), 0),
@@ -5858,7 +5979,7 @@ with tab8:
                             rows_simple.append(current_row)
 
                         if whatif_choice != "Current setup only":
-                            if whatif_choice == "Higher EV use (+25%)":
+                            if whatif_choice == "Higher EV driving (+25%)":
                                 whatif_params = {
                                     "plan": str(current_plan_input),
                                     "solar_kw": float(current_solar_kw_input),
@@ -5917,6 +6038,7 @@ with tab8:
                                     "Plan": str(best_opt.get("Plan", "-")),
                                     "Solar size (kW)": best_opt.get("Optimal solar size (kW)"),
                                     "Battery (kWh)": best_opt.get("Optimal battery (kWh)"),
+                                    "EV enabled": None,
                                     "EV km/yr": None,
                                     "Annual bill with battery ($/yr)": best_opt.get("Estimated annual bill with battery ($/yr)"),
                                     "Annualised savings ($/yr)": best_opt.get("Annualised savings ($/yr)"),
@@ -5934,13 +6056,30 @@ with tab8:
                             st.session_state["whatif_simple_meta"] = {
                                 "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "choice": str(whatif_choice),
+                                "signature": whatif_run_signature_current,
                             }
                             if notes:
                                 st.warning("Notes: " + " | ".join(notes))
 
                     df_simple = st.session_state.get("whatif_simple_df")
-                    if isinstance(df_simple, pd.DataFrame) and not df_simple.empty:
-                        meta_simple = st.session_state.get("whatif_simple_meta") or {}
+                    meta_simple = st.session_state.get("whatif_simple_meta") or {}
+                    show_simple_results = isinstance(df_simple, pd.DataFrame) and not df_simple.empty
+                    if show_simple_results:
+                        saved_signature = meta_simple.get("signature")
+                        if (not isinstance(saved_signature, dict)) or (saved_signature != whatif_run_signature_current):
+                            if meta_simple.get("run_at"):
+                                st.caption(f"Last run: {meta_simple['run_at']}")
+                            st.warning(
+                                "Inputs changed since the last What-if run (or the saved run predates current settings), so these results are stale. "
+                                "Click 'Run simple comparison' to refresh."
+                            )
+                            if st.button("Clear stale What-if results", key="btn_clear_whatif_simple_stale"):
+                                st.session_state.pop("whatif_simple_df", None)
+                                st.session_state.pop("whatif_simple_meta", None)
+                                st.rerun()
+                            show_simple_results = False
+
+                    if show_simple_results:
                         if meta_simple.get("run_at"):
                             st.caption(f"Last run: {meta_simple['run_at']}")
                         if meta_simple.get("choice"):
