@@ -5206,6 +5206,10 @@ with tab8:
             with batt_tab_joint:
                 st.markdown("**Best overall retailer + solar + battery (decision wizard):**")
                 st.caption("Sweeps battery sizes for each retailer and optionally solar sizes, then ranks combinations by lowest PV lifetime cost.")
+                st.caption(
+                    "Quick comparison optimises battery for one fixed plan/solar profile. "
+                    "This joint optimizer re-optimises plan + solar + battery together."
+                )
 
                 solar_available = bool(
                     isinstance(solar_profile_for_battery, pd.DataFrame)
@@ -5363,9 +5367,28 @@ with tab8:
                                 "wide_base": _intervals_wide_from_long(df_case),
                             })
 
+                        # Reference for "total savings" reporting:
+                        # same plan at current solar size, no battery.
+                        if enable_solar_sweep:
+                            df_current_solar_case, _, _ = apply_pv_scale_to_intervals(
+                                df_int,
+                                solar_profile_for_battery,
+                                1.0,
+                            )
+                        else:
+                            df_current_solar_case = df_int
+
                         for plan_idx, p in enumerate(plans_lib, start=1):
                             plan_progress.progress(float(plan_idx - 1) / float(max(len(plans_lib), 1)))
                             best = None
+                            baseline_current_solar = simulate_plan(df_current_solar_case, p, include_signup_credit=False)
+                            base_current_total = float(baseline_current_solar.get("total_cents", 0.0))
+                            days_current = float(baseline_current_solar.get("days", 0.0) or 0.0)
+                            annual_bill_current_solar = (
+                                (base_current_total / 100.0) * (365.0 / days_current)
+                                if days_current > 0
+                                else (base_current_total / 100.0)
+                            )
 
                             for pv_case in pv_cases:
                                 pv_kw = float(pv_case["pv_kw"])
@@ -5408,6 +5431,8 @@ with tab8:
                                     tot = float(sim_b.get("total_cents", 0.0))
                                     savings = (base_total - tot) / 100.0
                                     annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
+                                    annual_bill_with_battery = float(max(0.0, annual_base_bill - annual_savings))
+                                    total_savings_vs_current_solar = float(annual_bill_current_solar - annual_bill_with_battery)
                                     batt_cost = _battery_capex_for_size(cap)
 
                                     battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
@@ -5455,7 +5480,10 @@ with tab8:
                                         "Battery NPV ($)": float(npv_val),
                                         "IRR (%)": (float(irr_val) * 100.0 if irr_val is not None else None),
                                         "Annualised savings ($/yr)": float(annual_savings),
-                                        "Estimated annual bill with battery ($/yr)": float(max(0.0, annual_base_bill - annual_savings)),
+                                        "Battery incremental savings vs same solar ($/yr)": float(annual_savings),
+                                        "Total savings vs current solar, no battery ($/yr)": float(total_savings_vs_current_solar),
+                                        "Estimated annual bill with battery ($/yr)": annual_bill_with_battery,
+                                        "Current solar/no-battery annual bill ($/yr)": float(annual_bill_current_solar),
                                         "Incremental solar capex ($)": float(pv_capex),
                                         "Battery cost ($)": float(batt_cost),
                                         "Cycles equiv": round(battery_cycles_equiv, 2),
@@ -5533,7 +5561,11 @@ with tab8:
                     best = df_joint.iloc[0]
                     payback = None
                     try:
-                        sav = float(best.get("Annualised savings ($/yr)", 0.0) or 0.0)
+                        sav = float(
+                            best.get("Total savings vs current solar, no battery ($/yr)",
+                                     best.get("Annualised savings ($/yr)", 0.0))
+                            or 0.0
+                        )
                         bc = float(best.get("Battery cost ($)", 0.0) or 0.0) + float(best.get("Incremental solar capex ($)", 0.0) or 0.0)
                         if sav > 0:
                             payback = bc / sav
@@ -5545,20 +5577,27 @@ with tab8:
                         s1.metric("Best plan", str(best.get("Plan", "-")))
                         s2.metric("Best solar size", f"{float(best.get('Optimal solar size (kW)', 0.0)):.1f} kW")
                         s3.metric("Best battery size", f"{float(best.get('Optimal battery (kWh)', 0.0)):.1f} kWh")
-                        s4.metric("Year-1 savings", f"${float(best.get('Annualised savings ($/yr)', 0.0)):.0f}/yr")
+                        s4.metric(
+                            "Year-1 total savings",
+                            f"${float(best.get('Total savings vs current solar, no battery ($/yr)', best.get('Annualised savings ($/yr)', 0.0))):.0f}/yr",
+                        )
                         s5.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
                     else:
                         s1, s2, s3, s4 = st.columns(4)
                         s1.metric("Best plan", str(best.get("Plan", "-")))
                         s2.metric("Best battery size", f"{float(best.get('Optimal battery (kWh)', 0.0)):.1f} kWh")
-                        s3.metric("Year-1 savings", f"${float(best.get('Annualised savings ($/yr)', 0.0)):.0f}/yr")
+                        s3.metric(
+                            "Year-1 total savings",
+                            f"${float(best.get('Total savings vs current solar, no battery ($/yr)', best.get('Annualised savings ($/yr)', 0.0))):.0f}/yr",
+                        )
                         s4.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
 
                     _show_dataframe_with_frozen_column(df_joint, freeze_col="Optimal battery (kWh)")
                     st.caption(
                         "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + battery cost. Lower is better."
                     )
-                    st.caption("PV lifetime saving is measured against the same solar size with no battery.")
+                    st.caption("`Battery incremental savings vs same solar` isolates battery-only impact at that solar size.")
+                    st.caption("`Total savings vs current solar, no battery` includes both solar-size and battery effects.")
                     st.caption("Cycle stress = implied cycle life more than 20% below assumed life.")
                     stress_rows_joint = df_joint[df_joint["Cycle stress"].astype(str) == "High"] if "Cycle stress" in df_joint.columns else pd.DataFrame()
                     if not stress_rows_joint.empty:
