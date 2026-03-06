@@ -6,8 +6,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 15.323,
     "feed_in_flat_cents_per_kwh": 4.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": null,
     "tou": {
       "bands": [
@@ -65,8 +70,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 18.57,
     "feed_in_flat_cents_per_kwh": 4.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": {
       "cents_per_kwh": 35.36
     },
@@ -81,8 +91,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 15.95,
     "feed_in_flat_cents_per_kwh": 3.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": null,
     "tou": {
       "bands": [
@@ -126,8 +141,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 17.721,
     "feed_in_flat_cents_per_kwh": 0.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": null,
     "tou": {
       "bands": [
@@ -189,8 +209,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 15.32,
     "feed_in_flat_cents_per_kwh": 4.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": {
       "cents_per_kwh": 28.39
     },
@@ -205,8 +230,13 @@
     "controlled_supply_cents_per_day": 3.971,
     "controlled_cents_per_kwh": 17.765,
     "feed_in_flat_cents_per_kwh": 0.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": {
       "cents_per_kwh": 35.244
     },
@@ -225,8 +255,13 @@
     "controlled_supply_cents_per_day": 0.0,
     "controlled_cents_per_kwh": 0.0,
     "feed_in_flat_cents_per_kwh": 5.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": {
       "cents_per_kwh": 26.0
     },
@@ -241,8 +276,13 @@
     "controlled_supply_cents_per_day": 3.97,
     "controlled_cents_per_kwh": 17.78,
     "feed_in_flat_cents_per_kwh": 7.0,
+    "fit_requires_home_battery": true,
+    "fit_min_battery_kwh": 5.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 3.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": null,
     "tou": {
       "bands": [
@@ -289,12 +329,67 @@
     "controlled_supply_cents_per_day": 3.78,
     "controlled_cents_per_kwh": 16.88,
     "feed_in_flat_cents_per_kwh": 3.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
     "monthly_fee_cents": 0.0,
     "signup_credit_cents": 20000.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
     "flat": {
       "cents_per_kwh": 33.49
     },
     "tou": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "1st Energy",
+    "supply_cents_per_day": 150.7,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 0.0,
+    "feed_in_flat_cents_per_kwh": 0.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "discount_pct": 5.0,
+    "discount_applies_to": "usage_and_supply",
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 30.8,
+          "days": "all",
+          "start": "21:00",
+          "end": "00:00"
+        },
+        {
+          "name": "shoulder",
+          "cents_per_kwh": 25.96,
+          "days": "all",
+          "start": "09:00",
+          "end": "16:00"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 47.08,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        },
+        {
+          "name": "off peak",
+          "cents_per_kwh": 30.8,
+          "days": "all",
+          "start": "00:00",
+          "end": "09:00"
+        }
+      ]
+    },
     "feed_in_tiered": null,
     "feed_in_tou": null
   }

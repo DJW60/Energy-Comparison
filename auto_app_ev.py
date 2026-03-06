@@ -327,6 +327,15 @@ def _norm_time_str(s: str) -> str:
     return s
 
 
+def _norm_discount_scope(s: str) -> str:
+    t = str(s or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if t in ("usage_and_supply", "usage+supply", "usage_supply", "all"):
+        return "usage_and_supply"
+    if t in ("usage", "usage_only"):
+        return "usage"
+    return "none"
+
+
 # ---------------------------
 # Plan library persistence (plans.json next to this file)
 # ---------------------------
@@ -670,9 +679,14 @@ class Plan:
     feed_in_flat_cents_per_kwh: float = 0.0
     feed_in_tiered: Optional[TieredFiT] = None
     feed_in_tou: Optional[TouTariff] = None
+    fit_requires_home_battery: bool = False
+    fit_min_battery_kwh: float = 0.0
+    fit_unqualified_feed_in_flat_cents_per_kwh: float = 0.0
 
     monthly_fee_cents: float = 0.0
     signup_credit_cents: float = 0.0
+    discount_pct: float = 0.0
+    discount_applies_to: str = "none"  # none | usage | usage_and_supply
 
 
 def _plan_to_dict(p: Plan) -> dict:
@@ -683,8 +697,13 @@ def _plan_to_dict(p: Plan) -> dict:
         "controlled_supply_cents_per_day": p.controlled_supply_cents_per_day,
         "controlled_cents_per_kwh": p.controlled_cents_per_kwh,
         "feed_in_flat_cents_per_kwh": p.feed_in_flat_cents_per_kwh,
+        "fit_requires_home_battery": bool(p.fit_requires_home_battery),
+        "fit_min_battery_kwh": float(p.fit_min_battery_kwh or 0.0),
+        "fit_unqualified_feed_in_flat_cents_per_kwh": float(p.fit_unqualified_feed_in_flat_cents_per_kwh or 0.0),
         "monthly_fee_cents": p.monthly_fee_cents,
         "signup_credit_cents": p.signup_credit_cents,
+        "discount_pct": float(p.discount_pct or 0.0),
+        "discount_applies_to": _norm_discount_scope(getattr(p, "discount_applies_to", "none")),
         "flat": {"cents_per_kwh": p.flat.cents_per_kwh} if p.flat else None,
         "tou": {"bands": [b.__dict__ for b in p.tou.bands]} if p.tou else None,
         "feed_in_tiered": {
@@ -738,8 +757,13 @@ def _dict_to_plan(d: dict) -> Plan:
         feed_in_flat_cents_per_kwh=float(d.get("feed_in_flat_cents_per_kwh", 0.0)),
         feed_in_tiered=fit,
         feed_in_tou=fit_tou,
+        fit_requires_home_battery=bool(d.get("fit_requires_home_battery", False)),
+        fit_min_battery_kwh=max(float(d.get("fit_min_battery_kwh", 0.0) or 0.0), 0.0),
+        fit_unqualified_feed_in_flat_cents_per_kwh=max(float(d.get("fit_unqualified_feed_in_flat_cents_per_kwh", 0.0) or 0.0), 0.0),
         monthly_fee_cents=float(d.get("monthly_fee_cents", 0.0)),
         signup_credit_cents=float(d.get("signup_credit_cents", 0.0)),
+        discount_pct=max(min(float(d.get("discount_pct", 0.0) or 0.0), 100.0), 0.0),
+        discount_applies_to=_norm_discount_scope(d.get("discount_applies_to", "none")),
     )
 
 
@@ -1401,6 +1425,12 @@ def fit_tou_night_bonus_export_kwh(df_intervals: pd.DataFrame, plan: Plan) -> fl
 
 def _battery_dependent_plan_reason(plan: Plan) -> str | None:
     """Return a plain-language reason when a plan appears battery-targeted."""
+    if bool(getattr(plan, "fit_requires_home_battery", False)):
+        min_kwh = max(float(getattr(plan, "fit_min_battery_kwh", 0.0) or 0.0), 0.0)
+        if min_kwh > 0:
+            return f"Advertised FiT requires at least {min_kwh:.1f} kWh home battery capacity."
+        return "Advertised FiT requires a home battery."
+
     base = float(plan.feed_in_flat_cents_per_kwh or 0.0)
     fit_rows = [b.__dict__ for b in (plan.feed_in_tou.bands if plan.feed_in_tou else [])]
     if _fit_tou_has_night_bonus_rows(fit_rows, base):
@@ -1410,6 +1440,30 @@ def _battery_dependent_plan_reason(plan: Plan) -> str | None:
     if any(tok in nm for tok in ("battery", "powerwall", "vpp", "virtual power")):
         return "Plan name indicates a battery-targeted offer."
     return None
+
+
+def _effective_plan_for_battery_context(plan: Plan, battery_kwh_context: float | None) -> tuple[Plan, str]:
+    """Return (effective_plan, fit_mode) for the provided battery context."""
+    if battery_kwh_context is None:
+        return plan, "as_configured"
+
+    requires = bool(getattr(plan, "fit_requires_home_battery", False))
+    min_kwh = max(float(getattr(plan, "fit_min_battery_kwh", 0.0) or 0.0), 0.0)
+    if (not requires) and min_kwh <= 0.0:
+        return plan, "as_configured"
+
+    batt_kwh = max(float(battery_kwh_context or 0.0), 0.0)
+    eligible = (batt_kwh >= min_kwh) if min_kwh > 0 else (batt_kwh > 0.0 if requires else True)
+    if eligible:
+        return plan, "as_configured"
+
+    # If not eligible, strip bonus FiT structures and apply fallback flat FiT.
+    fallback_fit = max(float(getattr(plan, "fit_unqualified_feed_in_flat_cents_per_kwh", 0.0) or 0.0), 0.0)
+    p_eff = copy.deepcopy(plan)
+    p_eff.feed_in_tou = None
+    p_eff.feed_in_tiered = None
+    p_eff.feed_in_flat_cents_per_kwh = fallback_fit
+    return p_eff, "fallback_no_battery"
 
 
 def _addon_label(addon: dict) -> str:
@@ -1512,10 +1566,28 @@ def _flat_plan_uses_single_import_rate(plan: Plan) -> bool:
         return True
 
 
+def _controlled_uses_general_tou_fallback(plan: Plan) -> bool:
+    """True when controlled load should be priced at general TOU rates."""
+    if plan.import_type != "tou":
+        return False
+    tou_obj = getattr(plan, "tou", None)
+    if tou_obj is None or not hasattr(tou_obj, "bands"):
+        return False
+    try:
+        return float(plan.controlled_cents_per_kwh or 0.0) <= 0.0
+    except Exception:
+        return True
+
+
 # ---------------------------
 # Simulation
 # ---------------------------
-def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit: bool = False) -> dict:
+def simulate_plan(
+    df_intervals: pd.DataFrame,
+    plan: Plan,
+    include_signup_credit: bool = False,
+    battery_kwh_context: float | None = None,
+) -> dict:
     if df_intervals.empty:
         return {
             "days": 0,
@@ -1530,15 +1602,23 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
             "import_kwh": 0.0,
             "import_cents": 0.0,
             "flat_applies_to_all_import": False,
+            "controlled_uses_general_tou_fallback": False,
             "export_credit_cents": 0.0,
             "signup_credit_cents_available": float(plan.signup_credit_cents or 0.0),
             "signup_credit_cents_applied": 0.0,
+            "discount_usage_cents": 0.0,
+            "discount_supply_cents": 0.0,
+            "discount_total_cents": 0.0,
+            "discount_pct": float(plan.discount_pct or 0.0),
+            "discount_applies_to": _norm_discount_scope(getattr(plan, "discount_applies_to", "none")),
+            "fit_mode_applied": "as_configured",
             "total_cents": 0.0,
             "line_items": pd.DataFrame(columns=["item", "qty", "unit", "rate", "amount"]),
         }
 
     df = df_intervals.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    plan_eff, fit_mode_applied = _effective_plan_for_battery_context(plan, battery_kwh_context)
 
     reg = df["register"].astype(str)
     kwh = pd.to_numeric(df["kwh"], errors="coerce").fillna(0.0).astype(float)
@@ -1551,50 +1631,83 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
     n_days = int(g["date"].nunique())
     total_general_kwh = float(g["general_kwh"].sum())
     total_controlled_kwh = float(g["controlled_kwh"].sum())
-    controlled_rate_c = float(plan.controlled_cents_per_kwh or 0.0)
-    flat_applies_to_all_import = _flat_plan_uses_single_import_rate(plan)
+    controlled_rate_c = float(plan_eff.controlled_cents_per_kwh or 0.0)
+    flat_applies_to_all_import = _flat_plan_uses_single_import_rate(plan_eff)
+    controlled_uses_general_tou_fallback = _controlled_uses_general_tou_fallback(plan_eff)
 
     # General import cents
-    if plan.import_type == "flat":
-        rate_c = float(plan.flat.cents_per_kwh if plan.flat else 0.0)
-        general_cents = total_general_kwh * rate_c
-        controlled_cents = total_controlled_kwh * (rate_c if flat_applies_to_all_import else controlled_rate_c)
+    if plan_eff.import_type == "flat":
+        rate_c = float(plan_eff.flat.cents_per_kwh if plan_eff.flat else 0.0)
+        general_cents_base = total_general_kwh * rate_c
+        controlled_cents_base = total_controlled_kwh * (rate_c if flat_applies_to_all_import else controlled_rate_c)
     else:
-        rates = [tou_rate_for_ts(pd.Timestamp(ts), plan.tou) for ts in g["timestamp"]]
+        rates = [tou_rate_for_ts(pd.Timestamp(ts), plan_eff.tou) for ts in g["timestamp"]]
         g["rate_cents_per_kwh"] = rates
-        general_cents = float((g["general_kwh"] * g["rate_cents_per_kwh"]).sum())
-        controlled_cents = total_controlled_kwh * controlled_rate_c
+        general_cents_base = float((g["general_kwh"] * g["rate_cents_per_kwh"]).sum())
+        if controlled_uses_general_tou_fallback:
+            controlled_cents_base = float((g["controlled_kwh"] * g["rate_cents_per_kwh"]).sum())
+        else:
+            controlled_cents_base = total_controlled_kwh * controlled_rate_c
 
     # Supply cents
-    supply_cents = n_days * float(plan.supply_cents_per_day or 0.0)
-    controlled_supply_cents = n_days * float(plan.controlled_supply_cents_per_day or 0.0)
+    supply_cents_base = n_days * float(plan_eff.supply_cents_per_day or 0.0)
+    controlled_supply_cents_base = n_days * float(plan_eff.controlled_supply_cents_per_day or 0.0)
 
     # Monthly fee (scaled)
-    monthly_fee_cents = float(plan.monthly_fee_cents or 0.0) * (n_days / 30.4375)
-    signup_credit_cents_available = float(plan.signup_credit_cents or 0.0)
+    monthly_fee_cents = float(plan_eff.monthly_fee_cents or 0.0) * (n_days / 30.4375)
+    signup_credit_cents_available = float(plan_eff.signup_credit_cents or 0.0)
     signup_credit_cents_applied = signup_credit_cents_available if include_signup_credit else 0.0
 
     # Export credits
     total_export_kwh = float(g["export_kwh"].sum())
-    if _has_fit_tou(plan):
+    if _has_fit_tou(plan_eff):
         export_detail = df[df["register"].isin(EXPORT_REGS)].groupby("timestamp", as_index=False)["kwh"].sum()
         if export_detail.empty:
             export_credit_cents = 0.0
         else:
             export_detail["rate_c_per_kwh"] = export_detail["timestamp"].apply(
-                lambda ts: fit_rate_for_ts(pd.Timestamp(ts), plan)
+                lambda ts: fit_rate_for_ts(pd.Timestamp(ts), plan_eff)
             )
             export_credit_cents = float((export_detail["kwh"] * export_detail["rate_c_per_kwh"]).sum())
-    elif plan.feed_in_tiered:
-        cap_kwh = n_days * float(plan.feed_in_tiered.high_kwh_per_day)
+    elif plan_eff.feed_in_tiered:
+        cap_kwh = n_days * float(plan_eff.feed_in_tiered.high_kwh_per_day)
         high_kwh = min(total_export_kwh, cap_kwh)
         low_kwh = max(total_export_kwh - cap_kwh, 0.0)
         export_credit_cents = (
-            high_kwh * float(plan.feed_in_tiered.high_rate_cents)
-            + low_kwh * float(plan.feed_in_tiered.low_rate_cents)
+            high_kwh * float(plan_eff.feed_in_tiered.high_rate_cents)
+            + low_kwh * float(plan_eff.feed_in_tiered.low_rate_cents)
         )
     else:
-        export_credit_cents = total_export_kwh * float(plan.feed_in_flat_cents_per_kwh or 0.0)
+        export_credit_cents = total_export_kwh * float(plan_eff.feed_in_flat_cents_per_kwh or 0.0)
+
+    # Optional plan discount logic
+    discount_scope = _norm_discount_scope(getattr(plan_eff, "discount_applies_to", "none"))
+    discount_pct = max(min(float(getattr(plan_eff, "discount_pct", 0.0) or 0.0), 100.0), 0.0)
+    if discount_scope == "none":
+        discount_pct = 0.0
+    discount_frac = discount_pct / 100.0
+    usage_discount_cents = 0.0
+    supply_discount_cents = 0.0
+
+    usage_base_cents = float(general_cents_base + controlled_cents_base)
+    if discount_scope in ("usage", "usage_and_supply") and discount_frac > 0 and usage_base_cents > 0:
+        usage_discount_cents = usage_base_cents * discount_frac
+
+    supply_base_cents = float(supply_cents_base + controlled_supply_cents_base)
+    if discount_scope == "usage_and_supply" and discount_frac > 0 and supply_base_cents > 0:
+        supply_discount_cents = supply_base_cents * discount_frac
+
+    # Allocate discount proportionally across line items for downstream metrics.
+    general_discount_cents = (usage_discount_cents * (general_cents_base / usage_base_cents)) if usage_base_cents > 0 else 0.0
+    controlled_discount_cents = usage_discount_cents - general_discount_cents
+    supply_discount_main_cents = (supply_discount_cents * (supply_cents_base / supply_base_cents)) if supply_base_cents > 0 else 0.0
+    controlled_supply_discount_cents = supply_discount_cents - supply_discount_main_cents
+
+    general_cents = float(general_cents_base - general_discount_cents)
+    controlled_cents = float(controlled_cents_base - controlled_discount_cents)
+    supply_cents = float(supply_cents_base - supply_discount_main_cents)
+    controlled_supply_cents = float(controlled_supply_cents_base - controlled_supply_discount_cents)
+    discount_total_cents = float(usage_discount_cents + supply_discount_cents)
 
     total_cents = (
         supply_cents
@@ -1613,28 +1726,28 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
         "item": "Daily Charge",
         "qty": n_days,
         "unit": "days",
-        "rate": float(plan.supply_cents_per_day or 0.0) / 100.0,
-        "amount": supply_cents / 100.0,
+        "rate": float(plan_eff.supply_cents_per_day or 0.0) / 100.0,
+        "amount": supply_cents_base / 100.0,
     })
 
-    if float(plan.controlled_supply_cents_per_day or 0.0) > 0:
+    if float(plan_eff.controlled_supply_cents_per_day or 0.0) > 0:
         line_items.append({
             "item": "Controlled Supply",
             "qty": n_days,
             "unit": "days",
-            "rate": float(plan.controlled_supply_cents_per_day) / 100.0,
-            "amount": controlled_supply_cents / 100.0,
+            "rate": float(plan_eff.controlled_supply_cents_per_day) / 100.0,
+            "amount": controlled_supply_cents_base / 100.0,
         })
 
-    if plan.import_type == "flat":
-        flat_rate = float(plan.flat.cents_per_kwh if plan.flat else 0.0)
+    if plan_eff.import_type == "flat":
+        flat_rate = float(plan_eff.flat.cents_per_kwh if plan_eff.flat else 0.0)
         if flat_applies_to_all_import:
             line_items.append({
                 "item": "Import Usage (single rate)",
                 "qty": total_general_kwh + total_controlled_kwh,
                 "unit": "kWh",
                 "rate": flat_rate / 100.0,
-                "amount": (general_cents + controlled_cents) / 100.0,
+                "amount": (general_cents_base + controlled_cents_base) / 100.0,
             })
         else:
             line_items.append({
@@ -1642,10 +1755,10 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
                 "qty": total_general_kwh,
                 "unit": "kWh",
                 "rate": flat_rate / 100.0,
-                "amount": general_cents / 100.0,
+                "amount": general_cents_base / 100.0,
             })
     else:
-        bd = tou_breakdown_general(df_intervals, plan.tou)
+        bd = tou_breakdown_general(df_intervals, plan_eff.tou)
         for _, r in bd.iterrows():
             line_items.append({
                 "item": str(r["band"]).title(),
@@ -1655,18 +1768,37 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
                 "amount": float(r["cents"]) / 100.0,
             })
 
-    if (plan.import_type != "flat" or not flat_applies_to_all_import) and float(plan.controlled_cents_per_kwh or 0.0) > 0:
+    if (
+        (plan_eff.import_type != "flat" or not flat_applies_to_all_import)
+        and total_controlled_kwh > 0.0
+        and (float(plan_eff.controlled_cents_per_kwh or 0.0) > 0.0 or controlled_uses_general_tou_fallback)
+    ):
+        controlled_item_name = "Controlled Load (general TOU fallback)" if controlled_uses_general_tou_fallback else "Controlled Load"
+        controlled_item_rate_c = (
+            (controlled_cents_base / total_controlled_kwh)
+            if (controlled_uses_general_tou_fallback and total_controlled_kwh > 0)
+            else controlled_rate_c
+        )
         line_items.append({
-            "item": "Controlled Load",
+            "item": controlled_item_name,
             "qty": total_controlled_kwh,
             "unit": "kWh",
-            "rate": controlled_rate_c / 100.0,
-            "amount": controlled_cents / 100.0,
+            "rate": controlled_item_rate_c / 100.0,
+            "amount": controlled_cents_base / 100.0,
+        })
+
+    if discount_total_cents > 0:
+        line_items.append({
+            "item": f"Plan discount ({discount_pct:.1f}% {discount_scope.replace('_', ' ')})",
+            "qty": 1,
+            "unit": "discount",
+            "rate": -(discount_total_cents / 100.0),
+            "amount": -(discount_total_cents / 100.0),
         })
 
     if total_export_kwh > 0:
-        if _has_fit_tou(plan):
-            fit_bd = fit_breakdown_export(df_intervals, plan)
+        if _has_fit_tou(plan_eff):
+            fit_bd = fit_breakdown_export(df_intervals, plan_eff)
             for _, r in fit_bd.iterrows():
                 band_name = str(r["band"]).strip() or "base"
                 line_items.append({
@@ -1708,9 +1840,16 @@ def simulate_plan(df_intervals: pd.DataFrame, plan: Plan, include_signup_credit:
         "import_kwh": total_general_kwh + total_controlled_kwh,
         "import_cents": general_cents + controlled_cents,
         "flat_applies_to_all_import": flat_applies_to_all_import,
+        "controlled_uses_general_tou_fallback": bool(controlled_uses_general_tou_fallback),
         "export_credit_cents": export_credit_cents,
         "signup_credit_cents_available": signup_credit_cents_available,
         "signup_credit_cents_applied": signup_credit_cents_applied,
+        "discount_usage_cents": usage_discount_cents,
+        "discount_supply_cents": supply_discount_cents,
+        "discount_total_cents": discount_total_cents,
+        "discount_pct": discount_pct,
+        "discount_applies_to": discount_scope,
+        "fit_mode_applied": fit_mode_applied,
         "total_cents": total_cents,
         "line_items": pd.DataFrame(line_items),
     }
@@ -2120,6 +2259,276 @@ def apply_pv_scale_to_intervals(
         "base_export_kwh": float(m["export_kwh"].sum()),
         "scaled_export_kwh": float(m["export_scaled_kwh"].sum()),
         "reason": "",
+    })
+    return out, scaled_solar, meta
+
+
+def _extract_au_postcode(value: str) -> str:
+    """Extract a 4-digit Australian postcode from free text."""
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    m = re.search(r"\b(\d{4})\b", txt)
+    if m:
+        return str(m.group(1))
+    digits = re.sub(r"\D", "", txt)
+    return digits[:4] if len(digits) >= 4 else ""
+
+
+def _latitude_for_au_postcode(value: str) -> float:
+    """Return a broad latitude estimate from postcode prefix (first-pass heuristic)."""
+    pc = _extract_au_postcode(value)
+    if not pc:
+        return -27.47  # Brisbane fallback
+    try:
+        first = int(pc[0])
+    except Exception:
+        return -27.47
+    lat_map = {
+        0: -33.90,  # ACT/NSW bands
+        1: -33.90,  # NSW bands
+        2: -33.90,  # NSW/ACT bands
+        3: -37.81,  # VIC
+        4: -27.47,  # QLD
+        5: -34.93,  # SA
+        6: -31.95,  # WA
+        7: -42.88,  # TAS
+        8: -12.46,  # NT
+        9: -27.47,  # fallback
+    }
+    return float(lat_map.get(first, -27.47))
+
+
+def _solar_region_factor_for_postcode(value: str) -> float:
+    """Return a simple location factor for solar yield by postcode prefix."""
+    pc = _extract_au_postcode(value)
+    if not pc:
+        return 1.0
+    try:
+        first = int(pc[0])
+    except Exception:
+        return 1.0
+    fac_map = {
+        0: 0.95,
+        1: 0.95,
+        2: 0.95,
+        3: 0.92,
+        4: 1.03,
+        5: 0.97,
+        6: 1.01,
+        7: 0.86,
+        8: 1.06,
+        9: 1.00,
+    }
+    return float(fac_map.get(first, 1.0))
+
+
+def build_modelled_solar_profile_1kw(
+    df_int: pd.DataFrame,
+    postcode_or_location: str,
+    roof_tilt_deg: float,
+    roof_azimuth_deg: float,
+    system_losses_pct: float,
+) -> tuple[pd.DataFrame, dict]:
+    """Generate a first-pass interval solar profile for a 1 kW system.
+
+    This is a lightweight heuristic model intended for "no uploaded solar file" workflows.
+    """
+    meta = {
+        "applied": False,
+        "reason": "",
+        "latitude_deg": 0.0,
+        "postcode": "",
+        "orientation_factor": 1.0,
+        "tilt_factor": 1.0,
+        "loss_factor": 1.0,
+        "region_factor": 1.0,
+        "annual_kwh_per_kw": 0.0,
+        "avg_daily_kwh_per_kw": 0.0,
+    }
+    if (
+        df_int is None
+        or not isinstance(df_int, pd.DataFrame)
+        or df_int.empty
+        or "timestamp" not in df_int.columns
+    ):
+        meta["reason"] = "No interval timestamps."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    ts = pd.to_datetime(df_int["timestamp"], errors="coerce").dropna().drop_duplicates().sort_values()
+    if ts.empty:
+        meta["reason"] = "No valid timestamps."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    lat_deg = float(_latitude_for_au_postcode(postcode_or_location))
+    lat_rad = math.radians(lat_deg)
+    postcode = _extract_au_postcode(postcode_or_location)
+
+    az = float(roof_azimuth_deg or 0.0) % 360.0
+    az_diff = min(abs(az), 360.0 - abs(az))
+    # SH convention: 0 degrees = North-facing best.
+    orientation_factor = 0.55 + 0.45 * max(math.cos(math.radians(az_diff)), 0.0)
+    orientation_factor = max(min(float(orientation_factor), 1.0), 0.55)
+
+    tilt = max(min(float(roof_tilt_deg or 0.0), 60.0), 0.0)
+    tilt_opt = max(min(abs(lat_deg) * 0.76, 40.0), 10.0)
+    tilt_diff = abs(tilt - tilt_opt)
+    tilt_factor = max(0.80, 1.0 - 0.0045 * tilt_diff)
+
+    losses = max(min(float(system_losses_pct or 0.0), 60.0), 0.0)
+    loss_factor = max(min(1.0 - (losses / 100.0), 1.0), 0.0)
+    region_factor = float(_solar_region_factor_for_postcode(postcode_or_location))
+    sys_factor = orientation_factor * tilt_factor * loss_factor * region_factor
+
+    prof = pd.DataFrame({"timestamp": ts})
+    prof["timestamp"] = pd.to_datetime(prof["timestamp"], errors="coerce")
+    prof = prof.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    prof["date"] = prof["timestamp"].dt.date
+    prof["doy"] = prof["timestamp"].dt.dayofyear.astype(int)
+    prof["hour"] = prof["timestamp"].dt.hour + (prof["timestamp"].dt.minute / 60.0)
+    prof["pv_kwh"] = 0.0
+
+    for _, g in prof.groupby("date", sort=False):
+        doy = int(g["doy"].iloc[0])
+        decl = math.radians(23.44 * math.sin((2.0 * math.pi * (284.0 + float(doy))) / 365.0))
+
+        # Day length from latitude + declination.
+        cos_ha = -math.tan(lat_rad) * math.tan(decl)
+        cos_ha = max(min(cos_ha, 1.0), -1.0)
+        ha = math.acos(cos_ha)
+        daylight_hours = max((24.0 / math.pi) * ha, 0.0)
+        sunrise = 12.0 - (daylight_hours / 2.0)
+        sunset = 12.0 + (daylight_hours / 2.0)
+
+        # Midday solar-altitude proxy converted to daily equivalent full-sun hours.
+        midday_proxy = (math.sin(lat_rad) * math.sin(decl)) + (math.cos(lat_rad) * math.cos(decl))
+        midday_proxy = max(float(midday_proxy), 0.05)
+        daily_kwh_per_kw = max(daylight_hours * midday_proxy * 0.42, 0.4) * sys_factor
+
+        window = max(sunset - sunrise, 1e-9)
+        x = (g["hour"].astype(float) - sunrise) / window
+        w = x.apply(lambda v: (math.sin(math.pi * v) ** 1.35) if (0.0 < v < 1.0) else 0.0)
+        w_sum = float(w.sum())
+        if w_sum > 0:
+            prof.loc[g.index, "pv_kwh"] = (w / w_sum) * float(daily_kwh_per_kw)
+        else:
+            prof.loc[g.index, "pv_kwh"] = 0.0
+
+    out = prof[["timestamp", "pv_kwh"]].copy()
+    out["pv_kwh"] = pd.to_numeric(out["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    total_kwh = float(out["pv_kwh"].sum())
+    n_days = float(out["timestamp"].dt.date.nunique()) if not out.empty else 0.0
+    avg_daily = (total_kwh / n_days) if n_days > 0 else 0.0
+
+    meta.update({
+        "applied": True,
+        "reason": "",
+        "latitude_deg": float(lat_deg),
+        "postcode": str(postcode),
+        "orientation_factor": float(orientation_factor),
+        "tilt_factor": float(tilt_factor),
+        "loss_factor": float(loss_factor),
+        "region_factor": float(region_factor),
+        "annual_kwh_per_kw": float(avg_daily * 365.0),
+        "avg_daily_kwh_per_kw": float(avg_daily),
+    })
+    return out, meta
+
+
+def apply_modelled_pv_to_intervals(
+    df_int: pd.DataFrame,
+    modelled_solar_profile: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], dict]:
+    """Apply a modelled PV profile to intervals where baseline imports represent full site load.
+
+    Assumptions:
+      - PV offsets general load first (E1), controlled load remains separate.
+      - Any PV remaining after E1 offset is exported (B1).
+    """
+    meta = {
+        "applied": False,
+        "reason": "",
+        "base_import_kwh": 0.0,
+        "scaled_import_kwh": 0.0,
+        "base_export_kwh": 0.0,
+        "scaled_export_kwh": 0.0,
+        "scaled_pv_kwh": 0.0,
+    }
+    if df_int is None or not isinstance(df_int, pd.DataFrame) or df_int.empty:
+        meta["reason"] = "No interval data."
+        return pd.DataFrame(columns=["register", "timestamp", "kwh"]), None, meta
+
+    if (
+        not isinstance(modelled_solar_profile, pd.DataFrame)
+        or modelled_solar_profile.empty
+        or not {"timestamp", "pv_kwh"}.issubset(modelled_solar_profile.columns)
+    ):
+        meta["reason"] = "No modelled solar profile."
+        return df_int.copy(), None, meta
+
+    wide = _intervals_wide_from_long(df_int)
+    if wide.empty:
+        meta["reason"] = "Could not build interval-wide profile."
+        return df_int.copy(), None, meta
+
+    for c in ("general_kwh", "controlled_kwh", "export_kwh"):
+        if c not in wide.columns:
+            wide[c] = 0.0
+        wide[c] = pd.to_numeric(wide[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    s = modelled_solar_profile[["timestamp", "pv_kwh"]].copy()
+    s["timestamp"] = pd.to_datetime(s["timestamp"], errors="coerce")
+    s["pv_kwh"] = pd.to_numeric(s["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    s = s.dropna(subset=["timestamp"]).groupby("timestamp", as_index=False)["pv_kwh"].sum()
+
+    m = wide.merge(s, on="timestamp", how="left")
+    m["pv_kwh"] = pd.to_numeric(m["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    m["base_import_kwh"] = m["general_kwh"] + m["controlled_kwh"]
+    m["pv_to_general_kwh"] = m[["pv_kwh", "general_kwh"]].min(axis=1)
+    m["general_scaled_kwh"] = (m["general_kwh"] - m["pv_to_general_kwh"]).clip(lower=0.0)
+    m["controlled_scaled_kwh"] = m["controlled_kwh"]
+    m["export_scaled_kwh"] = (m["export_kwh"] + (m["pv_kwh"] - m["pv_to_general_kwh"]).clip(lower=0.0)).clip(lower=0.0)
+    m["scaled_import_kwh"] = m["general_scaled_kwh"] + m["controlled_scaled_kwh"]
+
+    wide_adj = pd.DataFrame({
+        "timestamp": m["timestamp"],
+        "general_kwh": m["general_scaled_kwh"].astype(float),
+        "controlled_kwh": m["controlled_scaled_kwh"].astype(float),
+        "export_kwh": m["export_scaled_kwh"].astype(float),
+    })
+
+    mapped_regs = set(GENERAL_REGS + CONTROLLED_REGS + EXPORT_REGS)
+    base = df_int.copy()
+    base["register"] = base["register"].astype(str)
+    other_regs = base[~base["register"].isin(mapped_regs)].copy()
+    adj_mapped = _intervals_long_from_wide(wide_adj)
+
+    existing_mapped = set(base["register"]).intersection(mapped_regs)
+    if float(wide_adj["general_kwh"].sum()) > 0 and GENERAL_REGS:
+        existing_mapped.add(GENERAL_REGS[0])
+    if float(wide_adj["controlled_kwh"].sum()) > 0 and CONTROLLED_REGS:
+        existing_mapped.add(CONTROLLED_REGS[0])
+    if float(wide_adj["export_kwh"].sum()) > 0 and EXPORT_REGS:
+        existing_mapped.add(EXPORT_REGS[0])
+    if existing_mapped:
+        adj_mapped = adj_mapped[adj_mapped["register"].astype(str).isin(existing_mapped)].copy()
+
+    out = pd.concat([other_regs, adj_mapped], ignore_index=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    out["kwh"] = pd.to_numeric(out["kwh"], errors="coerce").fillna(0.0).astype(float)
+    out = out.dropna(subset=["timestamp"]).sort_values(["timestamp", "register"]).reset_index(drop=True)
+
+    scaled_solar = m[["timestamp", "pv_kwh"]].copy()
+    scaled_solar["pv_kwh"] = pd.to_numeric(scaled_solar["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    meta.update({
+        "applied": True,
+        "reason": "",
+        "base_import_kwh": float(m["base_import_kwh"].sum()),
+        "scaled_import_kwh": float(m["scaled_import_kwh"].sum()),
+        "base_export_kwh": float(pd.to_numeric(m["export_kwh"], errors="coerce").fillna(0.0).sum()),
+        "scaled_export_kwh": float(m["export_scaled_kwh"].sum()),
+        "scaled_pv_kwh": float(scaled_solar["pv_kwh"].sum()),
     })
     return out, scaled_solar, meta
 
@@ -2606,6 +3015,7 @@ def simulate_plan_with_battery(
     baseline: Optional[dict] = None,
     wide_base: Optional[pd.DataFrame] = None,
     solar_profile: Optional[pd.DataFrame] = None,
+    baseline_battery_kwh_context: float = 0.0,
 ) -> dict:
     """Run simulate_plan on baseline vs battery-adjusted intervals and attach $ impacts + battery KPIs.
 
@@ -2619,7 +3029,16 @@ def simulate_plan_with_battery(
     by non-recurring switching incentives.
     """
     # Baseline (no battery) can be injected by callers during sweeps to avoid recomputation.
-    baseline_sim = baseline if baseline is not None else simulate_plan(df_int, plan, include_signup_credit=False)
+    baseline_sim = (
+        baseline
+        if baseline is not None
+        else simulate_plan(
+            df_int,
+            plan,
+            include_signup_credit=False,
+            battery_kwh_context=float(baseline_battery_kwh_context),
+        )
+    )
 
     # Convert to wide totals, dispatch battery, then back to long for billing.
     # Reusing precomputed wide intervals is a major speed-up in optimizer loops.
@@ -2628,7 +3047,12 @@ def simulate_plan_with_battery(
     df_adj_long = _intervals_long_from_wide(wide_adj)
 
     # Battery-adjusted bill simulation
-    sim = simulate_plan(df_adj_long, plan, include_signup_credit=False)
+    sim = simulate_plan(
+        df_adj_long,
+        plan,
+        include_signup_credit=False,
+        battery_kwh_context=float(batt.capacity_kwh or 0.0),
+    )
 
     # Attach baseline totals for comparison
     sim["baseline_total_cents"] = float(baseline_sim.get("total_cents", 0.0))
@@ -2677,10 +3101,15 @@ def simulate_plan_with_battery(
     return sim
 
 
-def daily_totals(df_intervals: pd.DataFrame, plan: Plan) -> pd.DataFrame:
+def daily_totals(
+    df_intervals: pd.DataFrame,
+    plan: Plan,
+    battery_kwh_context: float | None = None,
+) -> pd.DataFrame:
     df = df_intervals.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["date"] = df["timestamp"].dt.date
+    plan_eff, _fit_mode = _effective_plan_for_battery_context(plan, battery_kwh_context)
 
     gen = df[df["register"].isin(GENERAL_REGS)].groupby("date")["kwh"].sum()
     ctl = df[df["register"].isin(CONTROLLED_REGS)].groupby("date")["kwh"].sum()
@@ -2692,14 +3121,15 @@ def daily_totals(df_intervals: pd.DataFrame, plan: Plan) -> pd.DataFrame:
     out["controlled_kwh"] = out["date"].map(ctl).fillna(0.0)
     out["export_kwh"] = out["date"].map(exp).fillna(0.0)
 
-    out["supply_cents"] = float(plan.supply_cents_per_day or 0.0)
-    out["controlled_supply_cents"] = float(plan.controlled_supply_cents_per_day or 0.0)
-    controlled_rate_c = float(plan.controlled_cents_per_kwh or 0.0)
+    out["supply_cents"] = float(plan_eff.supply_cents_per_day or 0.0)
+    out["controlled_supply_cents"] = float(plan_eff.controlled_supply_cents_per_day or 0.0)
+    controlled_rate_c = float(plan_eff.controlled_cents_per_kwh or 0.0)
+    controlled_uses_general_tou_fallback = _controlled_uses_general_tou_fallback(plan_eff)
 
-    if plan.import_type == "flat":
-        rate = float(plan.flat.cents_per_kwh if plan.flat else 0.0)
+    if plan_eff.import_type == "flat":
+        rate = float(plan_eff.flat.cents_per_kwh if plan_eff.flat else 0.0)
         out["general_cents"] = out["general_kwh"] * rate
-        if _flat_plan_uses_single_import_rate(plan):
+        if _flat_plan_uses_single_import_rate(plan_eff):
             out["controlled_cents"] = out["controlled_kwh"] * rate
         else:
             out["controlled_cents"] = out["controlled_kwh"] * controlled_rate_c
@@ -2707,27 +3137,55 @@ def daily_totals(df_intervals: pd.DataFrame, plan: Plan) -> pd.DataFrame:
         dfg = df[df["register"].isin(GENERAL_REGS)].copy()
         dfg = dfg.groupby("timestamp", as_index=False)["kwh"].sum()
         dfg["date"] = dfg["timestamp"].dt.date
-        dfg["rate"] = dfg["timestamp"].apply(lambda ts: tou_rate_for_ts(pd.Timestamp(ts), plan.tou))
+        dfg["rate"] = dfg["timestamp"].apply(lambda ts: tou_rate_for_ts(pd.Timestamp(ts), plan_eff.tou))
         dfg["cents"] = dfg["kwh"] * dfg["rate"]
         gen_day_cents = dfg.groupby("date")["cents"].sum()
         out["general_cents"] = out["date"].map(gen_day_cents).fillna(0.0)
-        out["controlled_cents"] = out["controlled_kwh"] * controlled_rate_c
+        if controlled_uses_general_tou_fallback:
+            dfc = df[df["register"].isin(CONTROLLED_REGS)].copy()
+            dfc = dfc.groupby("timestamp", as_index=False)["kwh"].sum()
+            dfc["date"] = dfc["timestamp"].dt.date
+            dfc["rate"] = dfc["timestamp"].apply(lambda ts: tou_rate_for_ts(pd.Timestamp(ts), plan_eff.tou))
+            dfc["cents"] = dfc["kwh"] * dfc["rate"]
+            ctl_day_cents = dfc.groupby("date")["cents"].sum()
+            out["controlled_cents"] = out["date"].map(ctl_day_cents).fillna(0.0)
+        else:
+            out["controlled_cents"] = out["controlled_kwh"] * controlled_rate_c
 
-    if _has_fit_tou(plan):
+    if _has_fit_tou(plan_eff):
         dfe = df[df["register"].isin(EXPORT_REGS)].copy()
         dfe = dfe.groupby("timestamp", as_index=False)["kwh"].sum()
         dfe["date"] = dfe["timestamp"].dt.date
-        dfe["rate"] = dfe["timestamp"].apply(lambda ts: fit_rate_for_ts(pd.Timestamp(ts), plan))
+        dfe["rate"] = dfe["timestamp"].apply(lambda ts: fit_rate_for_ts(pd.Timestamp(ts), plan_eff))
         dfe["cents"] = dfe["kwh"] * dfe["rate"]
         exp_day_cents = dfe.groupby("date")["cents"].sum()
         out["export_credit_cents"] = out["date"].map(exp_day_cents).fillna(0.0)
-    elif plan.feed_in_tiered:
-        sim = simulate_plan(df_intervals, plan, include_signup_credit=False)
+    elif plan_eff.feed_in_tiered:
+        sim = simulate_plan(
+            df_intervals,
+            plan,
+            include_signup_credit=False,
+            battery_kwh_context=battery_kwh_context,
+        )
         total_credit = float(sim["export_credit_cents"])
         total_export = float(sim["export_kwh"])
         out["export_credit_cents"] = (out["export_kwh"] / total_export * total_credit) if total_export > 0 else 0.0
     else:
-        out["export_credit_cents"] = out["export_kwh"] * float(plan.feed_in_flat_cents_per_kwh or 0.0)
+        out["export_credit_cents"] = out["export_kwh"] * float(plan_eff.feed_in_flat_cents_per_kwh or 0.0)
+
+    discount_scope = _norm_discount_scope(getattr(plan_eff, "discount_applies_to", "none"))
+    discount_pct = max(min(float(getattr(plan_eff, "discount_pct", 0.0) or 0.0), 100.0), 0.0)
+    if discount_scope == "none":
+        discount_pct = 0.0
+    discount_frac = discount_pct / 100.0
+
+    out["discount_usage_cents"] = 0.0
+    out["discount_supply_cents"] = 0.0
+    if discount_frac > 0:
+        if discount_scope in ("usage", "usage_and_supply"):
+            out["discount_usage_cents"] = (out["general_cents"] + out["controlled_cents"]) * discount_frac
+        if discount_scope == "usage_and_supply":
+            out["discount_supply_cents"] = (out["supply_cents"] + out["controlled_supply_cents"]) * discount_frac
 
     out["total_cents"] = (
         out["supply_cents"]
@@ -2735,14 +3193,20 @@ def daily_totals(df_intervals: pd.DataFrame, plan: Plan) -> pd.DataFrame:
         + out["general_cents"]
         + out["controlled_cents"]
         - out["export_credit_cents"]
+        - out["discount_usage_cents"]
+        - out["discount_supply_cents"]
     )
     out["total_$"] = out["total_cents"] / 100.0
     return out
 
 
-def monthly_totals(df_intervals: pd.DataFrame, plan: Plan) -> pd.DataFrame:
+def monthly_totals(
+    df_intervals: pd.DataFrame,
+    plan: Plan,
+    battery_kwh_context: float | None = None,
+) -> pd.DataFrame:
     """Monthly totals ($) derived from daily totals, for risk/volatility analysis."""
-    d = daily_totals(df_intervals, plan).copy()
+    d = daily_totals(df_intervals, plan, battery_kwh_context=battery_kwh_context).copy()
     if d.empty:
         return pd.DataFrame(columns=["month", "total_$"])
     d["month"] = pd.to_datetime(d["date"]).dt.to_period("M").dt.to_timestamp()
@@ -2828,7 +3292,7 @@ def render_help_and_glossary() -> None:
         st.markdown(
             "- `Total ($)`: Estimated total bill over the dataset period (GST inclusive).\n"
             "- `Effective Rate (c/kWh)`: Total bill divided by total imported kWh.\n"
-            "- `Avg import rate excl supply (c/kWh)`: Usage-only import rate net of FiT credit, excluding fixed daily charges.\n"
+            "- `Avg import rate excl supply (c/kWh)`: Usage-only import charges divided by total imported kWh (E1+E2), excluding fixed daily charges and FiT credits.\n"
             "- `FiT credit ($)`: Credit for exported energy based on plan feed-in settings.\n"
             "- `Supply ($)`: Daily fixed charges over the period.\n"
             "- `Controlled usage ($)`: E2 usage charges.\n"
@@ -3513,7 +3977,7 @@ if show_overview_only:
 st.subheader("Comparison results (GST inclusive)")
 st.caption(
     "Effective import (c/kWh) includes fixed charges and nets off FiT credit. "
-    "Avg import rate excl supply nets off FiT but excludes fixed charges."
+    "Avg import rate excl supply is usage-only import charges divided by import kWh (excludes fixed charges and FiT credits)."
 )
 st.caption(
     "Where configured, one-time sign-up credit is included once in period totals for this comparison view. "
@@ -3542,6 +4006,11 @@ if (not bool(has_home_battery)) and (not bool(include_battery_dependent_in_compa
 
 rows = []
 base_totals_by_plan = {}
+comparison_battery_context_kwh = (
+    float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+    if bool(has_home_battery)
+    else 0.0
+)
 addon_profile = {
     "has_home_battery": bool(has_home_battery),
     "battery_kwh": float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0),
@@ -3567,9 +4036,19 @@ if bool(addon_profile.get("ev_enabled", False)):
     addon_ev_wall_kwh_annual = addon_ev_drive_kwh / max(1e-9, (1.0 - max(addon_ev_loss_pct, 0.0) / 100.0))
 addon_profile["ev_annual_kwh"] = float(max(addon_ev_wall_kwh_annual, 0.0))
 for p in comparison_plans:
-    sim = simulate_plan(df_int, p, include_signup_credit=True)
+    sim = simulate_plan(
+        df_int,
+        p,
+        include_signup_credit=True,
+        battery_kwh_context=comparison_battery_context_kwh,
+    )
     if ev_summary.get("enabled"):
-        sim_base = simulate_plan(df_int_base, p, include_signup_credit=True)
+        sim_base = simulate_plan(
+            df_int_base,
+            p,
+            include_signup_credit=True,
+            battery_kwh_context=comparison_battery_context_kwh,
+        )
         base_totals_by_plan[p.name] = float(sim_base.get("total_cents", 0.0)) / 100.0
 
     general_kwh = float(sim["general_kwh"])
@@ -3597,17 +4076,27 @@ for p in comparison_plans:
     addon_benefit = float(addon_eval.get("benefit", 0.0) or 0.0)
     addon_labels = addon_eval.get("eligible_labels", []) or []
     single_rate_all_import = bool(sim.get("flat_applies_to_all_import", False))
+    controlled_tou_fallback = bool(sim.get("controlled_uses_general_tou_fallback", False))
+    p_comp_eff, _comp_fit_mode = _effective_plan_for_battery_context(p, comparison_battery_context_kwh)
     night_fit_bonus = _fit_tou_has_night_bonus_rows(
-        [b.__dict__ for b in (p.feed_in_tou.bands if p.feed_in_tou else [])],
-        float(p.feed_in_flat_cents_per_kwh or 0.0),
+        [b.__dict__ for b in (p_comp_eff.feed_in_tou.bands if p_comp_eff.feed_in_tou else [])],
+        float(p_comp_eff.feed_in_flat_cents_per_kwh or 0.0),
     )
-    night_bonus_export_kwh = fit_tou_night_bonus_export_kwh(df_int, p) if night_fit_bonus else 0.0
+    night_bonus_export_kwh = fit_tou_night_bonus_export_kwh(df_int, p_comp_eff) if night_fit_bonus else 0.0
 
     effective_general_c_per_kwh = (general_cents / general_kwh) if general_kwh > 0 else 0.0
-    # Usage-only average import rate (excludes daily supply charges) and nets off FiT credit.
-    avg_import_ex_supply_c_per_kwh = ((import_usage_cents - export_credit_cents) / import_kwh) if import_kwh > 0 else 0.0
+    # Usage-only average import rate (excludes daily supply charges and FiT credits).
+    avg_import_ex_supply_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
     # "Effective Rate" includes supply charges (and nets off FiT credit) per total imported kWh.
     effective_rate_c_per_kwh = (total_cents / import_kwh) if import_kwh > 0 else 0.0
+    if controlled_tou_fallback:
+        e2_pricing_method = "General TOU fallback"
+    elif float(p_comp_eff.controlled_cents_per_kwh or 0.0) > 0.0:
+        e2_pricing_method = "Controlled-load tariff"
+    elif single_rate_all_import:
+        e2_pricing_method = "Single-rate import tariff"
+    else:
+        e2_pricing_method = "No controlled-load usage pricing"
 
     rows.append({
         "Plan": p.name,
@@ -3625,6 +4114,7 @@ for p in comparison_plans:
         "Supply ($)": round(float(sim["supply_cents"]) / 100.0, 2),
         "Controlled supply ($)": round(float(sim["controlled_supply_cents"]) / 100.0, 2),
         "Controlled usage ($)": round(float(sim["controlled_cents"]) / 100.0, 2),
+        "E2 pricing method": e2_pricing_method,
         "Single-rate applied to all import": "Yes" if single_rate_all_import else "No",
         "Night FiT bonus window": "Yes" if night_fit_bonus else "No",
         "Night bonus export kWh": round(night_bonus_export_kwh, 3),
@@ -3787,9 +4277,14 @@ else:
     )
 
 with tab1:
+    daily_battery_context_kwh = (
+        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+        if bool(has_home_battery)
+        else 0.0
+    )
     chart_df = None
     for p in plans:
-        d = daily_totals(df_int, p)[["date", "total_$"]].copy()
+        d = daily_totals(df_int, p, battery_kwh_context=daily_battery_context_kwh)[["date", "total_$"]].copy()
         d = d.rename(columns={"total_$": p.name}).set_index("date")
         chart_df = d if chart_df is None else _dedupe_columns(chart_df.merge(d, how="outer", left_index=True, right_index=True, suffixes=("", "_dup")))
     st.line_chart(chart_df)
@@ -3801,7 +4296,7 @@ with tab1:
 
 
     win_plan = next(pp for pp in plans if pp.name == winner)
-    dwin = daily_totals(df_int, win_plan)
+    dwin = daily_totals(df_int, win_plan, battery_kwh_context=daily_battery_context_kwh)
     st.write(f"Daily breakdown (last 14 days) - **{winner}**")
     st.dataframe(dwin.tail(14), use_container_width=True)
 
@@ -3810,6 +4305,11 @@ with tab2:
     if not tou_plans:
         st.info("No TOU plans are available in the current library.")
     else:
+        tou_battery_context_kwh = (
+            float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+            if bool(has_home_battery)
+            else 0.0
+        )
         tou_names = [p.name for p in tou_plans]
         selected_name = st.selectbox(
             "Select a plan to view TOU breakdown",
@@ -3832,10 +4332,28 @@ with tab2:
 
             st.dataframe(bd[["band", "kwh", "% of General", "rate_c_per_kwh", "$"]], use_container_width=True)
 
-            # Flat-rate equivalent callout
-            total_cents = float(bd["cents"].sum())
-            eff_c_per_kwh = (total_cents / total_general_kwh) if total_general_kwh > 0 else 0.0
-            st.success(f"Flat-rate equivalent for General usage (E1): **{eff_c_per_kwh:.2f} c/kWh**")
+            # Flat-rate equivalent callouts.
+            # Match Comparison report basis (effective billed general usage, including plan discounts).
+            sim_tou = simulate_plan(
+                df_int,
+                selected_plan,
+                include_signup_credit=False,
+                battery_kwh_context=tou_battery_context_kwh,
+            )
+            billed_general_kwh = float(sim_tou.get("general_kwh", 0.0))
+            billed_general_cents = float(sim_tou.get("general_cents", 0.0))
+            eff_general_c_per_kwh = (billed_general_cents / billed_general_kwh) if billed_general_kwh > 0 else 0.0
+
+            tariff_total_cents = float(bd["cents"].sum())
+            tariff_only_c_per_kwh = (tariff_total_cents / total_general_kwh) if total_general_kwh > 0 else 0.0
+
+            st.success(
+                f"Flat-rate equivalent for General usage (E1, effective billed): **{eff_general_c_per_kwh:.2f} c/kWh**"
+            )
+            if abs(eff_general_c_per_kwh - tariff_only_c_per_kwh) > 1e-6:
+                st.caption(
+                    f"TOU tariff-only equivalent (before plan discounts): {tariff_only_c_per_kwh:.2f} c/kWh."
+                )
 
 with tab3:
     st.write("Invoice-style line items (like a retailer invoice).")
@@ -3863,7 +4381,12 @@ with tab3:
     )
 
     selected_plan = next(p for p in plans if p.name == selected_plan_name)
-    sim = simulate_plan(df_int, selected_plan)
+    invoice_battery_context_kwh = (
+        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+        if bool(has_home_battery)
+        else 0.0
+    )
+    sim = simulate_plan(df_int, selected_plan, battery_kwh_context=invoice_battery_context_kwh)
     if bool(sim.get("flat_applies_to_all_import", False)):
         st.info("This flat plan has no controlled-load usage rate, so the single import tariff is applied to all import kWh (E1+E2).")
     if _has_fit_tou(selected_plan):
@@ -3931,8 +4454,18 @@ with tab5:
         st.info(f"Confidence level: {confidence}")
 
         forecast_rows = []
+        forecast_battery_context_kwh = (
+            float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+            if bool(has_home_battery)
+            else 0.0
+        )
         for p in plans:
-            simf = simulate_plan(future_df, p, include_signup_credit=False)
+            simf = simulate_plan(
+                future_df,
+                p,
+                include_signup_credit=False,
+                battery_kwh_context=forecast_battery_context_kwh,
+            )
             forecast_rows.append({
                 "Plan": p.name,
                 "Forecast Days": simf["days"],
@@ -4132,9 +4665,14 @@ with tab6:
 
     risk_rows = []
     monthly_wide = None
+    risk_battery_context_kwh = (
+        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+        if bool(has_home_battery)
+        else 0.0
+    )
 
     for p in risk_scenario_plans:
-        m = monthly_totals(df_int, p)
+        m = monthly_totals(df_int, p, battery_kwh_context=risk_battery_context_kwh)
         if m.empty:
             continue
 
@@ -4279,9 +4817,19 @@ with tab7:
             return pp
 
         rows_scn = []
+        scenario_battery_context_kwh = (
+            float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+            if bool(has_home_battery)
+            else 0.0
+        )
         for p in risk_scenario_plans:
             p_scn = _uplift_plan(p)
-            sim_scn = simulate_plan(df_scn, p_scn, include_signup_credit=True)
+            sim_scn = simulate_plan(
+                df_scn,
+                p_scn,
+                include_signup_credit=True,
+                battery_kwh_context=scenario_battery_context_kwh,
+            )
 
             rows_scn.append({
                 "Plan": p.name,
@@ -4738,7 +5286,7 @@ with tab8:
                     discharge_min = rmin_f
                     st.caption(f"All TOU import rates are currently {rmin_f:.1f} c/kWh. Discharge threshold is fixed at this value.")
 
-            st.info("Suggested flow: 1) Quick comparison -> 2) Battery economics (selected retailer) -> 3) Best overall retailer + battery.")
+            st.info("Suggested flow: 1) Quick comparison -> 2) Battery economics (selected retailer) -> 3) Best overall retailer + solar + battery.")
             if "timestamp" in df_int.columns:
                 ts_batt = pd.to_datetime(df_int["timestamp"], errors="coerce")
                 ts_start = str(ts_batt.min()) if not ts_batt.empty else ""
@@ -4797,11 +5345,17 @@ with tab8:
                 "joint_pv_max_kw": round(float(st.session_state.get("joint_pv_max_kw", 13.0)), 4),
                 "joint_pv_step_kw": round(float(st.session_state.get("joint_pv_step_kw", 2.0)), 4),
                 "joint_pv_include_zero": bool(st.session_state.get("joint_pv_include_zero", False)),
+                "joint_use_modelled_solar": bool(st.session_state.get("joint_use_modelled_solar", False)),
+                "joint_modelled_postcode": str(st.session_state.get("joint_modelled_postcode", "")),
+                "joint_modelled_tilt_deg": round(float(st.session_state.get("joint_modelled_tilt_deg", 20.0)), 4),
+                "joint_modelled_azimuth_deg": round(float(st.session_state.get("joint_modelled_azimuth_deg", 0.0)), 4),
+                "joint_modelled_losses_pct": round(float(st.session_state.get("joint_modelled_losses_pct", 14.0)), 4),
+                "joint_assume_no_existing_export": bool(st.session_state.get("joint_assume_no_existing_export", False)),
             }
 
             prev_joint_signature = st.session_state.get("joint_signature")
             if ("joint_best" in st.session_state) and (prev_joint_signature is not None) and (prev_joint_signature != joint_signature_current):
-                for k in ("joint_opt_df", "joint_best", "joint_days", "joint_meta", "joint_signature"):
+                for k in ("joint_opt_df", "joint_best", "joint_days", "joint_meta", "joint_signature", "joint_stage_df", "joint_stage_meta"):
                     st.session_state.pop(k, None)
                 st.info("Decision summary was cleared because assumptions changed. Re-run the optimizer in subtab 3.")
 
@@ -4895,7 +5449,7 @@ with tab8:
                     if not quick_sizes:
                         st.error("Select at least one battery size (kWh) to run the simulation.")
                     else:
-                        baseline = simulate_plan(df_int, plan_obj, include_signup_credit=False)
+                        baseline = simulate_plan(df_int, plan_obj, include_signup_credit=False, battery_kwh_context=0.0)
                         base_total = float(baseline.get("total_cents", 0.0))
                         days = float(baseline.get("days", 0.0) or 0.0)
                         wide_base = _intervals_wide_from_long(df_int)
@@ -5080,7 +5634,7 @@ with tab8:
                     if opt_err:
                         st.error(opt_err)
                     else:
-                        baseline = simulate_plan(df_int, plan_obj, include_signup_credit=False)
+                        baseline = simulate_plan(df_int, plan_obj, include_signup_credit=False, battery_kwh_context=0.0)
                         base_total = float(baseline.get("total_cents", 0.0))
                         days = float(baseline.get("days", 0.0) or 0.0)
                         annual_base_bill = (base_total / 100.0) * (365.0 / days) if days > 0 else (base_total / 100.0)
@@ -5211,40 +5765,145 @@ with tab8:
                     "This joint optimizer re-optimises plan + solar + battery together."
                 )
 
-                solar_available = bool(
+                solar_uploaded_available = bool(
                     isinstance(solar_profile_for_battery, pd.DataFrame)
                     and not solar_profile_for_battery.empty
                     and {"timestamp", "pv_kwh"}.issubset(solar_profile_for_battery.columns)
                 )
+                modelled_postcode = str(st.session_state.get("joint_modelled_postcode", "4000"))
+                modelled_tilt_deg = float(st.session_state.get("joint_modelled_tilt_deg", 20.0) or 20.0)
+                modelled_azimuth_deg = float(st.session_state.get("joint_modelled_azimuth_deg", 0.0) or 0.0)
+                modelled_losses_pct = float(st.session_state.get("joint_modelled_losses_pct", 14.0) or 14.0)
+                modelled_solar_profile_1kw = None
+                modelled_solar_meta: dict = {}
+
+                if "joint_use_modelled_solar" not in st.session_state:
+                    st.session_state["joint_use_modelled_solar"] = False
+
+                use_modelled_solar = False
+                if not solar_uploaded_available:
+                    st.caption("No uploaded solar profile found. You can still model solar from site assumptions.")
+                    use_modelled_solar = st.checkbox(
+                        "Use modelled solar profile (no upload)",
+                        value=bool(st.session_state.get("joint_use_modelled_solar", False)),
+                        key="joint_use_modelled_solar",
+                        help="Builds a first-pass interval solar profile from postcode/location, roof orientation, and losses.",
+                    )
+                    if use_modelled_solar:
+                        ms1, ms2 = st.columns(2)
+                        with ms1:
+                            modelled_postcode = st.text_input(
+                                "Location / postcode",
+                                value=str(st.session_state.get("joint_modelled_postcode", "4000")),
+                                key="joint_modelled_postcode",
+                                help="Used for a broad latitude/region estimate in the first-pass solar model.",
+                            )
+                            modelled_tilt_deg = st.number_input(
+                                "Roof tilt (deg)",
+                                min_value=0.0,
+                                max_value=60.0,
+                                value=float(st.session_state.get("joint_modelled_tilt_deg", 20.0)),
+                                step=1.0,
+                                key="joint_modelled_tilt_deg",
+                                help="Panel tilt angle from horizontal.",
+                            )
+                        with ms2:
+                            modelled_azimuth_deg = st.number_input(
+                                "Roof azimuth (deg, 0 = North)",
+                                min_value=0.0,
+                                max_value=359.0,
+                                value=float(st.session_state.get("joint_modelled_azimuth_deg", 0.0)),
+                                step=5.0,
+                                key="joint_modelled_azimuth_deg",
+                                help="Panel orientation: 0=N, 90=E, 180=S, 270=W.",
+                            )
+                            modelled_losses_pct = st.number_input(
+                                "System losses + shading (%)",
+                                min_value=0.0,
+                                max_value=60.0,
+                                value=float(st.session_state.get("joint_modelled_losses_pct", 14.0)),
+                                step=1.0,
+                                key="joint_modelled_losses_pct",
+                                help="Combined wiring, inverter, temperature and shading losses.",
+                            )
+
+                        modelled_solar_profile_1kw, modelled_solar_meta = build_modelled_solar_profile_1kw(
+                            df_int,
+                            modelled_postcode,
+                            float(modelled_tilt_deg),
+                            float(modelled_azimuth_deg),
+                            float(modelled_losses_pct),
+                        )
+                        if isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
+                            avg_daily_1kw = float(modelled_solar_meta.get("avg_daily_kwh_per_kw", 0.0) or 0.0)
+                            annual_1kw = float(modelled_solar_meta.get("annual_kwh_per_kw", 0.0) or 0.0)
+                            lat_disp = float(modelled_solar_meta.get("latitude_deg", 0.0) or 0.0)
+                            st.caption(
+                                "Modelled solar (first pass): "
+                                f"~{avg_daily_1kw:.2f} kWh/day per 1 kW "
+                                f"(~{annual_1kw:.0f} kWh/yr/kW, est. lat {lat_disp:.2f} deg)."
+                            )
+                        else:
+                            use_modelled_solar = False
+                            st.warning("Could not build a modelled solar profile from the current dataset and assumptions.")
+
+                solar_mode = "uploaded" if solar_uploaded_available else ("modelled" if use_modelled_solar else "none")
+                solar_available_for_sweep = solar_uploaded_available or use_modelled_solar
+                assume_no_existing_export = st.checkbox(
+                    "Assume no existing solar/export in baseline",
+                    value=bool(st.session_state.get("joint_assume_no_existing_export", False)),
+                    key="joint_assume_no_existing_export",
+                    help="Sets existing B1 export to zero for this joint optimizer run. Useful when testing new-solar decisions with a dataset that already includes export.",
+                )
+                df_joint_base = df_int
+                if assume_no_existing_export:
+                    try:
+                        d0 = df_int.copy()
+                        reg = d0["register"].astype(str)
+                        mask_export = reg.isin(EXPORT_REGS)
+                        removed_export_kwh = float(pd.to_numeric(d0.loc[mask_export, "kwh"], errors="coerce").fillna(0.0).sum())
+                        d0.loc[mask_export, "kwh"] = 0.0
+                        df_joint_base = d0
+                        st.caption(f"Baseline export removed for optimizer: {removed_export_kwh:,.1f} kWh over dataset period.")
+                    except Exception:
+                        df_joint_base = df_int
+                        st.warning("Could not apply baseline export override; using original dataset profile.")
                 enable_solar_sweep = st.checkbox(
                     "Sweep solar system size",
-                    value=solar_available,
+                    value=solar_available_for_sweep,
                     key="joint_enable_solar_sweep",
-                    disabled=not solar_available,
-                    help="Requires uploaded solar production file. When enabled, optimizer searches retailer + solar size + battery size together.",
+                    disabled=not solar_available_for_sweep,
+                    help=(
+                        "When enabled, optimizer searches retailer + solar size + battery size together. "
+                        "With no upload, this uses the modelled solar profile."
+                    ),
                 )
-                if not solar_available:
-                    st.info("Upload a solar production file to enable solar size optimization. Running retailer + battery optimization only.")
+                if not solar_available_for_sweep:
+                    st.info("Upload a solar profile or enable modelled solar to include solar-size optimization.")
                     enable_solar_sweep = False
 
                 pv_err = None
                 if enable_solar_sweep:
                     sp1, sp2 = st.columns(2)
                     with sp1:
+                        current_pv_default = 0.0 if solar_mode == "modelled" else 6.6
                         current_pv_kw = st.number_input(
                             "Current solar system size (kW)",
-                            min_value=0.1,
+                            min_value=(0.0 if solar_mode == "modelled" else 0.1),
                             max_value=50.0,
-                            value=6.6,
+                            value=float(st.session_state.get("joint_current_pv_kw", current_pv_default)),
                             step=0.1,
                             key="joint_current_pv_kw",
-                            help="Used to scale your uploaded PV profile: scaled PV = uploaded PV x (candidate size / current size).",
+                            help=(
+                                "Used for incremental solar capex baseline. "
+                                "Uploaded-solar mode also uses this to scale the uploaded profile."
+                            ),
                         )
                     with sp2:
                         pv_cost_per_kw = st.number_input(
                             "Solar cost ($/kW installed)",
                             min_value=0.0,
-                            value=1200.0,
+                            value=float(st.session_state.get("joint_pv_cost_per_kw", 1200.0)),
                             step=50.0,
                             key="joint_pv_cost_per_kw",
                             help="Installed cost per added kW used for incremental solar capex.",
@@ -5255,13 +5914,40 @@ with tab8:
                     )
 
                     p1, p2, p3 = st.columns(3)
+                    pv_min_default = 0.0 if solar_mode == "modelled" else 3.0
+                    pv_max_default = 12.0 if solar_mode == "modelled" else 13.0
                     with p1:
-                        joint_pv_min_kw = st.number_input("Min solar size (kW)", min_value=0.0, max_value=50.0, value=3.0, step=0.5, key="joint_pv_min_kw")
+                        joint_pv_min_kw = st.number_input(
+                            "Min solar size (kW)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=float(st.session_state.get("joint_pv_min_kw", pv_min_default)),
+                            step=0.5,
+                            key="joint_pv_min_kw",
+                        )
                     with p2:
-                        joint_pv_max_kw = st.number_input("Max solar size (kW)", min_value=0.0, max_value=50.0, value=13.0, step=0.5, key="joint_pv_max_kw")
+                        joint_pv_max_kw = st.number_input(
+                            "Max solar size (kW)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=float(st.session_state.get("joint_pv_max_kw", pv_max_default)),
+                            step=0.5,
+                            key="joint_pv_max_kw",
+                        )
                     with p3:
-                        joint_pv_step_kw = st.number_input("Solar step (kW)", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="joint_pv_step_kw")
-                    joint_pv_include_zero = st.checkbox("Include 0 kW solar in sweep", value=False, key="joint_pv_include_zero")
+                        joint_pv_step_kw = st.number_input(
+                            "Solar step (kW)",
+                            min_value=0.1,
+                            max_value=10.0,
+                            value=float(st.session_state.get("joint_pv_step_kw", 2.0)),
+                            step=0.1,
+                            key="joint_pv_step_kw",
+                        )
+                    joint_pv_include_zero = st.checkbox(
+                        "Include 0 kW solar in sweep",
+                        value=bool(st.session_state.get("joint_pv_include_zero", (solar_mode == "modelled"))),
+                        key="joint_pv_include_zero",
+                    )
 
                     pv_mn = float(joint_pv_min_kw)
                     pv_mx = float(joint_pv_max_kw)
@@ -5276,14 +5962,43 @@ with tab8:
                         joint_pv_sizes = [round(pv_mn + i * pv_stp, 3) for i in range(max(pv_steps, 0))]
                         if joint_pv_include_zero:
                             joint_pv_sizes = sorted(set([0.0] + joint_pv_sizes))
-                        if current_pv_kw <= 0:
-                            pv_err = "Current solar system size must be > 0 when solar sweep is enabled."
+                        if (solar_mode == "uploaded") and (current_pv_kw <= 0):
+                            pv_err = "Current solar system size must be > 0 when scaling an uploaded solar profile."
                         elif not joint_pv_sizes:
                             pv_err = "No solar sizes to simulate with this range."
                 else:
-                    current_pv_kw = float(st.session_state.get("joint_current_pv_kw", 6.6))
+                    if solar_mode == "modelled":
+                        current_pv_kw = st.number_input(
+                            "Fixed modelled solar size (kW)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=float(st.session_state.get("joint_current_pv_kw", 0.0)),
+                            step=0.1,
+                            key="joint_current_pv_kw",
+                            help="With solar sweep off, optimizer keeps this modelled solar size fixed while optimising retailer + battery.",
+                        )
+                    else:
+                        current_pv_kw = float(st.session_state.get("joint_current_pv_kw", 6.6))
                     pv_cost_per_kw = float(st.session_state.get("joint_pv_cost_per_kw", 1200.0))
-                    joint_pv_sizes = [current_pv_kw]
+                    joint_pv_sizes = [float(current_pv_kw)] if solar_mode != "none" else [0.0]
+                    if solar_mode in ("uploaded", "modelled"):
+                        st.info(
+                            f"Solar sweep is OFF. Optimizer is using a fixed solar size of {float(current_pv_kw):.1f} kW "
+                            "and only re-optimising retailer + battery."
+                        )
+                    if (solar_mode == "modelled") and (float(current_pv_kw) <= 0.0):
+                        if bool(assume_no_existing_export):
+                            st.warning(
+                                "Modelled solar is ON but fixed solar size is 0.0 kW while solar sweep is OFF, "
+                                "and baseline export override is ON. This run will almost always recommend no solar and no battery. "
+                                "Set fixed modelled solar size > 0 kW or turn ON 'Sweep solar system size'."
+                            )
+                        else:
+                            st.warning(
+                                "Modelled solar is ON but fixed solar size is 0.0 kW while solar sweep is OFF. "
+                                "This run is effectively retailer + battery only, so solar cannot be recommended. "
+                                "Set fixed modelled solar size > 0 kW or turn ON 'Sweep solar system size'."
+                            )
 
                 j1, j2, j3 = st.columns(3)
                 with j1:
@@ -5315,10 +6030,16 @@ with tab8:
 
                 run_count = len(joint_sizes) * len(plans_lib) * len(joint_pv_sizes)
                 if enable_solar_sweep:
-                    st.caption(
-                        f"Estimated run size: {run_count} simulations "
-                        f"({len(plans_lib)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes)."
-                    )
+                    if solar_mode == "modelled":
+                        st.caption(
+                            f"Estimated run size: {run_count} simulations "
+                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} modelled solar sizes x {len(joint_sizes)} battery sizes)."
+                        )
+                    else:
+                        st.caption(
+                            f"Estimated run size: {run_count} simulations "
+                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes)."
+                        )
                 else:
                     st.caption(f"Estimated run size: {run_count} simulations ({len(plans_lib)} plans x {len(joint_sizes)} battery sizes).")
                 if run_count > 400:
@@ -5328,7 +6049,12 @@ with tab8:
                 if pv_err:
                     st.error(pv_err)
 
-                btn_label = "Find best retailer + solar + battery" if enable_solar_sweep else "Find best retailer + battery"
+                if enable_solar_sweep and solar_mode == "modelled":
+                    btn_label = "Find best retailer + modelled solar + battery"
+                elif enable_solar_sweep:
+                    btn_label = "Find best retailer + solar + battery"
+                else:
+                    btn_label = "Find best retailer + battery"
                 if st.button(btn_label, type="primary", key="btn_joint_opt"):
                     if joint_err:
                         st.error(joint_err)
@@ -5344,22 +6070,45 @@ with tab8:
 
                         pv_cases = []
                         for pv_kw in joint_pv_sizes:
-                            if enable_solar_sweep:
-                                pv_scale = (float(pv_kw) / float(current_pv_kw)) if float(current_pv_kw) > 0 else 0.0
+                            pv_kw_eff = max(float(pv_kw), 0.0)
+                            pv_capex = (
+                                max(float(pv_kw_eff) - float(current_pv_kw), 0.0) * float(pv_cost_per_kw)
+                                if (enable_solar_sweep and solar_mode != "none")
+                                else 0.0
+                            )
+                            if (solar_mode == "uploaded") and enable_solar_sweep:
+                                pv_scale = (float(pv_kw_eff) / float(current_pv_kw)) if float(current_pv_kw) > 0 else 0.0
                                 df_case, solar_case, _pv_meta = apply_pv_scale_to_intervals(
-                                    df_int,
+                                    df_joint_base,
                                     solar_profile_for_battery,
                                     pv_scale,
                                 )
-                                pv_capex = max(float(pv_kw) - float(current_pv_kw), 0.0) * float(pv_cost_per_kw)
+                            elif solar_mode == "modelled":
+                                if isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
+                                    pv_scale = float(pv_kw_eff if enable_solar_sweep else max(float(current_pv_kw), 0.0))
+                                    solar_case = modelled_solar_profile_1kw.copy()
+                                    solar_case["pv_kwh"] = (
+                                        pd.to_numeric(solar_case["pv_kwh"], errors="coerce")
+                                        .fillna(0.0)
+                                        .clip(lower=0.0)
+                                        .astype(float)
+                                        * float(pv_scale)
+                                    )
+                                    df_case, solar_case, _pv_meta = apply_modelled_pv_to_intervals(
+                                        df_joint_base,
+                                        solar_case,
+                                    )
+                                else:
+                                    pv_scale = 0.0
+                                    df_case = df_joint_base
+                                    solar_case = None
                             else:
-                                pv_scale = 1.0
-                                df_case = df_int
-                                solar_case = solar_profile_for_battery
-                                pv_capex = 0.0
+                                pv_scale = 1.0 if solar_mode == "uploaded" else 0.0
+                                df_case = df_joint_base
+                                solar_case = solar_profile_for_battery if solar_mode == "uploaded" else None
 
                             pv_cases.append({
-                                "pv_kw": float(pv_kw),
+                                "pv_kw": float(pv_kw_eff),
                                 "pv_scale": float(pv_scale),
                                 "pv_capex": float(pv_capex),
                                 "df_int": df_case,
@@ -5369,19 +6118,40 @@ with tab8:
 
                         # Reference for "total savings" reporting:
                         # same plan at current solar size, no battery.
-                        if enable_solar_sweep:
+                        if (solar_mode == "uploaded") and enable_solar_sweep:
                             df_current_solar_case, _, _ = apply_pv_scale_to_intervals(
-                                df_int,
+                                df_joint_base,
                                 solar_profile_for_battery,
                                 1.0,
                             )
+                        elif solar_mode == "modelled":
+                            if isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
+                                solar_current = modelled_solar_profile_1kw.copy()
+                                solar_current["pv_kwh"] = (
+                                    pd.to_numeric(solar_current["pv_kwh"], errors="coerce")
+                                    .fillna(0.0)
+                                    .clip(lower=0.0)
+                                    .astype(float)
+                                    * max(float(current_pv_kw), 0.0)
+                                )
+                                df_current_solar_case, _, _ = apply_modelled_pv_to_intervals(
+                                    df_joint_base,
+                                    solar_current,
+                                )
+                            else:
+                                df_current_solar_case = df_joint_base
                         else:
-                            df_current_solar_case = df_int
+                            df_current_solar_case = df_joint_base
 
                         for plan_idx, p in enumerate(plans_lib, start=1):
                             plan_progress.progress(float(plan_idx - 1) / float(max(len(plans_lib), 1)))
                             best = None
-                            baseline_current_solar = simulate_plan(df_current_solar_case, p, include_signup_credit=False)
+                            baseline_current_solar = simulate_plan(
+                                df_current_solar_case,
+                                p,
+                                include_signup_credit=False,
+                                battery_kwh_context=0.0,
+                            )
                             base_current_total = float(baseline_current_solar.get("total_cents", 0.0))
                             days_current = float(baseline_current_solar.get("days", 0.0) or 0.0)
                             annual_bill_current_solar = (
@@ -5394,7 +6164,7 @@ with tab8:
                                 pv_kw = float(pv_case["pv_kw"])
                                 pv_capex = float(pv_case["pv_capex"])
                                 df_case = pv_case["df_int"]
-                                baseline = simulate_plan(df_case, p, include_signup_credit=False)
+                                baseline = simulate_plan(df_case, p, include_signup_credit=False, battery_kwh_context=0.0)
                                 base_total = float(baseline.get("total_cents", 0.0))
                                 days = float(baseline.get("days", 0.0) or 0.0)
                                 annual_base_bill = (base_total / 100.0) * (365.0 / days) if days > 0 else (base_total / 100.0)
@@ -5528,6 +6298,8 @@ with tab8:
 
                         if not results:
                             st.warning("No results. Check that plans and size ranges are valid.")
+                            st.session_state["joint_stage_df"] = pd.DataFrame()
+                            st.session_state["joint_stage_meta"] = {"reason": "no_results"}
                         else:
                             sort_cols = ["PV lifetime cost incl battery ($)"]
                             if enable_solar_sweep:
@@ -5536,12 +6308,14 @@ with tab8:
                             df_joint_run = pd.DataFrame(results).sort_values(sort_cols, ascending=[True] * len(sort_cols)).reset_index(drop=True)
                             st.session_state["joint_opt_df"] = df_joint_run
                             st.session_state["joint_best"] = df_joint_run.iloc[0].to_dict()
-                            st.session_state["joint_days"] = float(pd.to_datetime(df_int["timestamp"], errors="coerce").dt.date.nunique()) if "timestamp" in df_int.columns else 0.0
+                            st.session_state["joint_days"] = float(pd.to_datetime(df_joint_base["timestamp"], errors="coerce").dt.date.nunique()) if "timestamp" in df_joint_base.columns else 0.0
                             st.session_state["joint_signature"] = joint_signature_current
                             st.session_state["joint_meta"] = {
                                 "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "summary": (
                                     f"Joint optimizer; scenario={_scenario_label}; "
+                                    f"solar_source={solar_mode}; "
+                                    f"baseline_export_override={'on' if assume_no_existing_export else 'off'}; "
                                     f"solar_sweep={'on' if enable_solar_sweep else 'off'}; "
                                     f"power={float(power_kw):.1f}kW; reserve={float(reserve_pct):.0f}%; "
                                     f"eff={float(roundtrip_eff):.2f}; aging={'cycle-aware' if cycle_aware else 'calendar-only'}; "
@@ -5549,6 +6323,135 @@ with tab8:
                                     f"simulations={run_count}"
                                 ),
                             }
+                            stage_rows: list[dict] = []
+                            try:
+                                best_row = df_joint_run.iloc[0]
+                                best_plan_name = str(best_row.get("Plan", "") or "")
+                                best_plan_obj = next((pp for pp in plans_lib if str(pp.name) == best_plan_name), None)
+                                if best_plan_obj is not None:
+                                    best_solar_raw = best_row.get("Optimal solar size (kW)")
+                                    if best_solar_raw is None or pd.isna(best_solar_raw):
+                                        best_solar_kw = float(max(float(current_pv_kw), 0.0)) if solar_mode != "none" else 0.0
+                                    else:
+                                        best_solar_kw = float(max(float(best_solar_raw), 0.0))
+                                    best_batt_kwh = float(max(float(best_row.get("Optimal battery (kWh)", 0.0) or 0.0), 0.0))
+
+                                    stage_cases = [
+                                        ("Plan only", 0.0, 0.0),
+                                        ("Plan + solar", best_solar_kw, 0.0),
+                                        ("Plan + battery", 0.0, best_batt_kwh),
+                                        ("Plan + solar + battery", best_solar_kw, best_batt_kwh),
+                                    ]
+
+                                    for scenario_label, pv_kw_case, batt_kwh_case in stage_cases:
+                                        scenario_note = ""
+                                        solar_case = None
+                                        solar_applied = False
+                                        if (solar_mode == "uploaded") and isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
+                                            if float(current_pv_kw) > 0:
+                                                pv_scale_case = float(pv_kw_case) / float(current_pv_kw)
+                                                df_stage, solar_case, _stage_meta = apply_pv_scale_to_intervals(
+                                                    df_joint_base,
+                                                    solar_profile_for_battery,
+                                                    pv_scale_case,
+                                                )
+                                                solar_applied = bool(float(pv_kw_case) > 0.0)
+                                            else:
+                                                df_stage = df_joint_base
+                                                solar_case = solar_profile_for_battery
+                                                if float(pv_kw_case) > 0:
+                                                    scenario_note = "Solar scaling unavailable (set current solar size > 0)."
+                                        elif (solar_mode == "modelled") and isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
+                                            solar_case = modelled_solar_profile_1kw.copy()
+                                            solar_case["pv_kwh"] = (
+                                                pd.to_numeric(solar_case["pv_kwh"], errors="coerce")
+                                                .fillna(0.0)
+                                                .clip(lower=0.0)
+                                                .astype(float)
+                                                * float(max(pv_kw_case, 0.0))
+                                            )
+                                            df_stage, solar_case, _stage_meta = apply_modelled_pv_to_intervals(
+                                                df_joint_base,
+                                                solar_case,
+                                            )
+                                            solar_applied = bool(float(pv_kw_case) > 0.0)
+                                        else:
+                                            df_stage = df_joint_base
+                                            solar_case = solar_profile_for_battery if solar_mode == "uploaded" else None
+
+                                        baseline_stage = simulate_plan(
+                                            df_stage,
+                                            best_plan_obj,
+                                            include_signup_credit=False,
+                                            battery_kwh_context=0.0,
+                                        )
+                                        days_stage = float(baseline_stage.get("days", 0.0) or 0.0)
+                                        total_base_stage = float(baseline_stage.get("total_cents", 0.0) or 0.0)
+                                        annual_stage_bill = (
+                                            (total_base_stage / 100.0) * (365.0 / days_stage)
+                                            if days_stage > 0
+                                            else (total_base_stage / 100.0)
+                                        )
+                                        if float(batt_kwh_case) > 0:
+                                            batt_stage = BatteryParams(
+                                                capacity_kwh=float(batt_kwh_case),
+                                                power_kw=float(power_kw),
+                                                roundtrip_eff=float(roundtrip_eff),
+                                                reserve_frac=float(reserve_pct) / 100.0,
+                                                initial_soc_frac=float(init_soc_pct) / 100.0,
+                                                discharge_min_rate_cents=None,
+                                                charge_from_export_only=True,
+                                            )
+                                            sim_stage = simulate_plan_with_battery(
+                                                df_stage,
+                                                best_plan_obj,
+                                                batt_stage,
+                                                baseline=baseline_stage,
+                                                wide_base=_intervals_wide_from_long(df_stage),
+                                                solar_profile=solar_case,
+                                            )
+                                            total_stage = float(sim_stage.get("total_cents", total_base_stage) or 0.0)
+                                            annual_stage_bill = (
+                                                (total_stage / 100.0) * (365.0 / days_stage)
+                                                if days_stage > 0
+                                                else (total_stage / 100.0)
+                                            )
+
+                                        solar_capex_stage = (
+                                            max(float(pv_kw_case) - float(current_pv_kw), 0.0) * float(pv_cost_per_kw)
+                                            if (solar_mode != "none" and solar_applied)
+                                            else 0.0
+                                        )
+                                        batt_capex_stage = _battery_capex_for_size(float(batt_kwh_case))
+                                        stage_rows.append(
+                                            {
+                                                "Scenario": scenario_label,
+                                                "Plan": best_plan_name,
+                                                "Solar size (kW)": round(float(pv_kw_case), 2),
+                                                "Battery size (kWh)": round(float(batt_kwh_case), 2),
+                                                "Estimated annual bill ($/yr)": round(float(annual_stage_bill), 0),
+                                                "Incremental solar capex ($)": round(float(solar_capex_stage), 0),
+                                                "Battery capex ($)": round(float(batt_capex_stage), 0),
+                                                "Total incremental capex ($)": round(float(solar_capex_stage + batt_capex_stage), 0),
+                                                "Scenario notes": scenario_note or "-",
+                                            }
+                                        )
+
+                                    if stage_rows:
+                                        plan_only_bill = float(stage_rows[0].get("Estimated annual bill ($/yr)", 0.0) or 0.0)
+                                        for rr in stage_rows:
+                                            rr["Savings vs Plan only ($/yr)"] = round(
+                                                plan_only_bill - float(rr.get("Estimated annual bill ($/yr)", 0.0) or 0.0),
+                                                0,
+                                            )
+                                st.session_state["joint_stage_df"] = pd.DataFrame(stage_rows)
+                                st.session_state["joint_stage_meta"] = {
+                                    "plan": best_plan_name,
+                                    "solar_mode": solar_mode,
+                                }
+                            except Exception as stage_ex:
+                                st.session_state["joint_stage_df"] = pd.DataFrame()
+                                st.session_state["joint_stage_meta"] = {"error": str(stage_ex)}
 
                 df_joint = st.session_state.get("joint_opt_df")
                 if isinstance(df_joint, pd.DataFrame) and not df_joint.empty:
@@ -5592,6 +6495,14 @@ with tab8:
                         )
                         s4.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
 
+                    stage_df = st.session_state.get("joint_stage_df")
+                    if isinstance(stage_df, pd.DataFrame) and not stage_df.empty:
+                        st.markdown("**Staged pathway (best plan):**")
+                        _show_dataframe_with_frozen_column(stage_df, freeze_col="Scenario")
+                        st.caption(
+                            "Savings vs Plan only compares each staged setup to the same best-plan, no-solar/no-battery baseline."
+                        )
+
                     _show_dataframe_with_frozen_column(df_joint, freeze_col="Optimal battery (kWh)")
                     st.caption(
                         "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + battery cost. Lower is better."
@@ -5610,7 +6521,7 @@ with tab8:
                         st.caption("Payback uses battery cost + incremental solar capex.")
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
-                    st.info("Run 'Find best retailer + solar + battery' to generate results.")
+                    st.info("Run the joint optimizer in this tab to generate results.")
             with batt_tab_whatif:
                 st.markdown("**What-if: current vs optimised:**")
                 st.caption(
@@ -5932,7 +6843,12 @@ with tab8:
                             if abs(float(solar_kw) - float(base_solar_kw_for_scaling)) > 0.01:
                                 note = f"{case_name}: solar size change ignored (no solar profile uploaded)."
 
-                        baseline_case = simulate_plan(df_case, plan_case, include_signup_credit=False)
+                        baseline_case = simulate_plan(
+                            df_case,
+                            plan_case,
+                            include_signup_credit=False,
+                            battery_kwh_context=0.0,
+                        )
                         base_total_case = float(baseline_case.get("total_cents", 0.0))
                         days_case = float(baseline_case.get("days", 0.0) or 0.0)
 
@@ -6245,6 +7161,11 @@ with tab9:
             feed_in_tiered=None,
             monthly_fee_cents=0.0,
             signup_credit_cents=0.0,
+            fit_requires_home_battery=False,
+            fit_min_battery_kwh=0.0,
+            fit_unqualified_feed_in_flat_cents_per_kwh=0.0,
+            discount_pct=0.0,
+            discount_applies_to="none",
         )
         plans_lib.append(np)
         save_plans(plans_lib)
@@ -6347,6 +7268,67 @@ with tab9:
         format="%.2f",
         key=_ek("signup_credit"),
         help="One-off credit applied for plan-switch comparison only. Excluded from forecast and optimizer modelling.",
+    )
+
+    st.markdown("#### Plan discounts")
+    _discount_label_to_value = {
+        "No discount": "none",
+        "Usage only": "usage",
+        "Usage + supply": "usage_and_supply",
+    }
+    discount_scope_default = _norm_discount_scope(getattr(p, "discount_applies_to", "none"))
+    discount_scope_labels = list(_discount_label_to_value.keys())
+    discount_scope_values = list(_discount_label_to_value.values())
+    discount_scope_idx = discount_scope_values.index(discount_scope_default) if discount_scope_default in discount_scope_values else 0
+    discount_scope_label = st.selectbox(
+        "Discount applies to",
+        options=discount_scope_labels,
+        index=discount_scope_idx,
+        key=_ek("discount_scope"),
+        help="Use usage-only or usage+supply discounting as advertised by the retailer.",
+    )
+    discount_applies_to = _discount_label_to_value.get(discount_scope_label, "none")
+    discount_pct = st.number_input(
+        "Discount (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(getattr(p, "discount_pct", 0.0) or 0.0),
+        step=0.1,
+        format="%.2f",
+        key=_ek("discount_pct"),
+        disabled=(discount_applies_to == "none"),
+        help="Percentage discount applied after usage/supply charges are calculated.",
+    )
+    if discount_applies_to == "none":
+        discount_pct = 0.0
+
+    st.markdown("#### FiT eligibility (battery-required offers)")
+    fit_requires_home_battery = st.checkbox(
+        "Advertised FiT requires home battery",
+        value=bool(getattr(p, "fit_requires_home_battery", False)),
+        key=_ek("fit_requires_home_battery"),
+        help="When enabled, no-battery scenarios use the fallback FiT below instead of the advertised bonus FiT.",
+    )
+    fit_min_battery_kwh = st.number_input(
+        "Minimum battery size for advertised FiT (kWh)",
+        min_value=0.0,
+        max_value=60.0,
+        value=float(getattr(p, "fit_min_battery_kwh", 0.0) or 0.0),
+        step=0.5,
+        key=_ek("fit_min_battery_kwh"),
+        disabled=not fit_requires_home_battery,
+        help="Eligibility threshold for the advertised FiT rates.",
+    )
+    fit_unqualified_fallback_flat = st.number_input(
+        "Fallback FiT if not eligible (c/kWh)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(getattr(p, "fit_unqualified_feed_in_flat_cents_per_kwh", 0.0) or 0.0),
+        step=0.001,
+        format="%.3f",
+        key=_ek("fit_unqualified_feed_in_flat"),
+        disabled=not fit_requires_home_battery,
+        help="Applied when battery eligibility is not met in optimizer/battery modelling runs.",
     )
 
     st.markdown("#### Controlled load")
@@ -6535,8 +7517,13 @@ with tab9:
         feed_in_flat_cents_per_kwh=float(fit_flat if fit_mode in ("flat", "tou") else 0.0),
         feed_in_tiered=TieredFiT(float(fit_high), float(fit_kwh_day), float(fit_low)) if fit_mode == "tiered" else None,
         feed_in_tou=TouTariff(bands=[TouBand(**row) for row in fit_tou_rows_clean]) if fit_mode == "tou" else None,
+        fit_requires_home_battery=bool(fit_requires_home_battery),
+        fit_min_battery_kwh=float(fit_min_battery_kwh if fit_requires_home_battery else 0.0),
+        fit_unqualified_feed_in_flat_cents_per_kwh=float(fit_unqualified_fallback_flat if fit_requires_home_battery else 0.0),
         monthly_fee_cents=float(monthly_fee),
         signup_credit_cents=float(signup_credit_dollars) * 100.0,
+        discount_pct=float(discount_pct),
+        discount_applies_to=str(discount_applies_to),
     )
 
     has_unsaved_changes = _plan_to_dict(preview_plan) != _plan_to_dict(p)
