@@ -4847,7 +4847,7 @@ with tab7:
 
         st.subheader("Scenario comparison (GST inclusive)")
         df_scn_res_disp = _add_current_flag(df_scn_res)
-        st.dataframe(_style_current_rows(df_scn_res_disp), use_container_width=True)
+        _show_dataframe_with_frozen_column(df_scn_res_disp, freeze_col="Plan")
 
         if not df_scn_res.empty:
             scn_winner = df_scn_res.iloc[0]["Plan"]
@@ -5286,7 +5286,7 @@ with tab8:
                     discharge_min = rmin_f
                     st.caption(f"All TOU import rates are currently {rmin_f:.1f} c/kWh. Discharge threshold is fixed at this value.")
 
-            st.info("Suggested flow: 1) Quick comparison -> 2) Battery economics (selected retailer) -> 3) Best overall retailer + solar + battery.")
+            st.info("Suggested flow: 1) Quick battery comparison -> 2) Battery economics (selected retailer) -> 3) Best overall retailer + solar + battery.")
             if "timestamp" in df_int.columns:
                 ts_batt = pd.to_datetime(df_int["timestamp"], errors="coerce")
                 ts_start = str(ts_batt.min()) if not ts_batt.empty else ""
@@ -5429,7 +5429,7 @@ with tab8:
 
             batt_tab_compare, batt_tab_opt, batt_tab_joint, batt_tab_whatif = st.tabs(
                 [
-                    "Quick comparison",
+                    "Quick battery comparison",
                     "Battery economics (selected retailer)",
                     "Best overall retailer + solar + battery",
                     "What-if: current vs optimised",
@@ -5437,7 +5437,7 @@ with tab8:
             )
 
             with batt_tab_compare:
-                st.markdown("**Quick comparison (pick a few battery sizes to compare):**")
+                st.markdown("**Quick battery comparison (pick a few battery sizes to compare):**")
                 size_options = [0.0, 3.0, 5.0, 7.0, 10.0, 13.5, 15.0, 20.0]
                 chosen_sizes = st.multiselect("Sizes", size_options, default=[0.0, 5.0, 10.0, 13.5], key="batt_sizes_compare")
                 quick_sizes = sorted(set(float(s) for s in chosen_sizes))
@@ -5550,7 +5550,7 @@ with tab8:
                         st.session_state["batt_quick_meta"] = {
                             "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "summary": (
-                                f"Quick comparison; plan={sim_plan_name}; scenario={_scenario_label}; "
+                                f"Quick battery comparison; plan={sim_plan_name}; scenario={_scenario_label}; "
                                 f"power={float(power_kw):.1f}kW; reserve={float(reserve_pct):.0f}%; "
                                 f"eff={float(roundtrip_eff):.2f}; aging={'cycle-aware' if cycle_aware else 'calendar-only'}; "
                                 f"assumptions={assumption_preset_name}; "
@@ -5711,6 +5711,7 @@ with tab8:
                         st.session_state["batt_opt_df"] = pd.DataFrame(rows).sort_values("Battery (kWh)").reset_index(drop=True)
                         st.session_state["batt_opt_meta"] = {
                             "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "plan": str(sim_plan_name),
                             "summary": (
                                 f"Battery economics; plan={sim_plan_name}; scenario={_scenario_label}; "
                                 f"power={float(power_kw):.1f}kW; reserve={float(reserve_pct):.0f}%; "
@@ -5723,6 +5724,8 @@ with tab8:
                 df_opt = st.session_state.get("batt_opt_df")
                 if isinstance(df_opt, pd.DataFrame) and not df_opt.empty:
                     opt_meta = st.session_state.get("batt_opt_meta") or {}
+                    opt_plan = str(opt_meta.get("plan", sim_plan_name) or sim_plan_name)
+                    st.markdown(f"**Retailer: {opt_plan}**")
                     if opt_meta.get("run_at"):
                         st.caption(f"Last run: {opt_meta['run_at']}")
                     if opt_meta.get("summary"):
@@ -5761,7 +5764,7 @@ with tab8:
                 st.markdown("**Best overall retailer + solar + battery (decision wizard):**")
                 st.caption("Sweeps battery sizes for each retailer and optionally solar sizes, then ranks combinations by lowest PV lifetime cost.")
                 st.caption(
-                    "Quick comparison optimises battery for one fixed plan/solar profile. "
+                    "Quick battery comparison optimises battery for one fixed plan/solar profile. "
                     "This joint optimizer re-optimises plan + solar + battery together."
                 )
 
@@ -6503,7 +6506,7 @@ with tab8:
                             "Savings vs Plan only compares each staged setup to the same best-plan, no-solar/no-battery baseline."
                         )
 
-                    _show_dataframe_with_frozen_column(df_joint, freeze_col="Optimal battery (kWh)")
+                    _show_dataframe_with_frozen_column(df_joint, freeze_col="Plan")
                     st.caption(
                         "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + battery cost. Lower is better."
                     )

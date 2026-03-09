@@ -390,7 +390,11 @@
         }
       ]
     },
-    "feed_in_tiered": null,
+    "feed_in_tiered": {
+      "high_rate_cents": 1.0,
+      "high_kwh_per_day": 5.0,
+      "low_rate_cents": 0.1
+    },
     "feed_in_tou": null
   }
 ]
