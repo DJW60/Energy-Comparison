@@ -770,6 +770,7 @@ def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 _ST_DATAFRAME = st.dataframe
 
@@ -4250,6 +4251,14 @@ section = st.sidebar.radio(
     ["Overview", "Comparison", "Plan Library", "Breakdowns", "Battery and Solar Simulator", "Help & Glossary"],
     index=0,
 )
+_previous_section = st.session_state.get("_last_nav_section")
+_section_changed = (_previous_section is not None) and (str(_previous_section) != str(section))
+st.session_state["_last_nav_section"] = section
+if _section_changed:
+    components.html(
+        "<script>window.parent.scrollTo({top: 0, left: 0, behavior: 'auto'});</script>",
+        height=0,
+    )
 show_overview_only = section == "Overview"
 show_comparison_only = section == "Comparison"
 show_breakdowns_only = section == "Breakdowns"
