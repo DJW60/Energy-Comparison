@@ -20,6 +20,7 @@ import csv
 import datetime as dt
 import json
 import copy
+import hashlib
 import io
 import math
 import re
@@ -32,7 +33,7 @@ from typing import List, Optional
 import pandas as pd
 
 
-def _infer_interval_minutes(ts: pd.Series) -> float:
+def _infer_interval_minutes_from_series(ts: pd.Series) -> float:
     """Infer the interval length (minutes) from a timestamp series."""
     if ts is None or len(ts) < 2:
         return 5.0
@@ -102,7 +103,7 @@ def compute_max_demand_kw(df_int: pd.DataFrame, window_minutes: int = 30) -> flo
     if imp.empty:
         return 0.0
 
-    interval_min = _infer_interval_minutes(imp["timestamp"])
+    interval_min = _infer_interval_minutes_from_series(imp["timestamp"])
     if interval_min <= 0:
         interval_min = 5.0
 
@@ -507,6 +508,20 @@ def _build_joint_optimizer_report_markdown(
                 "",
             ]
         )
+        best_self_cons = pd.to_numeric(
+            [best.get("Est. self-consumption (solar-only, %)", None)],
+            errors="coerce",
+        )[0]
+        best_solar_cov = pd.to_numeric(
+            [best.get("Est. solar coverage of load (solar-only, %)", None)],
+            errors="coerce",
+        )[0]
+        if pd.notna(best_self_cons):
+            lines.append(f"- Est. self-consumption (solar-only): {float(best_self_cons):.1f}%")
+        if pd.notna(best_solar_cov):
+            lines.append(f"- Est. solar coverage of load (solar-only): {float(best_solar_cov):.1f}%")
+        if pd.notna(best_self_cons) or pd.notna(best_solar_cov):
+            lines.append("")
 
         lines.append("## Top plan outcomes (best config per plan)")
         top_disp = df_joint.head(min(10, len(df_joint))).copy()
@@ -615,7 +630,7 @@ def compute_average_daily_profile(df_int: pd.DataFrame, import_cols=("E1","E2"))
         return pd.DataFrame(columns=["tod","kw","day_type"])
     d = df_int.copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"])
-    interval_min = _infer_interval_minutes(d["timestamp"])
+    interval_min = _infer_interval_minutes_from_series(d["timestamp"])
     total_kwh = pd.Series(0.0, index=d.index)
     for c in import_cols:
         if c in d.columns:
@@ -755,6 +770,67 @@ def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 import streamlit as st
+
+_ST_DATAFRAME = st.dataframe
+
+
+def _is_currency_table_column(col_name: object) -> bool:
+    name = str(col_name or "").strip().lower()
+    if not name:
+        return False
+    if "$" in name:
+        return True
+    if "cent" in name or "c/kwh" in name or "(c/" in name:
+        return False
+    return name in {"amount", "amount ($)"}
+
+
+def _currency_columns_for_table(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    if not isinstance(df, pd.DataFrame):
+        return cols
+    for c in df.columns:
+        if _is_currency_table_column(c):
+            cols.append(c)
+    return cols
+
+
+def _format_currency_columns_for_table(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    for c in _currency_columns_for_table(out):
+        s = pd.to_numeric(out[c], errors="coerce")
+        if s.notna().any():
+            out[c] = s.round(2)
+    # Invoice-style tables sometimes store monetary values in generic `rate` / `amount` columns.
+    if {"unit", "rate"}.issubset(out.columns):
+        try:
+            has_dollar_units = out["unit"].astype(str).str.contains("$", regex=False).any()
+        except Exception:
+            has_dollar_units = False
+        if has_dollar_units:
+            s_rate = pd.to_numeric(out["rate"], errors="coerce")
+            if s_rate.notna().any():
+                out["rate"] = s_rate.round(2)
+    return out
+
+
+def _show_table(data, **kwargs) -> None:
+    """Table renderer that forces 2dp on currency columns for table displays only."""
+    if isinstance(data, pd.DataFrame):
+        _ST_DATAFRAME(_format_currency_columns_for_table(data), **kwargs)
+        return
+    # Handle styled tables while preserving styles and forcing 2dp currency formatting.
+    try:
+        styler_df = data.data if hasattr(data, "data") else None
+        if isinstance(styler_df, pd.DataFrame):
+            fmt_map = {c: "{:,.2f}" for c in _currency_columns_for_table(styler_df)}
+            if fmt_map:
+                data = data.format(fmt_map)
+    except Exception:
+        pass
+    _ST_DATAFRAME(data, **kwargs)
 
 
 # --- Scenario presets for homeowner-friendly sensitivity ---
@@ -3196,6 +3272,83 @@ def apply_modelled_pv_to_intervals(
     return out, scaled_solar, meta
 
 
+def estimate_solar_self_consumption_metrics(
+    df_int: pd.DataFrame,
+    solar_profile: Optional[pd.DataFrame],
+) -> dict:
+    """Estimate solar-only self-consumption and coverage from interval data."""
+    metrics = {
+        "applied": False,
+        "reason": "",
+        "pv_generated_kwh": 0.0,
+        "import_kwh": 0.0,
+        "export_kwh": 0.0,
+        "self_consumed_kwh": 0.0,
+        "self_consumption_pct": 0.0,
+        "solar_coverage_pct": 0.0,
+        "excess_export_over_pv_kwh": 0.0,
+    }
+    if df_int is None or not isinstance(df_int, pd.DataFrame) or df_int.empty:
+        metrics["reason"] = "No interval data."
+        return metrics
+    if (
+        not isinstance(solar_profile, pd.DataFrame)
+        or solar_profile.empty
+        or not {"timestamp", "pv_kwh"}.issubset(solar_profile.columns)
+    ):
+        metrics["reason"] = "No solar profile."
+        return metrics
+
+    wide = _intervals_wide_from_long(df_int)
+    if wide.empty:
+        metrics["reason"] = "Could not build interval-wide profile."
+        return metrics
+
+    wide = wide.copy()
+    wide["timestamp"] = pd.to_datetime(wide["timestamp"], errors="coerce")
+    wide = wide.dropna(subset=["timestamp"])
+    for c in ("general_kwh", "controlled_kwh", "export_kwh"):
+        if c not in wide.columns:
+            wide[c] = 0.0
+        wide[c] = pd.to_numeric(wide[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    s = solar_profile[["timestamp", "pv_kwh"]].copy()
+    s["timestamp"] = pd.to_datetime(s["timestamp"], errors="coerce")
+    s["pv_kwh"] = pd.to_numeric(s["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    s = s.dropna(subset=["timestamp"]).groupby("timestamp", as_index=False)["pv_kwh"].sum()
+
+    merged = wide[["timestamp", "general_kwh", "controlled_kwh", "export_kwh"]].merge(s, on="timestamp", how="left")
+    merged["pv_kwh"] = pd.to_numeric(merged["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    merged["import_kwh"] = pd.to_numeric(merged["general_kwh"], errors="coerce").fillna(0.0) + pd.to_numeric(
+        merged["controlled_kwh"], errors="coerce"
+    ).fillna(0.0)
+    merged["export_kwh"] = pd.to_numeric(merged["export_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    total_import_kwh = float(merged["import_kwh"].sum())
+    total_export_kwh = float(merged["export_kwh"].sum())
+    total_pv_kwh = float(merged["pv_kwh"].sum())
+    total_self_cons_kwh = max(total_pv_kwh - total_export_kwh, 0.0)
+    total_est_load_kwh = total_import_kwh + total_self_cons_kwh
+    self_cons_pct = (total_self_cons_kwh / total_pv_kwh * 100.0) if total_pv_kwh > 0 else 0.0
+    solar_cov_pct = (total_self_cons_kwh / total_est_load_kwh * 100.0) if total_est_load_kwh > 0 else 0.0
+    clipped_excess_export_kwh = float((merged["export_kwh"] - merged["pv_kwh"]).clip(lower=0.0).sum())
+
+    metrics.update(
+        {
+            "applied": True,
+            "reason": "",
+            "pv_generated_kwh": float(total_pv_kwh),
+            "import_kwh": float(total_import_kwh),
+            "export_kwh": float(total_export_kwh),
+            "self_consumed_kwh": float(total_self_cons_kwh),
+            "self_consumption_pct": float(self_cons_pct),
+            "solar_coverage_pct": float(solar_cov_pct),
+            "excess_export_over_pv_kwh": float(clipped_excess_export_kwh),
+        }
+    )
+    return metrics
+
+
 @dataclass
 class EVParams:
     """User-configurable EV charging assumptions for interval-level what-if analysis."""
@@ -3474,6 +3627,26 @@ def _dataset_signature(df_int: pd.DataFrame) -> dict:
     if rates:
         return max(rates)
     return None
+
+
+def _stable_json_digest(payload: object) -> str:
+    """Return a stable SHA1 digest for JSON-serializable payloads."""
+    try:
+        txt = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        txt = repr(payload)
+    return hashlib.sha1(txt.encode("utf-8")).hexdigest()
+
+
+def _plan_list_signature(plan_list: list) -> str:
+    """Stable digest for a list of plan objects."""
+    serial = []
+    for p in (plan_list or []):
+        try:
+            serial.append(_plan_to_dict(p))
+        except Exception:
+            serial.append({"name": str(getattr(p, "name", ""))})
+    return _stable_json_digest(serial)
 
 
 def apply_battery_to_intervals(
@@ -4010,9 +4183,10 @@ def render_help_and_glossary() -> None:
         st.markdown(
             "- `Overview`: Dataset sanity checks, totals, and demand profile.\n"
             "- `Comparison`: Fast ranking of plans by estimated total cost.\n"
-            "- `Breakdowns`: Daily totals, TOU bands, invoice-style line items, forecast, risk, sensitivity, battery outputs.\n"
-            "- `Battery and Solar Simulator`: Detailed battery economics and dispatch results.\n"
-            "- `Plan Library`: Create, duplicate, edit, export, and import plans."
+            "- `Plan Library`: Create, duplicate, edit, export, and import plans.\n"
+            "- `Breakdowns`: Daily totals, TOU bands, invoice-style line items, forecast, risk, and sensitivity.\n"
+            "- `Battery and Solar Simulator`: Battery economics, optimization, and what-if analysis.\n"
+            "- `Help & Glossary`: Usage notes, definitions, and troubleshooting."
         )
 
     with st.expander("Operational rules (Plan Library on Streamlit Cloud)", expanded=False):
@@ -4073,47 +4247,76 @@ st.set_page_config(page_title="Energex Retailer Comparator", layout='wide')
 # --- Navigation (pro polish) ---
 section = st.sidebar.radio(
     "Navigate",
-    ["Overview", "Comparison", "Breakdowns", "Battery and Solar Simulator", "Plan Library", "Help & Glossary"],
+    ["Overview", "Comparison", "Plan Library", "Breakdowns", "Battery and Solar Simulator", "Help & Glossary"],
     index=0,
 )
 show_overview_only = section == "Overview"
 show_comparison_only = section == "Comparison"
+show_breakdowns_only = section == "Breakdowns"
 show_battery_only = section == "Battery and Solar Simulator"
 show_plan_library_only = section == "Plan Library"
 show_help_only = section == "Help & Glossary"
-st.title("Electricity plan comparator (Energex) - NEM12 5-minute CSV")
+section_heading_map = {
+    "Overview": "Overview",
+    "Comparison": "Comparison",
+    "Plan Library": "Plan Library",
+    "Breakdowns": "Breakdowns",
+    "Battery and Solar Simulator": "Battery and Solar Simulator",
+    "Help & Glossary": "Help & Glossary",
+}
+if show_overview_only:
+    st.title("Electricity plan comparator (Energex) - NEM12 5-minute CSV")
+    st.subheader("Overview")
+else:
+    st.title(section_heading_map.get(section, section))
 
-st.write(
-    "Upload your **NEM12** CSV (5-minute intervals). This app compares plans using a locked mapping:\n"
-    "- **E1** = general import\n"
-    "- **E2** = controlled load\n"
-    "- **B1** = export\n"
-)
+if show_overview_only:
+    st.write(
+        "Upload your **NEM12** CSV (5-minute intervals). This app compares plans using a locked mapping:\n"
+        "- **E1** = general import\n"
+        "- **E2** = controlled load\n"
+        "- **B1** = export\n"
+    )
+else:
+    page_intro_map = {
+        "Comparison": "Compare included plans for your uploaded NEM12 dataset.",
+        "Plan Library": "Create, edit, import, and export plan definitions.",
+        "Breakdowns": "Deep-dive diagnostics and scenario analysis for uploaded data.",
+        "Battery and Solar Simulator": "Battery and solar simulation, optimisation, and economics.",
+        "Help & Glossary": "Reference notes, definitions, and troubleshooting guidance.",
+    }
+    st.caption(page_intro_map.get(section, ""))
+st.markdown("<div style='margin-bottom: 0.45rem;'></div>", unsafe_allow_html=True)
 st.sidebar.caption("Need guidance? Open `Help & Glossary` in Navigate.")
 
 if show_help_only:
     render_help_and_glossary()
     st.stop()
 
-uploaded = st.file_uploader("Upload NEM12 CSV", type=["csv"])
-if not uploaded:
+st.sidebar.markdown("### Data")
+uploaded = st.sidebar.file_uploader("Upload NEM12 CSV", type=["csv"], key="nem12_upload")
+if not uploaded and not show_plan_library_only:
     st.info("Upload a NEM12 CSV to begin.")
     st.stop()
 
-df_int_base = read_nem12_5min(uploaded)
-if df_int_base.empty:
-    st.error("Could not parse any 200/300 interval data from the file.")
-    st.stop()
-
-uploaded_solar = st.file_uploader(
-    "Optional: Upload solar production file (CSV/XLSX)",
-    type=["csv", "xlsx", "xls"],
-    key="solar_upload",
-    help="Supports Fronius Solar.Web style exports. Used to improve battery dispatch realism and solar diagnostics.",
-)
+if uploaded:
+    df_int_base = read_nem12_5min(uploaded)
+    if df_int_base.empty:
+        st.error("Could not parse any 200/300 interval data from the file.")
+        st.stop()
+    uploaded_solar = st.sidebar.file_uploader(
+        "Optional: Upload solar production file (CSV/XLSX)",
+        type=["csv", "xlsx", "xls"],
+        key="solar_upload",
+        help="Supports Fronius Solar.Web style exports. Used to improve battery dispatch realism and solar diagnostics.",
+    )
+else:
+    df_int_base = pd.DataFrame(columns=["register", "timestamp", "kwh"])
+    uploaded_solar = None
 
 regs = sorted(df_int_base["register"].unique().tolist())
-st.caption(f"Registers detected in file: {', '.join(regs)}")
+if regs:
+    st.sidebar.caption(f"Registers detected: {', '.join(regs)}")
 
 # Load plan library into session
 defaults = [ORIGIN, ALINTA]
@@ -4148,49 +4351,129 @@ if not plans and all_plans:
     )
 plans_lib = plans
 
-st.caption(f"Plans file: {PLANS_FILE}")
-excluded_plan_count = max(len(all_plans) - included_plan_count_actual, 0)
-st.caption(
-    f"Plans loaded: {len(all_plans)} "
-    f"(included in outputs: {included_plan_count_actual}, excluded: {excluded_plan_count})"
-)
-if LAST_PLANS_LOAD_STATUS.get("source") != "file":
-    reason = str(LAST_PLANS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
-    st.warning(
-        "Using built-in default plans only. "
-        f"Reason: {reason}. "
-        "Add `plans.json` to your GitHub repo or import it in Plan Library."
+if show_overview_only or show_plan_library_only:
+    st.caption(f"Plans file: {PLANS_FILE}")
+    excluded_plan_count = max(len(all_plans) - included_plan_count_actual, 0)
+    st.caption(
+        f"Plans loaded: {len(all_plans)} "
+        f"(included in outputs: {included_plan_count_actual}, excluded: {excluded_plan_count})"
     )
-elif int(LAST_PLANS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
-    st.info(
-        f"Loaded {LAST_PLANS_LOAD_STATUS.get('count', len(plans))} plans from file; "
-        f"skipped {LAST_PLANS_LOAD_STATUS.get('skipped', 0)} invalid entries."
+    if LAST_PLANS_LOAD_STATUS.get("source") != "file":
+        reason = str(LAST_PLANS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
+        st.warning(
+            "Using built-in default plans only. "
+            f"Reason: {reason}. "
+            "Add `plans.json` to your GitHub repo or import it in Plan Library."
+        )
+    elif int(LAST_PLANS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
+        st.info(
+            f"Loaded {LAST_PLANS_LOAD_STATUS.get('count', len(plans))} plans from file; "
+            f"skipped {LAST_PLANS_LOAD_STATUS.get('skipped', 0)} invalid entries."
+        )
+
+    if LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("source") != "file":
+        reason = str(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
+        st.caption(
+            f"Battery assumptions presets using built-in defaults ({reason}). "
+            f"File path: {BATTERY_ASSUMPTIONS_FILE}"
+        )
+    elif int(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
+        st.caption(
+            f"Battery assumptions loaded from file; "
+            f"skipped {LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get('skipped', 0)} invalid preset entries."
+        )
+
+    st.caption(f"Plan add-ons file: {PLAN_ADDONS_FILE}")
+    if LAST_PLAN_ADDONS_LOAD_STATUS.get("source") != "file":
+        reason = str(LAST_PLAN_ADDONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
+        st.caption(
+            f"Plan add-ons using built-in defaults ({reason}). "
+            "Edit plan_addons.json to add or update EV/VPP offers."
+        )
+    elif int(LAST_PLAN_ADDONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
+        st.caption(
+            f"Plan add-ons loaded from file; "
+            f"skipped {LAST_PLAN_ADDONS_LOAD_STATUS.get('skipped', 0)} invalid entries."
+        )
+
+if show_plan_library_only and not uploaded:
+    st.subheader("Plan Library Quick Access")
+    st.caption(
+        "NEM12 upload is not required for this quick mode. "
+        "Use these controls to import/export your plan files. "
+        "Upload a NEM12 file when you want full bill comparison and breakdown views."
     )
 
-if LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("source") != "file":
-    reason = str(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
-    st.caption(
-        f"Battery assumptions presets using built-in defaults ({reason}). "
-        f"File path: {BATTERY_ASSUMPTIONS_FILE}"
-    )
-elif int(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
-    st.caption(
-        f"Battery assumptions loaded from file; "
-        f"skipped {LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get('skipped', 0)} invalid preset entries."
+    quick_export_plans_json = json.dumps([_plan_to_dict(x) for x in all_plans], indent=2)
+    st.download_button(
+        "Download plans.json",
+        quick_export_plans_json,
+        file_name="plans.json",
+        mime="application/json",
+        key="btn_quick_download_plans_json",
     )
 
-st.caption(f"Plan add-ons file: {PLAN_ADDONS_FILE}")
-if LAST_PLAN_ADDONS_LOAD_STATUS.get("source") != "file":
-    reason = str(LAST_PLAN_ADDONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
-    st.caption(
-        f"Plan add-ons using built-in defaults ({reason}). "
-        "Edit plan_addons.json to add or update EV/VPP offers."
+    quick_uploaded_plans = st.file_uploader(
+        "Upload plans.json to replace library",
+        type=["json"],
+        key="plans_upload_quick_mode",
     )
-elif int(LAST_PLAN_ADDONS_LOAD_STATUS.get("skipped", 0) or 0) > 0:
-    st.caption(
-        f"Plan add-ons loaded from file; "
-        f"skipped {LAST_PLAN_ADDONS_LOAD_STATUS.get('skipped', 0)} invalid entries."
+    if quick_uploaded_plans is not None:
+        try:
+            quick_data = json.loads(quick_uploaded_plans.getvalue().decode("utf-8"))
+            quick_imported = [_dict_to_plan(x) for x in quick_data]
+            st.session_state["plans_lib"] = quick_imported
+            save_plans(quick_imported)
+            st.success("Imported and saved plans.json.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not import plans.json: {e}")
+
+    st.divider()
+
+    quick_export_addons_json = json.dumps(plan_addons_cfg, indent=2)
+    st.download_button(
+        "Download plan_addons.json",
+        quick_export_addons_json,
+        file_name="plan_addons.json",
+        mime="application/json",
+        key="btn_quick_download_plan_addons_json",
     )
+
+    quick_uploaded_addons = st.file_uploader(
+        "Upload plan_addons.json to replace add-ons library",
+        type=["json"],
+        key="plan_addons_upload_quick_mode",
+    )
+    if quick_uploaded_addons is not None:
+        try:
+            quick_raw_addons = json.loads(quick_uploaded_addons.getvalue().decode("utf-8"))
+            if not isinstance(quick_raw_addons, dict):
+                raise ValueError("plan_addons.json must be a JSON object with an 'addons' list.")
+            quick_rows_raw = quick_raw_addons.get("addons")
+            if not isinstance(quick_rows_raw, list):
+                raise ValueError("plan_addons.json.addons must be a list.")
+
+            quick_clean_addons: list[dict] = []
+            quick_skipped_rows = 0
+            for row in quick_rows_raw:
+                normalized = _normalize_plan_addon(row) if isinstance(row, dict) else None
+                if normalized is None:
+                    quick_skipped_rows += 1
+                    continue
+                quick_clean_addons.append(normalized)
+
+            quick_imported_cfg = {"addons": quick_clean_addons}
+            save_plan_addons_config(quick_imported_cfg)
+            st.session_state["plan_addons_cfg"] = quick_imported_cfg
+            st.success(
+                f"Imported add-ons library ({len(quick_clean_addons)} rows saved, {quick_skipped_rows} rows skipped)."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not import plan_addons.json: {e}")
+
+    st.stop()
 
 
 # ---------------------------
@@ -4507,50 +4790,41 @@ if uploaded_solar is not None:
             )
 
             solar_profile_for_battery = solar_aligned
-            total_pv_kwh = float(solar_aligned["pv_kwh"].sum())
+            solar_metrics = estimate_solar_self_consumption_metrics(df_int, solar_aligned)
+            total_pv_kwh = float(solar_metrics.get("pv_generated_kwh", 0.0) or 0.0)
+            self_cons_pct = float(solar_metrics.get("self_consumption_pct", 0.0) or 0.0)
+            solar_cov_pct = float(solar_metrics.get("solar_coverage_pct", 0.0) or 0.0)
+            clipped_excess_export_kwh = float(solar_metrics.get("excess_export_over_pv_kwh", 0.0) or 0.0)
 
-            wide_now = _intervals_wide_from_long(df_int)
-            merged = wide_now.merge(solar_aligned, on="timestamp", how="left")
-            merged["pv_kwh"] = pd.to_numeric(merged["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
-            merged["import_kwh"] = pd.to_numeric(merged["general_kwh"], errors="coerce").fillna(0.0) + pd.to_numeric(merged["controlled_kwh"], errors="coerce").fillna(0.0)
-            merged["export_kwh"] = pd.to_numeric(merged["export_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
-
-            total_import_kwh_for_solar = float(merged["import_kwh"].sum())
-            total_export_kwh_for_solar = float(merged["export_kwh"].sum())
-            total_self_cons_kwh = max(total_pv_kwh - total_export_kwh_for_solar, 0.0)
-            total_est_load_kwh = total_import_kwh_for_solar + total_self_cons_kwh
-            self_cons_pct = (total_self_cons_kwh / total_pv_kwh * 100.0) if total_pv_kwh > 0 else 0.0
-            solar_cov_pct = (total_self_cons_kwh / total_est_load_kwh * 100.0) if total_est_load_kwh > 0 else 0.0
-            clipped_excess_export_kwh = float((merged["export_kwh"] - merged["pv_kwh"]).clip(lower=0.0).sum())
-
-            st.info(
-                f"Solar production file loaded: **{len(solar_raw):,}** rows. "
-                f"**Alignment quality:** {solar_alignment_quality_pct:.1f}% "
-                f"({solar_common_intervals:,}/{solar_intervals_total:,} solar intervals align to NEM12). "
-                f"**NEM coverage by solar:** {solar_match_pct:.1f}% "
-                f"({solar_common_intervals:,}/{nem_intervals_total:,} NEM intervals have solar rows)."
-            )
-            st.caption(
-                "Alignment quality = share of uploaded solar production rows that match a NEM timestamp. "
-                "NEM coverage = share of NEM intervals that have a solar row."
-            )
-            s1, s2, s3 = st.columns(3)
-            s1.metric("PV generated", f"{total_pv_kwh:,.1f} kWh")
-            s2.metric("Est. self-consumption", f"{self_cons_pct:.1f}%")
-            s3.metric("Est. solar coverage of load", f"{solar_cov_pct:.1f}%")
-            st.caption(
-                "Coverage uses aggregate load: total import + self-consumed PV. "
-                "Battery model still preserves your register billing rules."
-            )
-            st.caption(
-                "Est. self-consumption = max(total PV - total export, 0) / total PV. "
-                "Est. solar coverage = self-consumed PV / (total import + self-consumed PV)."
-            )
-            if clipped_excess_export_kwh > 0.01:
-                st.caption(
-                    f"Reconciliation note: {clipped_excess_export_kwh:,.1f} kWh of intervals had export above PV. "
-                    "Self-consumption uses total PV minus total export."
+            if show_overview_only:
+                st.info(
+                    f"Solar production file loaded: **{len(solar_raw):,}** rows. "
+                    f"**Alignment quality:** {solar_alignment_quality_pct:.1f}% "
+                    f"({solar_common_intervals:,}/{solar_intervals_total:,} solar intervals align to NEM12). "
+                    f"**NEM coverage by solar:** {solar_match_pct:.1f}% "
+                    f"({solar_common_intervals:,}/{nem_intervals_total:,} NEM intervals have solar rows)."
                 )
+                st.caption(
+                    "Alignment quality = share of uploaded solar production rows that match a NEM timestamp. "
+                    "NEM coverage = share of NEM intervals that have a solar row."
+                )
+                s1, s2, s3 = st.columns(3)
+                s1.metric("PV generated", f"{total_pv_kwh:,.1f} kWh")
+                s2.metric("Est. self-consumption", f"{self_cons_pct:.1f}%")
+                s3.metric("Est. solar coverage of load", f"{solar_cov_pct:.1f}%")
+                st.caption(
+                    "Coverage uses aggregate load: total import + self-consumed PV. "
+                    "Battery model still preserves your register billing rules."
+                )
+                st.caption(
+                    "Est. self-consumption = max(total PV - total export, 0) / total PV. "
+                    "Est. solar coverage = self-consumed PV / (total import + self-consumed PV)."
+                )
+                if clipped_excess_export_kwh > 0.01:
+                    st.caption(
+                        f"Reconciliation note: {clipped_excess_export_kwh:,.1f} kWh of intervals had export above PV. "
+                        "Self-consumption uses total PV minus total export."
+                    )
 
 def _default_plan_index(names: list[str], fallback: int = 0) -> int:
     try:
@@ -4565,7 +4839,7 @@ def _mark_current_plan(name: str) -> str:
     cur = st.session_state.get("current_retailer", None)
     return f"* {name}" if cur and name == cur else name
 
-if ev_summary.get("enabled"):
+if ev_summary.get("enabled") and show_overview_only:
     ev_mode = "Solar-first + backup" if ev_summary.get("strategy") == "solar_first_backup" else "Timer (grid)"
     st.info(f"EV scenario active: **{ev_mode}** charging profile included in this run.")
     ev_c1, ev_c2, ev_c3, ev_c4 = st.columns(4)
@@ -4581,9 +4855,10 @@ if ev_summary.get("enabled"):
     if ev_summary.get("notes"):
         st.caption(str(ev_summary.get("notes")))
 
-st.subheader("Sanity check: totals by register (kWh)")
-stats = df_int.groupby("register")["kwh"].agg(["sum", "mean", "max"]).reset_index()
-st.dataframe(stats, use_container_width=True)
+if show_overview_only:
+    st.subheader("Sanity check: totals by register (kWh)")
+    stats = df_int.groupby("register")["kwh"].agg(["sum", "mean", "max"]).reset_index()
+    _show_table(stats, use_container_width=True)
 
 def _current_plan_name() -> str:
     try:
@@ -4612,9 +4887,9 @@ def _style_current_rows(df: pd.DataFrame, plan_col: str = "Plan"):
 def _show_dataframe_with_frozen_column(df: pd.DataFrame, freeze_col: str) -> None:
     # Streamlit keeps index visible while horizontally scrolling, so use key column as index.
     if freeze_col in df.columns:
-        st.dataframe(df.set_index(freeze_col), use_container_width=True)
+        _show_table(df.set_index(freeze_col), use_container_width=True)
     else:
-        st.dataframe(df, use_container_width=True)
+        _show_table(df, use_container_width=True)
 
 def _show_comparison_with_frozen_plan(df: pd.DataFrame, plan_col: str = "Plan") -> None:
     _show_dataframe_with_frozen_column(df, freeze_col=plan_col)
@@ -4626,7 +4901,7 @@ def _show_comparison_with_frozen_plan(df: pd.DataFrame, plan_col: str = "Plan") 
 # ---------------------------
 # Energy overview (dataset)
 # ---------------------------
-def _infer_interval_minutes(df: pd.DataFrame) -> float:
+def _infer_interval_minutes_from_df(df: pd.DataFrame) -> float:
     try:
         ts = df["timestamp"].dropna().drop_duplicates().sort_values()
         if len(ts) < 2:
@@ -4640,7 +4915,7 @@ def _infer_interval_minutes(df: pd.DataFrame) -> float:
 def _max_demand_kw(df: pd.DataFrame, import_registers=("E1","E2")) -> float:
     if df.empty:
         return 0.0
-    mins = _infer_interval_minutes(df)
+    mins = _infer_interval_minutes_from_df(df)
     g = df[df["register"].isin(list(import_registers))].groupby("timestamp")["kwh"].sum()
     if g.empty:
         return 0.0
@@ -4658,45 +4933,47 @@ max_demand_30 = compute_max_demand_kw(df_int, window_minutes=30)
 max_demand_5 = compute_max_demand_kw(df_int, window_minutes=5)
 monthly_max_demand = compute_monthly_max_demand(df_int, window_minutes=30)
 
-st.subheader("Energy overview (dataset)")
-if avg_daily_pv_production is not None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Days", f"{days_in_data}")
-    c2.metric("Import (E1+E2)", f"{total_import_kwh:,.1f} kWh")
-    c3.metric("Export (B1)", f"{total_export_kwh:,.1f} kWh")
-    c4.metric("Avg daily PV production", f"{avg_daily_pv_production:,.1f} kWh/day")
-    c5.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
-    c6.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
-else:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Days", f"{days_in_data}")
-    c2.metric("Import (E1+E2)", f"{total_import_kwh:,.1f} kWh")
-    c3.metric("Export (B1)", f"{total_export_kwh:,.1f} kWh")
-    c4.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
-    c5.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
-st.caption(f"Max 5-minute interval: {max_demand_5:,.2f} kW")
-st.caption(
-    "Max demand (30-min avg) is a rolling 30-minute average demand metric; "
-    "Max 5-minute interval is the highest single interval demand."
-)
+show_dataset_overview = show_overview_only
+if show_dataset_overview:
+    st.subheader("Energy overview (dataset)")
+    if avg_daily_pv_production is not None:
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Days", f"{days_in_data}")
+        c2.metric("Import (E1+E2)", f"{total_import_kwh:,.1f} kWh")
+        c3.metric("Export (B1)", f"{total_export_kwh:,.1f} kWh")
+        c4.metric("Avg daily PV production", f"{avg_daily_pv_production:,.1f} kWh/day")
+        c5.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
+        c6.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Days", f"{days_in_data}")
+        c2.metric("Import (E1+E2)", f"{total_import_kwh:,.1f} kWh")
+        c3.metric("Export (B1)", f"{total_export_kwh:,.1f} kWh")
+        c4.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
+        c5.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
+    st.caption(f"Max 5-minute interval: {max_demand_5:,.2f} kW")
+    st.caption(
+        "Max demand (30-min avg) is a rolling 30-minute average demand metric; "
+        "Max 5-minute interval is the highest single interval demand."
+    )
 
-st.divider()
+    st.divider()
 
-# Monthly max demand (30-min average) - matches Energex-style reporting
-if 'monthly_max_demand' in locals() and monthly_max_demand is not None and not monthly_max_demand.empty:
-    st.subheader("Monthly maximum demand (30-min average)")
-    md = monthly_max_demand.copy()
-    md["month"] = pd.to_datetime(md["month"]).dt.strftime("%b %Y")
-    st.dataframe(md.rename(columns={"month":"Month","max_demand_kw":"Max demand (kW)"}), use_container_width=True)
+    # Monthly max demand (30-min average) - matches Energex-style reporting
+    if 'monthly_max_demand' in locals() and monthly_max_demand is not None and not monthly_max_demand.empty:
+        st.subheader("Monthly maximum demand (30-min average)")
+        md = monthly_max_demand.copy()
+        md["month"] = pd.to_datetime(md["month"]).dt.strftime("%b %Y")
+        _show_table(md.rename(columns={"month":"Month","max_demand_kw":"Max demand (kW)"}), use_container_width=True)
 
 if show_overview_only:
     st.stop()
 
 
-if show_battery_only:
+if show_battery_only or show_breakdowns_only or show_plan_library_only:
     winner = str(st.session_state.get("current_retailer", plans[0].name if plans else ""))
 else:
-    st.subheader("Comparison results (GST inclusive)")
+    st.subheader("Results (GST inclusive)")
     st.caption(
         "Effective import (c/kWh) includes fixed charges and nets off FiT credit. "
         "Demand charges are included when enabled on a plan. "
@@ -4761,108 +5038,162 @@ else:
         addon_ev_drive_kwh = max(addon_ev_km, 0.0) * max(addon_ev_cons, 0.0) / 100.0
         addon_ev_wall_kwh_annual = addon_ev_drive_kwh / max(1e-9, (1.0 - max(addon_ev_loss_pct, 0.0) / 100.0))
     addon_profile["ev_annual_kwh"] = float(max(addon_ev_wall_kwh_annual, 0.0))
-    for p in comparison_plans:
-        sim = simulate_plan(
-            df_int,
-            p,
-            include_signup_credit=True,
-            battery_kwh_context=comparison_battery_context_kwh,
-        )
-        if ev_summary.get("enabled"):
-            sim_base = simulate_plan(
-                df_int_base,
+    comparison_signature_payload = {
+        "dataset_sig": dict(dataset_sig),
+        "dataset_base_sig": _dataset_signature(df_int_base),
+        "plans_sig": _plan_list_signature(comparison_plans),
+        "plan_addons_sig": _stable_json_digest(plan_addons_cfg),
+        "battery_context_kwh": round(float(comparison_battery_context_kwh), 4),
+        "ev_enabled": bool(ev_summary.get("enabled", False)),
+        "addon_profile": {
+            "has_home_battery": bool(addon_profile.get("has_home_battery", False)),
+            "battery_kwh": round(float(addon_profile.get("battery_kwh", 0.0) or 0.0), 4),
+            "solar_kw": round(float(addon_profile.get("solar_kw", 0.0) or 0.0), 4),
+            "ev_enabled": bool(addon_profile.get("ev_enabled", False)),
+            "vpp_opt_in": bool(addon_profile.get("vpp_opt_in", False)),
+            "ev_annual_kwh": round(float(addon_profile.get("ev_annual_kwh", 0.0) or 0.0), 3),
+        },
+        "addon_ev_inputs": {
+            "km": round(float(addon_ev_km), 3),
+            "cons": round(float(addon_ev_cons), 4),
+            "loss_pct": round(float(addon_ev_loss_pct), 4),
+        },
+    }
+    comparison_signature_hash = _stable_json_digest(comparison_signature_payload)
+    comparison_cache = st.session_state.get("comparison_results_cache")
+    comparison_cache_hit = (
+        isinstance(comparison_cache, dict)
+        and str(comparison_cache.get("signature", "")) == str(comparison_signature_hash)
+    )
+
+    if comparison_cache_hit:
+        cached_rows = comparison_cache.get("rows", [])
+        if isinstance(cached_rows, list):
+            rows = [dict(r) for r in cached_rows if isinstance(r, dict)]
+        cached_totals = comparison_cache.get("base_totals_by_plan", {})
+        if isinstance(cached_totals, dict):
+            safe_totals: dict[str, float] = {}
+            for k, v in cached_totals.items():
+                try:
+                    safe_totals[str(k)] = float(v)
+                except Exception:
+                    continue
+            base_totals_by_plan = safe_totals
+    else:
+        for p in comparison_plans:
+            sim = simulate_plan(
+                df_int,
                 p,
                 include_signup_credit=True,
                 battery_kwh_context=comparison_battery_context_kwh,
             )
-            base_total_cents = float(sim_base.get("total_cents", 0.0))
-            base_signup_credit_cents = float(sim_base.get("signup_credit_cents_applied", 0.0))
-            base_totals_by_plan[p.name] = (base_total_cents + base_signup_credit_cents) / 100.0
+            if ev_summary.get("enabled"):
+                sim_base = simulate_plan(
+                    df_int_base,
+                    p,
+                    include_signup_credit=True,
+                    battery_kwh_context=comparison_battery_context_kwh,
+                )
+                base_total_cents = float(sim_base.get("total_cents", 0.0))
+                base_signup_credit_cents = float(sim_base.get("signup_credit_cents_applied", 0.0))
+                base_totals_by_plan[p.name] = (base_total_cents + base_signup_credit_cents) / 100.0
     
-        general_kwh = float(sim["general_kwh"])
-        controlled_kwh = float(sim["controlled_kwh"])
-        export_kwh = float(sim["export_kwh"])
-        import_kwh = float(sim.get("import_kwh", general_kwh + controlled_kwh))
+            general_kwh = float(sim["general_kwh"])
+            controlled_kwh = float(sim["controlled_kwh"])
+            export_kwh = float(sim["export_kwh"])
+            import_kwh = float(sim.get("import_kwh", general_kwh + controlled_kwh))
     
-        general_cents = float(sim["general_cents"])
-        controlled_cents = float(sim["controlled_cents"])
-        import_usage_cents = float(sim.get("import_cents", general_cents + controlled_cents))
-        export_credit_cents = float(sim["export_credit_cents"])
-        signup_credit_cents = float(sim.get("signup_credit_cents_applied", 0.0))
-        supply_cents = float(sim["supply_cents"])
-        controlled_supply_cents = float(sim["controlled_supply_cents"])
-        demand_cents = float(sim.get("demand_cents", 0.0) or 0.0)
-        total_cents = float(sim["total_cents"])
-        days = int(sim["days"])
-        import_usage_rate_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
-        addon_eval = evaluate_plan_addons_for_plan(
-            plan_name=str(p.name),
-            addons_cfg=plan_addons_cfg,
-            profile=addon_profile,
-            days=float(days),
-            plan_context={"import_usage_rate_c_per_kwh": float(import_usage_rate_c_per_kwh)},
-        )
-        addon_benefit = float(addon_eval.get("benefit", 0.0) or 0.0)
-        signup_credit_dollars = float(signup_credit_cents) / 100.0
-        # Base comparison total excludes one-off sign-up credit.
-        total_dollars = (float(total_cents) + float(signup_credit_cents)) / 100.0
-        # Final comparison total explicitly includes one-off sign-up credit and add-on benefit.
-        final_total_with_addons_and_oneoff = total_dollars - signup_credit_dollars - float(addon_benefit)
-        addon_labels = addon_eval.get("eligible_labels", []) or []
-        single_rate_all_import = bool(sim.get("flat_applies_to_all_import", False))
-        controlled_tou_fallback = bool(sim.get("controlled_uses_general_tou_fallback", False))
-        p_comp_eff, _comp_fit_mode = _effective_plan_for_battery_context(p, comparison_battery_context_kwh)
-        night_fit_bonus = _fit_tou_has_night_bonus_rows(
-            [b.__dict__ for b in (p_comp_eff.feed_in_tou.bands if p_comp_eff.feed_in_tou else [])],
-            float(p_comp_eff.feed_in_flat_cents_per_kwh or 0.0),
-        )
-        night_bonus_export_kwh = fit_tou_night_bonus_export_kwh(df_int, p_comp_eff) if night_fit_bonus else 0.0
+            general_cents = float(sim["general_cents"])
+            controlled_cents = float(sim["controlled_cents"])
+            import_usage_cents = float(sim.get("import_cents", general_cents + controlled_cents))
+            export_credit_cents = float(sim["export_credit_cents"])
+            signup_credit_cents = float(sim.get("signup_credit_cents_applied", 0.0))
+            supply_cents = float(sim["supply_cents"])
+            controlled_supply_cents = float(sim["controlled_supply_cents"])
+            demand_cents = float(sim.get("demand_cents", 0.0) or 0.0)
+            total_cents = float(sim["total_cents"])
+            days = int(sim["days"])
+            import_usage_rate_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
+            addon_eval = evaluate_plan_addons_for_plan(
+                plan_name=str(p.name),
+                addons_cfg=plan_addons_cfg,
+                profile=addon_profile,
+                days=float(days),
+                plan_context={"import_usage_rate_c_per_kwh": float(import_usage_rate_c_per_kwh)},
+            )
+            addon_benefit = float(addon_eval.get("benefit", 0.0) or 0.0)
+            signup_credit_dollars = float(signup_credit_cents) / 100.0
+            # Base comparison total excludes one-off sign-up credit.
+            total_dollars = (float(total_cents) + float(signup_credit_cents)) / 100.0
+            # Final comparison total explicitly includes one-off sign-up credit and add-on benefit.
+            final_total_with_addons_and_oneoff = total_dollars - signup_credit_dollars - float(addon_benefit)
+            addon_labels = addon_eval.get("eligible_labels", []) or []
+            single_rate_all_import = bool(sim.get("flat_applies_to_all_import", False))
+            controlled_tou_fallback = bool(sim.get("controlled_uses_general_tou_fallback", False))
+            p_comp_eff, _comp_fit_mode = _effective_plan_for_battery_context(p, comparison_battery_context_kwh)
+            night_fit_bonus = _fit_tou_has_night_bonus_rows(
+                [b.__dict__ for b in (p_comp_eff.feed_in_tou.bands if p_comp_eff.feed_in_tou else [])],
+                float(p_comp_eff.feed_in_flat_cents_per_kwh or 0.0),
+            )
+            night_bonus_export_kwh = fit_tou_night_bonus_export_kwh(df_int, p_comp_eff) if night_fit_bonus else 0.0
     
-        effective_general_c_per_kwh = (general_cents / general_kwh) if general_kwh > 0 else 0.0
-        # Usage-only average import rate (excludes daily supply charges and FiT credits).
-        avg_import_ex_supply_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
-        # "Effective Rate" includes supply charges (and nets off FiT credit) per total imported kWh,
-        # but excludes one-time sign-up credits so plans are comparable on ongoing import economics.
-        effective_rate_c_per_kwh = ((total_cents + signup_credit_cents) / import_kwh) if import_kwh > 0 else 0.0
-        if controlled_tou_fallback:
-            e2_pricing_method = "General TOU fallback"
-        elif float(p_comp_eff.controlled_cents_per_kwh or 0.0) > 0.0:
-            e2_pricing_method = "Controlled-load tariff"
-        elif single_rate_all_import:
-            e2_pricing_method = "Single-rate import tariff"
-        else:
-            e2_pricing_method = "No controlled-load usage pricing"
+            effective_general_c_per_kwh = (general_cents / general_kwh) if general_kwh > 0 else 0.0
+            # Usage-only average import rate (excludes daily supply charges and FiT credits).
+            avg_import_ex_supply_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
+            # "Effective Rate" includes supply charges (and nets off FiT credit) per total imported kWh,
+            # but excludes one-time sign-up credits so plans are comparable on ongoing import economics.
+            effective_rate_c_per_kwh = ((total_cents + signup_credit_cents) / import_kwh) if import_kwh > 0 else 0.0
+            if controlled_tou_fallback:
+                e2_pricing_method = "General TOU fallback"
+            elif float(p_comp_eff.controlled_cents_per_kwh or 0.0) > 0.0:
+                e2_pricing_method = "Controlled-load tariff"
+            elif single_rate_all_import:
+                e2_pricing_method = "Single-rate import tariff"
+            else:
+                e2_pricing_method = "No controlled-load usage pricing"
     
-        rows.append({
-            "Plan": p.name,
-            "FiT type": fit_mode_for_plan(p),
-            "Days": days,
-            "Import kWh (E1+E2)": round(import_kwh, 3),
-            "Import Usage ($)": round(import_usage_cents / 100.0, 2),
-            "General kWh (E1)": round(general_kwh, 3),
-            "General Usage ($)": round(general_cents / 100.0, 2),
-            "Effective General Rate (c/kWh)": round(effective_general_c_per_kwh, 2),
-            "Avg import rate excl supply (c/kWh)": round(avg_import_ex_supply_c_per_kwh, 2),
-            "Effective Rate (c/kWh)": round(effective_rate_c_per_kwh, 2),
-            "Controlled kWh (E2)": round(float(sim["controlled_kwh"]), 3),
-            "Export kWh (B1)": round(float(sim["export_kwh"]), 3),
-            "Supply ($)": round(float(sim["supply_cents"]) / 100.0, 2),
-            "Controlled supply ($)": round(float(sim["controlled_supply_cents"]) / 100.0, 2),
-            "Demand charge ($)": round(demand_cents / 100.0, 2),
-            "Controlled usage ($)": round(float(sim["controlled_cents"]) / 100.0, 2),
-            "E2 pricing method": e2_pricing_method,
-            "Single-rate applied to all import": "Yes" if single_rate_all_import else "No",
-            "Night FiT bonus window": "Yes" if night_fit_bonus else "No",
-            "Night bonus export kWh": round(night_bonus_export_kwh, 3),
-            "FiT credit ($)": round(float(sim["export_credit_cents"]) / 100.0, 2),
-            "Total ($)": round(total_dollars, 2),
-            "Sign-up credit ($)": round(signup_credit_dollars, 2),
-            "Add-on eligible programs": "; ".join(str(v) for v in addon_labels) if addon_labels else "-",
-            "Add-on benefit ($)": round(addon_benefit, 2),
-            net_total_col: round(final_total_with_addons_and_oneoff, 2),
-        })
+            rows.append({
+                "Plan": p.name,
+                "FiT type": fit_mode_for_plan(p),
+                "Days": days,
+                "Import kWh (E1+E2)": round(import_kwh, 3),
+                "Import Usage ($)": round(import_usage_cents / 100.0, 2),
+                "General kWh (E1)": round(general_kwh, 3),
+                "General Usage ($)": round(general_cents / 100.0, 2),
+                "Effective General Rate (c/kWh)": round(effective_general_c_per_kwh, 2),
+                "Avg import rate excl supply (c/kWh)": round(avg_import_ex_supply_c_per_kwh, 2),
+                "Effective Rate (c/kWh)": round(effective_rate_c_per_kwh, 2),
+                "Controlled kWh (E2)": round(float(sim["controlled_kwh"]), 3),
+                "Export kWh (B1)": round(float(sim["export_kwh"]), 3),
+                "Supply ($)": round(float(sim["supply_cents"]) / 100.0, 2),
+                "Controlled supply ($)": round(float(sim["controlled_supply_cents"]) / 100.0, 2),
+                "Demand charge ($)": round(demand_cents / 100.0, 2),
+                "Controlled usage ($)": round(float(sim["controlled_cents"]) / 100.0, 2),
+                "E2 pricing method": e2_pricing_method,
+                "Single-rate applied to all import": "Yes" if single_rate_all_import else "No",
+                "Night FiT bonus window": "Yes" if night_fit_bonus else "No",
+                "Night bonus export kWh": round(night_bonus_export_kwh, 3),
+                "FiT credit ($)": round(float(sim["export_credit_cents"]) / 100.0, 2),
+                "Total ($)": round(total_dollars, 2),
+                "Sign-up credit ($)": round(signup_credit_dollars, 2),
+                "Add-on eligible programs": "; ".join(str(v) for v in addon_labels) if addon_labels else "-",
+                "Add-on benefit ($)": round(addon_benefit, 2),
+                net_total_col: round(final_total_with_addons_and_oneoff, 2),
+            })
+
+        st.session_state["comparison_results_cache"] = {
+            "signature": comparison_signature_hash,
+            "rows": rows,
+            "base_totals_by_plan": base_totals_by_plan,
+        }
     
     res = pd.DataFrame(rows)
+    if not res.empty and "Plan" in res.columns and "Total ($)" in res.columns:
+        st.session_state["comparison_base_totals_by_plan"] = {
+            str(r["Plan"]): float(r["Total ($)"])
+            for _, r in res.iterrows()
+        }
+        st.session_state["comparison_base_totals_signature"] = str(comparison_signature_hash)
     if res.empty:
         st.info("No plans available after current filtering.")
         st.stop()
@@ -4982,7 +5313,7 @@ else:
                 "Export kWh (B1)": "Export with EV (kWh)",
             }
         )
-        st.dataframe(ev_delta, use_container_width=True)
+        _show_table(ev_delta, use_container_width=True)
     
     winner = res.iloc[0]["Plan"]
     st.success(f"Cheapest for this dataset: **{winner}**")
@@ -5005,8 +5336,6 @@ else:
             if expected_intervals_report > 0
             else 0.0
         )
-        months_covered_report = int(ts_base_report.dt.to_period("M").nunique()) if not ts_base_report.empty else 0
-
         cur_name_report = str(st.session_state.get("current_retailer", "") or "")
         cur_row_report = res[res["Plan"].astype(str) == cur_name_report].head(1)
         winner_row_report = res.iloc[0]
@@ -5072,34 +5401,6 @@ else:
                     f"Off-peak {pct_map_report.get('off_peak', 0.0):.1f}%"
                 )
 
-        whatif_summary_report = "Not run in this session."
-        df_simple_report = st.session_state.get("whatif_simple_df")
-        if isinstance(df_simple_report, pd.DataFrame) and not df_simple_report.empty:
-            cur_simple = df_simple_report[df_simple_report["Scenario"].astype(str) == "Current setup"].head(1)
-            whatif_simple = df_simple_report[df_simple_report["Scenario"].astype(str) == "What-if"].head(1)
-            if (not cur_simple.empty) and (not whatif_simple.empty):
-                cur_simple_bill = pd.to_numeric(cur_simple["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
-                whatif_simple_bill = pd.to_numeric(whatif_simple["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
-                if pd.notna(cur_simple_bill) and pd.notna(whatif_simple_bill):
-                    whatif_summary_report = f"What-if delta vs current: ${float(whatif_simple_bill - cur_simple_bill):,.0f}/yr."
-
-        joint_best_report = st.session_state.get("joint_best") or {}
-        optimizer_summary_report = "Not run in this session."
-        opt_annual_bill_report = pd.to_numeric(
-            [joint_best_report.get("Estimated annual bill with battery ($/yr)", None)],
-            errors="coerce",
-        )[0]
-        opt_npv_report = pd.to_numeric([joint_best_report.get("Battery NPV ($)", None)], errors="coerce")[0]
-        if pd.notna(opt_annual_bill_report):
-            optimizer_summary_report = (
-                f"Optimizer annual bill: ${float(opt_annual_bill_report):,.0f}/yr"
-                + (
-                    f", Battery NPV: ${float(opt_npv_report):,.0f}."
-                    if pd.notna(opt_npv_report)
-                    else "."
-                )
-            )
-
         recommendation_report = "Monitor"
         recommendation_reason_report = "Build more history (seasonality) before switching."
         if annual_saving_vs_current_report is not None:
@@ -5152,7 +5453,7 @@ else:
                 {"Metric": "Solar source", "Value": solar_source_report},
             ]
         )
-        st.dataframe(dq_report, use_container_width=True, hide_index=True)
+        _show_table(dq_report, use_container_width=True, hide_index=True)
 
         st.markdown("#### 2) Household energy profile")
         ep_report = pd.DataFrame(
@@ -5165,7 +5466,7 @@ else:
                 {"Metric": "TOU exposure (winner plan)", "Value": tou_profile_report},
             ]
         )
-        st.dataframe(ep_report, use_container_width=True, hide_index=True)
+        _show_table(ep_report, use_container_width=True, hide_index=True)
 
         st.markdown("#### 3) Current setup baseline and top plan comparison")
         top_n_report = min(3, len(res))
@@ -5186,18 +5487,9 @@ else:
                 rank_col: "Bill over dataset ($)",
             }
         )
-        st.dataframe(top_report_disp.round(2), use_container_width=True)
+        _show_table(top_report_disp.round(2), use_container_width=True)
 
-        st.markdown("#### 4) Risk and sensitivity snapshot")
-        risk_lines_report = [
-            f"Months covered in this dataset: {months_covered_report}",
-            whatif_summary_report,
-            optimizer_summary_report,
-        ]
-        for ln in risk_lines_report:
-            st.write(f"- {ln}")
-
-        st.markdown("#### 5) Recommendation and action checklist")
+        st.markdown("#### 4) Recommendation and action checklist")
         st.info(f"**Recommendation:** {recommendation_report}. {recommendation_reason_report}")
         action_items_report = [
             f"Confirm the shortlisted plan: **{winner}** and validate any conditions (FiT windows, battery requirements, expiry offers).",
@@ -5234,11 +5526,6 @@ else:
             f"- Peak demand (30-min avg): {float(max_demand_30):,.2f} kW",
             f"- Peak demand (5-min): {float(max_demand_5):,.2f} kW",
             f"- TOU exposure (winner plan): {tou_profile_report}",
-            "",
-            "## Risk and sensitivity",
-            f"- Months covered: {months_covered_report}",
-            f"- {whatif_summary_report}",
-            f"- {optimizer_summary_report}",
             "",
             "## Action checklist",
             f"- Confirm and verify conditions for {winner}.",
@@ -5284,22 +5571,21 @@ else:
 # ---------------------------
 # Breakdowns
 # ---------------------------
-st.subheader("Breakdowns")
-if show_plan_library_only:
-    tab9, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-        ["Plan Library", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery and Solar Simulator"]
+tab1 = tab2 = tab3 = tab4 = tab5 = tab6 = tab7 = tab8 = tab9 = None
+if show_breakdowns_only:
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity"]
     )
 elif show_battery_only:
-    tab8, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab9 = st.tabs(
-        ["Battery and Solar Simulator", "Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Plan Library"]
-    )
+    tab8 = st.container()
+elif show_plan_library_only:
+    tab9 = st.container()
 else:
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-    ["Daily totals", "TOU bands (selected plan)", "Invoice-style breakdown", "Plan details", "Forecast", "Risk & volatility", "Scenario & sensitivity", "Battery and Solar Simulator", "Plan Library"]
-    )
+    st.stop()
 
-with tab8:
-    st.subheader("Battery and Solar Simulator (Level 1: solar-only charging)")
+if show_battery_only:
+  with tab8:
+    st.subheader("Level 1: solar-only charging")
     st.caption("Simulates a behind-the-meter battery that **only charges from PV surplus (reduces export)** and discharges to offset imports during high-rate periods (no grid charging).")
     st.caption("Battery economics and optimizer metrics exclude one-time plan sign-up credits.")
     if not bool(st.session_state.get("has_home_battery", False)):
@@ -6202,6 +6488,39 @@ with tab8:
                     "Quick battery comparison optimises battery for one fixed plan/solar profile. "
                     "This joint optimizer re-optimises plan + solar + battery together."
                 )
+                with st.expander("Where optimizer assumptions and variables come from", expanded=False):
+                    optimizer_source_rows = [
+                        {
+                            "Input group": "Load intervals",
+                            "Source used by optimizer": "Uploaded NEM12 interval file (E1/E2/B1) after any active Global EV charging adjustments.",
+                            "Where to change it": "Upload a different NEM12 file or edit sidebar 'Global EV charging model'.",
+                        },
+                        {
+                            "Input group": "Plan pricing and rules",
+                            "Source used by optimizer": "Included plans from Plan Library (TOU/flat rates, FiT, supply charges, credits, battery eligibility).",
+                            "Where to change it": "Navigate > Plan Library, then edit plan fields or include/exclude plans.",
+                        },
+                        {
+                            "Input group": "Solar production profile",
+                            "Source used by optimizer": "Uploaded solar profile when provided, otherwise optional modelled solar profile in this tab.",
+                            "Where to change it": "Upload solar file at top or enable 'Use modelled solar profile' in this optimizer tab.",
+                        },
+                        {
+                            "Input group": "Battery technical assumptions",
+                            "Source used by optimizer": "Battery assumptions preset (cycle life, EoL %, life years) plus dispatch controls in Battery Simulator.",
+                            "Where to change it": "Battery and Solar Simulator > battery assumptions and operation settings.",
+                        },
+                        {
+                            "Input group": "Financial assumptions",
+                            "Source used by optimizer": "Discount rate, price growth, battery/PV capex and sweep ranges currently selected in this tab.",
+                            "Where to change it": "Battery and Solar Simulator > Best overall retailer + solar + battery controls.",
+                        },
+                    ]
+                    _show_table(pd.DataFrame(optimizer_source_rows), use_container_width=True, hide_index=True)
+                    st.caption(
+                        "The optimizer only uses the current session settings shown in this table. "
+                        "If any input changes, prior optimizer outputs are invalidated and should be re-run."
+                    )
 
                 solar_uploaded_available = bool(
                     isinstance(solar_profile_for_battery, pd.DataFrame)
@@ -6633,12 +6952,14 @@ with tab8:
                                 df_case = df_joint_base
                                 solar_case = solar_profile_for_battery if solar_mode == "uploaded" else None
 
+                            solar_case_metrics = estimate_solar_self_consumption_metrics(df_case, solar_case)
                             pv_cases.append({
                                 "pv_kw": float(pv_kw_eff),
                                 "pv_scale": float(pv_scale),
                                 "pv_capex": float(pv_capex),
                                 "df_int": df_case,
                                 "solar_profile": solar_case,
+                                "solar_metrics": solar_case_metrics,
                                 "wide_base": _intervals_wide_from_long(df_case),
                             })
 
@@ -6690,6 +7011,12 @@ with tab8:
                                 pv_kw = float(pv_case["pv_kw"])
                                 pv_capex = float(pv_case["pv_capex"])
                                 df_case = pv_case["df_int"]
+                                solar_metrics_case = pv_case.get("solar_metrics") if isinstance(pv_case, dict) else {}
+                                if not isinstance(solar_metrics_case, dict):
+                                    solar_metrics_case = {}
+                                solar_self_cons_pct = float(solar_metrics_case.get("self_consumption_pct", 0.0) or 0.0)
+                                solar_cov_pct_case = float(solar_metrics_case.get("solar_coverage_pct", 0.0) or 0.0)
+                                solar_pv_gen_case = float(solar_metrics_case.get("pv_generated_kwh", 0.0) or 0.0)
                                 baseline = simulate_plan(df_case, p, include_signup_credit=False, battery_kwh_context=0.0)
                                 base_total = float(baseline.get("total_cents", 0.0))
                                 days = float(baseline.get("days", 0.0) or 0.0)
@@ -6782,6 +7109,9 @@ with tab8:
                                         "Current solar/no-battery annual bill ($/yr)": float(annual_bill_current_solar),
                                         "Incremental solar capex ($)": float(pv_capex),
                                         "Battery cost ($)": float(batt_cost),
+                                        "Est. PV generated (solar-only, kWh)": float(solar_pv_gen_case),
+                                        "Est. self-consumption (solar-only, %)": float(solar_self_cons_pct),
+                                        "Est. solar coverage of load (solar-only, %)": float(solar_cov_pct_case),
                                         "Cycles equiv": round(battery_cycles_equiv, 2),
                                         "Cycles/yr (EFC)": round(float(cycle_metrics.get("efc_per_year", 0.0)), 1),
                                         "Implied cycle life (yrs)": (
@@ -7054,6 +7384,30 @@ with tab8:
                         )
                         s4.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
 
+                    best_self_cons = pd.to_numeric(
+                        [best.get("Est. self-consumption (solar-only, %)", None)],
+                        errors="coerce",
+                    )[0]
+                    best_solar_cov = pd.to_numeric(
+                        [best.get("Est. solar coverage of load (solar-only, %)", None)],
+                        errors="coerce",
+                    )[0]
+                    if pd.notna(best_self_cons) or pd.notna(best_solar_cov):
+                        sc_txt = (
+                            f"{float(best_self_cons):.1f}%"
+                            if pd.notna(best_self_cons)
+                            else "-"
+                        )
+                        cov_txt = (
+                            f"{float(best_solar_cov):.1f}%"
+                            if pd.notna(best_solar_cov)
+                            else "-"
+                        )
+                        st.caption(
+                            "Solar-only estimate (before battery dispatch): "
+                            f"self-consumption {sc_txt}, solar coverage {cov_txt}."
+                        )
+
                     stage_df = st.session_state.get("joint_stage_df")
                     if isinstance(stage_df, pd.DataFrame) and not stage_df.empty:
                         st.markdown("**Staged pathway (best plan):**")
@@ -7191,6 +7545,10 @@ with tab8:
                     )
                     st.caption("`Battery incremental savings vs same solar` isolates battery-only impact at that solar size.")
                     st.caption("`Total savings vs current solar, no battery` includes both solar-size and battery effects.")
+                    st.caption(
+                        "`Est. self-consumption (solar-only, %)` and `Est. solar coverage of load (solar-only, %)` "
+                        "are based on the selected/uploaded/modelled solar profile before battery dispatch."
+                    )
                     st.caption("Cycle stress = implied cycle life more than 20% below assumed life.")
                     stress_rows_joint = df_joint[df_joint["Cycle stress"].astype(str) == "High"] if "Cycle stress" in df_joint.columns else pd.DataFrame()
                     if not stress_rows_joint.empty:
@@ -7820,225 +8178,213 @@ with tab8:
 if show_battery_only:
     st.stop()
 
-with tab1:
-    daily_battery_context_kwh = (
-        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
-        if bool(has_home_battery)
-        else 0.0
-    )
-    chart_df = None
-    for p in plans:
-        d = daily_totals(df_int, p, battery_kwh_context=daily_battery_context_kwh)[["date", "total_$"]].copy()
-        d = d.rename(columns={"total_$": p.name}).set_index("date")
-        chart_df = d if chart_df is None else _dedupe_columns(chart_df.merge(d, how="outer", left_index=True, right_index=True, suffixes=("", "_dup")))
-    st.line_chart(chart_df)
-
-    st.subheader("Average daily profile (all days)")
-    plot_average_24hr_profile_import_export(df_int, solar_profile=solar_profile_for_battery)
-    if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
-        st.caption("Production is shown as an additional solar trace so import/export and generation can be compared by hour.")
-
-
-    win_plan = next(pp for pp in plans if pp.name == winner)
-    dwin = daily_totals(df_int, win_plan, battery_kwh_context=daily_battery_context_kwh)
-    st.write(f"Daily breakdown (last 14 days) - **{winner}**")
-    st.dataframe(dwin.tail(14), use_container_width=True)
-
-with tab2:
-    tou_plans = [p for p in plans if p.import_type == "tou" and p.tou is not None]
-    if not tou_plans:
-        st.info("No TOU plans are available in the current library.")
-    else:
-        tou_battery_context_kwh = (
+if show_breakdowns_only:
+    with tab1:
+        daily_battery_context_kwh = (
             float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
             if bool(has_home_battery)
             else 0.0
         )
-        tou_names = [p.name for p in tou_plans]
-        selected_name = st.selectbox(
-            "Select a plan to view TOU breakdown",
-            tou_names,
-            index=_default_plan_index(tou_names, 0),
-        )
-        selected_plan = next(p for p in tou_plans if p.name == selected_name)
-        bd = tou_breakdown_general(df_int, selected_plan.tou).copy()
-        if bd.empty:
-            st.warning("No general usage data found for E1.")
-        else:
-            total_general_kwh = float(bd["kwh"].sum()) if "kwh" in bd.columns else 0.0
-            bd["$"] = bd["cents"] / 100.0
-            bd["% of General"] = bd["kwh"].apply(lambda x: (float(x) / total_general_kwh * 100.0) if total_general_kwh > 0 else 0.0)
-
-            bd["kwh"] = bd["kwh"].map(lambda x: round(float(x), 3))
-            bd["rate_c_per_kwh"] = bd["rate_c_per_kwh"].map(lambda x: round(float(x), 3))
-            bd["% of General"] = bd["% of General"].map(lambda x: round(float(x), 1))
-            bd["$"] = bd["$"].map(lambda x: round(float(x), 2))
-
-            st.dataframe(bd[["band", "kwh", "% of General", "rate_c_per_kwh", "$"]], use_container_width=True)
-
-            # Flat-rate equivalent callouts.
-            # Match Comparison report basis (effective billed general usage, including plan discounts).
-            sim_tou = simulate_plan(
-                df_int,
-                selected_plan,
-                include_signup_credit=False,
-                battery_kwh_context=tou_battery_context_kwh,
-            )
-            billed_general_kwh = float(sim_tou.get("general_kwh", 0.0))
-            billed_general_cents = float(sim_tou.get("general_cents", 0.0))
-            eff_general_c_per_kwh = (billed_general_cents / billed_general_kwh) if billed_general_kwh > 0 else 0.0
-
-            tariff_total_cents = float(bd["cents"].sum())
-            tariff_only_c_per_kwh = (tariff_total_cents / total_general_kwh) if total_general_kwh > 0 else 0.0
-
-            st.success(
-                f"Flat-rate equivalent for General usage (E1, effective billed): **{eff_general_c_per_kwh:.2f} c/kWh**"
-            )
-            if abs(eff_general_c_per_kwh - tariff_only_c_per_kwh) > 1e-6:
-                st.caption(
-                    f"TOU tariff-only equivalent (before plan discounts): {tariff_only_c_per_kwh:.2f} c/kWh."
-                )
-
-with tab3:
-    st.write("Invoice-style line items (like a retailer invoice).")
-    # Default this selector to the current retailer (sidebar) when possible.
-    # Implementation note: we control the widget value ONLY via st.session_state (no selectbox index),
-    # which avoids Streamlit's warning about setting both a default and session_state.
-    _cur = st.session_state.get("current_retailer", None)
-    _names = [p.name for p in plans]
-
-    if _names:
-        # Initialise session state once (or recover if it becomes invalid)
-        if ("invoice_plan" not in st.session_state) or (st.session_state.get("invoice_plan") not in _names):
-            st.session_state["invoice_plan"] = _cur if _cur in _names else _names[0]
-
-        # Re-sync ONLY when the sidebar current retailer changes (so users can still explore other plans)
-        if ("_invoice_last_current" not in st.session_state) or (st.session_state.get("_invoice_last_current") != _cur):
-            if _cur in _names:
-                st.session_state["invoice_plan"] = _cur
-            st.session_state["_invoice_last_current"] = _cur
-
-    selected_plan_name = st.selectbox(
-        "Select plan",
-        _names,
-        key="invoice_plan",
-    )
-
-    selected_plan = next(p for p in plans if p.name == selected_plan_name)
-    invoice_battery_context_kwh = (
-        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
-        if bool(has_home_battery)
-        else 0.0
-    )
-    sim = simulate_plan(df_int, selected_plan, battery_kwh_context=invoice_battery_context_kwh)
-    if bool(sim.get("flat_applies_to_all_import", False)):
-        st.info("This flat plan has no controlled-load usage rate, so the single import tariff is applied to all import kWh (E1+E2).")
-    if _has_fit_tou(selected_plan):
-        st.info("This plan uses FiT TOU: configured FiT windows override the base FiT rate for matching export intervals.")
-    li = sim["line_items"].copy()
-
-    li["qty"] = li["qty"].map(lambda x: round(float(x), 3))
-    li["rate"] = li["rate"].map(lambda x: round(float(x), 5))
-    li["amount"] = li["amount"].map(lambda x: round(float(x), 2))
-
-    st.dataframe(li[["item", "qty", "unit", "rate", "amount"]], use_container_width=True)
-
-    # Optional reconciliation
-    with st.expander("Reconciliation mode (optional)"):
-        invoice_total = st.number_input("Enter invoice total ($) for this period", value=0.00, step=0.01, format="%.2f")
-        if invoice_total > 0:
-            model_total = float(sim["total_cents"]) / 100.0
-            delta = model_total - float(invoice_total)
-            pct = (delta / float(invoice_total) * 100.0) if invoice_total else 0.0
-            st.write(f"Model total: **${model_total:.2f}**")
-            st.write(f"Difference (model - invoice): **${delta:.2f}** ({pct:+.2f}%)")
-            if abs(pct) > 1.0:
-                st.warning("Variance > 1%: check bill period alignment, register mapping, or retailer rounding rules.")
-
-with tab4:
-    st.write("Plan settings + locked register mapping")
-    # keep JSON safe for display
-    st.json({
-        "Register mapping": {
-            "general_import": GENERAL_REGS,
-            "controlled_load": CONTROLLED_REGS,
-            "export": EXPORT_REGS,
-        },
-        "Plans": [_plan_to_dict(p) for p in plans],
-    })
-
-with tab5:
-    st.subheader("Forward Projection")
-    st.caption("Forecast totals exclude one-time plan sign-up credits.")
-
-    horizon = st.selectbox(
-        "Select forecast horizon",
-        ["1 Month (~30 days)", "12 Months (~1 year)"]
-    )
-
-    if horizon.startswith("1 Month"):
-        future_df = forecast_repeat_last_4_weeks(df_int, days_forward=30)
-        method = "Repeat last 4 weeks"
-        confidence = "High (short-term replay)"
-    else:
-        future_df = forecast_replay_last_year(df_int)
-        if future_df is None:
-            st.warning("Not enough history for full year replay. Falling back to 4-week repeat over 365 days.")
-            future_df = forecast_repeat_last_4_weeks(df_int, days_forward=365)
-            method = "Repeat last 4 weeks (fallback)"
-            confidence = "Medium (limited history)"
-        else:
-            method = "Replay last year's usage shape"
-            confidence = "High (seasonality captured)"
-
-    if future_df.empty:
-        st.error("Not enough data to generate forecast.")
-    else:
-        st.info(f"Projection method: {method}")
-        st.info(f"Confidence level: {confidence}")
-
-        forecast_rows = []
-        forecast_battery_context_kwh = (
-            float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
-            if bool(has_home_battery)
-            else 0.0
-        )
+        chart_df = None
         for p in plans:
-            simf = simulate_plan(
-                future_df,
-                p,
-                include_signup_credit=False,
-                battery_kwh_context=forecast_battery_context_kwh,
-            )
-            forecast_rows.append({
-                "Plan": p.name,
-                "Forecast Days": simf["days"],
-                "Forecast General kWh": round(simf["general_kwh"], 1),
-                "Forecast Controlled kWh": round(simf["controlled_kwh"], 1),
-                "Forecast Export kWh": round(simf["export_kwh"], 1),
-                "Forecast Total ($)": round(simf["total_cents"] / 100.0, 2),
-            })
-
-        forecast_df = pd.DataFrame(forecast_rows).sort_values("Forecast Total ($)")
-        st.dataframe(forecast_df, use_container_width=True)
-
-        forecast_winner = forecast_df.iloc[0]["Plan"]
-        st.success(f"Cheapest forecasted plan: **{forecast_winner}**")
-
-
-def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """If a merge creates *_dup columns, keep non-null values and drop the dup."""
-    dup_cols = [c for c in df.columns if str(c).endswith("_dup")]
-    for dc in dup_cols:
-        base = str(dc)[:-4]
-        if base in df.columns:
-            df[base] = df[base].combine_first(df[dc])
-            df.drop(columns=[dc], inplace=True)
+            d = daily_totals(df_int, p, battery_kwh_context=daily_battery_context_kwh)[["date", "total_$"]].copy()
+            d = d.rename(columns={"total_$": p.name}).set_index("date")
+            chart_df = d if chart_df is None else _dedupe_columns(chart_df.merge(d, how="outer", left_index=True, right_index=True, suffixes=("", "_dup")))
+        st.line_chart(chart_df)
+    
+        st.subheader("Average daily profile (all days)")
+        plot_average_24hr_profile_import_export(df_int, solar_profile=solar_profile_for_battery)
+        if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
+            st.caption("Production is shown as an additional solar trace so import/export and generation can be compared by hour.")
+    
+    
+        win_plan = next(pp for pp in plans if pp.name == winner)
+        dwin = daily_totals(df_int, win_plan, battery_kwh_context=daily_battery_context_kwh)
+        st.write(f"Daily breakdown (last 14 days) - **{winner}**")
+        _show_table(dwin.tail(14), use_container_width=True)
+    
+    with tab2:
+        tou_plans = [p for p in plans if p.import_type == "tou" and p.tou is not None]
+        if not tou_plans:
+            st.info("No TOU plans are available in the current library.")
         else:
-            df.rename(columns={dc: base}, inplace=True)
-    return df
-
-
+            tou_battery_context_kwh = (
+                float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+                if bool(has_home_battery)
+                else 0.0
+            )
+            tou_names = [p.name for p in tou_plans]
+            selected_name = st.selectbox(
+                "Select a plan to view TOU breakdown",
+                tou_names,
+                index=_default_plan_index(tou_names, 0),
+            )
+            selected_plan = next(p for p in tou_plans if p.name == selected_name)
+            bd = tou_breakdown_general(df_int, selected_plan.tou).copy()
+            if bd.empty:
+                st.warning("No general usage data found for E1.")
+            else:
+                total_general_kwh = float(bd["kwh"].sum()) if "kwh" in bd.columns else 0.0
+                bd["$"] = bd["cents"] / 100.0
+                bd["% of General"] = bd["kwh"].apply(lambda x: (float(x) / total_general_kwh * 100.0) if total_general_kwh > 0 else 0.0)
+    
+                bd["kwh"] = bd["kwh"].map(lambda x: round(float(x), 3))
+                bd["rate_c_per_kwh"] = bd["rate_c_per_kwh"].map(lambda x: round(float(x), 3))
+                bd["% of General"] = bd["% of General"].map(lambda x: round(float(x), 1))
+                bd["$"] = bd["$"].map(lambda x: round(float(x), 2))
+    
+                _show_table(bd[["band", "kwh", "% of General", "rate_c_per_kwh", "$"]], use_container_width=True)
+    
+                # Flat-rate equivalent callouts.
+                # Match Comparison report basis (effective billed general usage, including plan discounts).
+                sim_tou = simulate_plan(
+                    df_int,
+                    selected_plan,
+                    include_signup_credit=False,
+                    battery_kwh_context=tou_battery_context_kwh,
+                )
+                billed_general_kwh = float(sim_tou.get("general_kwh", 0.0))
+                billed_general_cents = float(sim_tou.get("general_cents", 0.0))
+                eff_general_c_per_kwh = (billed_general_cents / billed_general_kwh) if billed_general_kwh > 0 else 0.0
+    
+                tariff_total_cents = float(bd["cents"].sum())
+                tariff_only_c_per_kwh = (tariff_total_cents / total_general_kwh) if total_general_kwh > 0 else 0.0
+    
+                st.success(
+                    f"Flat-rate equivalent for General usage (E1, effective billed): **{eff_general_c_per_kwh:.2f} c/kWh**"
+                )
+                if abs(eff_general_c_per_kwh - tariff_only_c_per_kwh) > 1e-6:
+                    st.caption(
+                        f"TOU tariff-only equivalent (before plan discounts): {tariff_only_c_per_kwh:.2f} c/kWh."
+                    )
+    
+    with tab3:
+        st.write("Invoice-style line items (like a retailer invoice).")
+        # Default this selector to the current retailer (sidebar) when possible.
+        # Implementation note: we control the widget value ONLY via st.session_state (no selectbox index),
+        # which avoids Streamlit's warning about setting both a default and session_state.
+        _cur = st.session_state.get("current_retailer", None)
+        _names = [p.name for p in plans]
+    
+        if _names:
+            # Initialise session state once (or recover if it becomes invalid)
+            if ("invoice_plan" not in st.session_state) or (st.session_state.get("invoice_plan") not in _names):
+                st.session_state["invoice_plan"] = _cur if _cur in _names else _names[0]
+    
+            # Re-sync ONLY when the sidebar current retailer changes (so users can still explore other plans)
+            if ("_invoice_last_current" not in st.session_state) or (st.session_state.get("_invoice_last_current") != _cur):
+                if _cur in _names:
+                    st.session_state["invoice_plan"] = _cur
+                st.session_state["_invoice_last_current"] = _cur
+    
+        selected_plan_name = st.selectbox(
+            "Select plan",
+            _names,
+            key="invoice_plan",
+        )
+    
+        selected_plan = next(p for p in plans if p.name == selected_plan_name)
+        invoice_battery_context_kwh = (
+            float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+            if bool(has_home_battery)
+            else 0.0
+        )
+        sim = simulate_plan(df_int, selected_plan, battery_kwh_context=invoice_battery_context_kwh)
+        if bool(sim.get("flat_applies_to_all_import", False)):
+            st.info("This flat plan has no controlled-load usage rate, so the single import tariff is applied to all import kWh (E1+E2).")
+        if _has_fit_tou(selected_plan):
+            st.info("This plan uses FiT TOU: configured FiT windows override the base FiT rate for matching export intervals.")
+        li = sim["line_items"].copy()
+    
+        li["qty"] = li["qty"].map(lambda x: round(float(x), 3))
+        li["rate"] = li["rate"].map(lambda x: round(float(x), 5))
+        li["amount"] = li["amount"].map(lambda x: round(float(x), 2))
+    
+        _show_table(li[["item", "qty", "unit", "rate", "amount"]], use_container_width=True)
+    
+        # Optional reconciliation
+        with st.expander("Reconciliation mode (optional)"):
+            invoice_total = st.number_input("Enter invoice total ($) for this period", value=0.00, step=0.01, format="%.2f")
+            if invoice_total > 0:
+                model_total = float(sim["total_cents"]) / 100.0
+                delta = model_total - float(invoice_total)
+                pct = (delta / float(invoice_total) * 100.0) if invoice_total else 0.0
+                st.write(f"Model total: **${model_total:.2f}**")
+                st.write(f"Difference (model - invoice): **${delta:.2f}** ({pct:+.2f}%)")
+                if abs(pct) > 1.0:
+                    st.warning("Variance > 1%: check bill period alignment, register mapping, or retailer rounding rules.")
+    
+    with tab4:
+        st.write("Plan settings + locked register mapping")
+        # keep JSON safe for display
+        st.json({
+            "Register mapping": {
+                "general_import": GENERAL_REGS,
+                "controlled_load": CONTROLLED_REGS,
+                "export": EXPORT_REGS,
+            },
+            "Plans": [_plan_to_dict(p) for p in plans],
+        })
+    
+    with tab5:
+        st.subheader("Forward Projection")
+        st.caption("Forecast totals exclude one-time plan sign-up credits.")
+    
+        horizon = st.selectbox(
+            "Select forecast horizon",
+            ["1 Month (~30 days)", "12 Months (~1 year)"]
+        )
+    
+        if horizon.startswith("1 Month"):
+            future_df = forecast_repeat_last_4_weeks(df_int, days_forward=30)
+            method = "Repeat last 4 weeks"
+            confidence = "High (short-term replay)"
+        else:
+            future_df = forecast_replay_last_year(df_int)
+            if future_df is None:
+                st.warning("Not enough history for full year replay. Falling back to 4-week repeat over 365 days.")
+                future_df = forecast_repeat_last_4_weeks(df_int, days_forward=365)
+                method = "Repeat last 4 weeks (fallback)"
+                confidence = "Medium (limited history)"
+            else:
+                method = "Replay last year's usage shape"
+                confidence = "High (seasonality captured)"
+    
+        if future_df.empty:
+            st.error("Not enough data to generate forecast.")
+        else:
+            st.info(f"Projection method: {method}")
+            st.info(f"Confidence level: {confidence}")
+    
+            forecast_rows = []
+            forecast_battery_context_kwh = (
+                float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+                if bool(has_home_battery)
+                else 0.0
+            )
+            for p in plans:
+                simf = simulate_plan(
+                    future_df,
+                    p,
+                    include_signup_credit=False,
+                    battery_kwh_context=forecast_battery_context_kwh,
+                )
+                forecast_rows.append({
+                    "Plan": p.name,
+                    "Forecast Days": simf["days"],
+                    "Forecast General kWh": round(simf["general_kwh"], 1),
+                    "Forecast Controlled kWh": round(simf["controlled_kwh"], 1),
+                    "Forecast Export kWh": round(simf["export_kwh"], 1),
+                    "Forecast Total ($)": round(simf["total_cents"] / 100.0, 2),
+                })
+    
+            forecast_df = pd.DataFrame(forecast_rows).sort_values("Forecast Total ($)")
+            _show_table(forecast_df, use_container_width=True)
+    
+            forecast_winner = forecast_df.iloc[0]["Plan"]
+            st.success(f"Cheapest forecasted plan: **{forecast_winner}**")
+    
+    
 def _sanitize_tou_rows(rows: list[dict]) -> list[dict]:
     """Drop empty/invalid TOU rows and normalize fields so saving never corrupts plans.json."""
     cleaned = []
@@ -8174,251 +8520,393 @@ def _unique_name(existing: list[str], base: str) -> str:
     return f"{base} ({i})"
 
 
-# No-battery filter applied to Risk & volatility and Scenario & sensitivity tabs.
-risk_scenario_plans = list(plans)
-excluded_battery_dependent_risk_scenario: list[tuple[Plan, str]] = []
-if not bool(has_home_battery):
-    _risk_scenario_filtered: list[Plan] = []
-    for _plan in plans:
-        _reason = _battery_dependent_plan_reason(_plan)
-        if _reason:
-            excluded_battery_dependent_risk_scenario.append((_plan, _reason))
+if show_breakdowns_only:
+    # No-battery filter applied to Risk & volatility and Scenario & sensitivity tabs.
+    risk_scenario_plans = list(plans)
+    excluded_battery_dependent_risk_scenario: list[tuple[Plan, str]] = []
+    if not bool(has_home_battery):
+        _risk_scenario_filtered: list[Plan] = []
+        for _plan in plans:
+            _reason = _battery_dependent_plan_reason(_plan)
+            if _reason:
+                excluded_battery_dependent_risk_scenario.append((_plan, _reason))
+            else:
+                _risk_scenario_filtered.append(_plan)
+        if _risk_scenario_filtered:
+            risk_scenario_plans = _risk_scenario_filtered
         else:
-            _risk_scenario_filtered.append(_plan)
-    if _risk_scenario_filtered:
-        risk_scenario_plans = _risk_scenario_filtered
-    else:
-        risk_scenario_plans = list(plans)
-        excluded_battery_dependent_risk_scenario = []
-
-
-
-
-with tab6:
-    st.subheader("Risk & volatility analysis")
-    st.caption("Shows how bills vary month-to-month for each plan (useful for solar households assessing downside risk, not just averages).")
-    if excluded_battery_dependent_risk_scenario:
-        st.info(
-            f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
-        )
-        with st.expander("Show excluded plans for this tab"):
-            st.dataframe(
-                pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
-                use_container_width=True,
+            risk_scenario_plans = list(plans)
+            excluded_battery_dependent_risk_scenario = []
+    
+    
+    
+    
+    with tab6:
+        st.subheader("Risk & volatility analysis")
+        st.caption("Shows how bills vary month-to-month for each plan (useful for solar households assessing downside risk, not just averages).")
+        if excluded_battery_dependent_risk_scenario:
+            st.info(
+                f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
             )
-
-    risk_rows = []
-    monthly_wide = None
-    risk_battery_context_kwh = (
-        float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
-        if bool(has_home_battery)
-        else 0.0
-    )
-
-    for p in risk_scenario_plans:
-        m = monthly_totals(df_int, p, battery_kwh_context=risk_battery_context_kwh)
-        if m.empty:
-            continue
-
-        mean = float(m["total_$"].mean())
-        std = float(m["total_$"].std(ddof=0)) if len(m) > 1 else 0.0
-        worst = float(m["total_$"].max())
-        best = float(m["total_$"].min())
-        cv = (std / mean * 100.0) if mean > 0 else 0.0
-
-        risk_rows.append({
-            "Plan": p.name,
-            "Avg monthly ($)": round(mean, 2),
-            "Std dev ($)": round(std, 2),
-            "Worst month ($)": round(worst, 2),
-            "Best month ($)": round(best, 2),
-            "Risk index (CV %)": round(cv, 1),
-        })
-
-        # Build wide monthly table for charting
-        w = m.copy()
-        w["month"] = pd.to_datetime(w["month"])
-        w = w.rename(columns={"total_$": p.name}).set_index("month")
-        monthly_wide = w if monthly_wide is None else _dedupe_columns(
-            monthly_wide.merge(w, how="outer", left_index=True, right_index=True, suffixes=("", "_dup"))
-        )
-
-    if not risk_rows:
-        st.info("Not enough data to compute monthly volatility (need at least one full month of data).")
-    else:
-        risk_df = pd.DataFrame(risk_rows).sort_values(["Avg monthly ($)", "Risk index (CV %)"]).reset_index(drop=True)
-
-        st.markdown("#### Plan risk summary")
-        st.caption("Risk index (CV %) = std dev / average monthly bill. Lower means more stable bills.")
-        risk_df_disp = _add_current_flag(risk_df)
-        st.dataframe(_style_current_rows(risk_df_disp), use_container_width=True)
-
-        st.markdown("#### Monthly bill history (by plan)")
-        if monthly_wide is not None and not monthly_wide.empty:
-            st.line_chart(monthly_wide)
-
-        cheapest_avg = risk_df.sort_values("Avg monthly ($)", ascending=True).head(1).iloc[0]
-        lowest_vol = risk_df.sort_values("Risk index (CV %)", ascending=True).head(1).iloc[0]
-
-        st.success(
-            f"Cheapest on average (monthly): **{cheapest_avg['Plan']}** at **${cheapest_avg['Avg monthly ($)']:.2f}/month**."
-        )
-        st.info(
-            f"Most stable (lowest volatility): **{lowest_vol['Plan']}** with risk index **{lowest_vol['Risk index (CV %)']:.1f}%**."
-        )
-
-
-with tab7:
-    st.subheader("Scenario & sensitivity")
-    st.caption("Stress-test plan rankings for solar households by adjusting usage/export and escalating tariffs.")
-    if excluded_battery_dependent_risk_scenario:
-        st.info(
-            f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
-        )
-        with st.expander("Show excluded plans for this tab"):
-            st.dataframe(
-                pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
-                use_container_width=True,
-            )
-
-    if df_int is None or df_int.empty:
-        st.info("Upload a dataset to enable scenarios.")
-    else:
-        s1, s2, s3 = st.columns(3)
-        with s1:
-            usage_multiplier = st.slider(
-                "Import usage multiplier (E1+E2)",
-                min_value=0.80,
-                max_value=1.50,
-                value=1.00,
-                step=0.05,
-                help="Scales imported energy (general + controlled). Example: 1.20 simulates +20% household usage (e.g., new appliance/EV charging).",
-            )
-        with s2:
-            export_multiplier = st.slider(
-                "Solar export multiplier (B1)",
-                min_value=0.50,
-                max_value=1.20,
-                value=1.00,
-                step=0.05,
-                help="Scales exported energy. Example: 0.80 simulates a 20% drop in PV export (e.g., shading, seasonal change, higher self-consumption).",
-            )
-        with s3:
-            tariff_uplift = st.slider(
-                "Tariff uplift (%)",
-                min_value=0.0,
-                max_value=25.0,
-                value=0.0,
-                step=1.0,
-                help="Applies a uniform uplift to selected tariff components below (useful for 'what if prices rise?').",
-            ) / 100.0
-
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            uplift_import_rates = st.checkbox("Apply uplift to import rates", value=True)
-        with a2:
-            uplift_supply_charges = st.checkbox("Apply uplift to supply/monthly fees", value=False)
-        with a3:
-            uplift_fit_rates = st.checkbox("Apply uplift to FiT rates", value=False)
-
-        # Scenario-adjust the interval dataset
-        df_scn = df_int.copy()
-        df_scn.loc[df_scn["register"].isin(["E1", "E2"]), "kwh"] = (
-            df_scn.loc[df_scn["register"].isin(["E1", "E2"]), "kwh"] * float(usage_multiplier)
-        )
-        df_scn.loc[df_scn["register"] == "B1", "kwh"] = (
-            df_scn.loc[df_scn["register"] == "B1", "kwh"] * float(export_multiplier)
-        )
-
-        def _uplift_plan(p: Plan) -> Plan:
-            pp = copy.deepcopy(p)
-            u = float(tariff_uplift)
-
-            if u <= 0:
-                return pp
-
-            if uplift_supply_charges:
-                pp.supply_cents_per_day = float(pp.supply_cents_per_day or 0.0) * (1 + u)
-                pp.controlled_supply_cents_per_day = float(pp.controlled_supply_cents_per_day or 0.0) * (1 + u)
-                pp.monthly_fee_cents = float(pp.monthly_fee_cents or 0.0) * (1 + u)
-
-            if uplift_import_rates:
-                if pp.flat:
-                    pp.flat.cents_per_kwh = float(pp.flat.cents_per_kwh or 0.0) * (1 + u)
-                if pp.tou and pp.tou.bands:
-                    for b in pp.tou.bands:
-                        b.cents_per_kwh = float(b.cents_per_kwh or 0.0) * (1 + u)
-                pp.controlled_cents_per_kwh = float(pp.controlled_cents_per_kwh or 0.0) * (1 + u)
-
-            if uplift_fit_rates:
-                pp.feed_in_flat_cents_per_kwh = float(pp.feed_in_flat_cents_per_kwh or 0.0) * (1 + u)
-                if pp.feed_in_tiered:
-                    pp.feed_in_tiered.high_rate_cents = float(pp.feed_in_tiered.high_rate_cents or 0.0) * (1 + u)
-                    pp.feed_in_tiered.low_rate_cents = float(pp.feed_in_tiered.low_rate_cents or 0.0) * (1 + u)
-                if pp.feed_in_tou and pp.feed_in_tou.bands:
-                    for b in pp.feed_in_tou.bands:
-                        b.cents_per_kwh = float(b.cents_per_kwh or 0.0) * (1 + u)
-            return pp
-
-        rows_scn = []
-        scenario_battery_context_kwh = (
+            with st.expander("Show excluded plans for this tab"):
+                _show_table(
+                    pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
+                    use_container_width=True,
+                )
+    
+        risk_battery_context_kwh = (
             float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
             if bool(has_home_battery)
             else 0.0
         )
-        for p in risk_scenario_plans:
-            p_scn = _uplift_plan(p)
-            sim_scn = simulate_plan(
-                df_scn,
-                p_scn,
-                include_signup_credit=True,
-                battery_kwh_context=scenario_battery_context_kwh,
-            )
-
-            rows_scn.append({
-                "Plan": p.name,
-                "Scenario Total ($)": round(float(sim_scn["total_cents"]) / 100.0, 2),
-                "Scenario Supply ($)": round(float(sim_scn["supply_cents"]) / 100.0, 2),
-                "Scenario Usage ($)": round((float(sim_scn["general_cents"]) + float(sim_scn["controlled_cents"])) / 100.0, 2),
-                "Scenario FiT credit ($)": round(float(sim_scn["export_credit_cents"]) / 100.0, 2),
-                "Scenario sign-up credit ($)": round(float(sim_scn.get("signup_credit_cents_applied", 0.0)) / 100.0, 2),
-                "Scenario Days": int(sim_scn["days"]),
-                "Scenario Import (kWh)": round(float(sim_scn["general_kwh"]) + float(sim_scn["controlled_kwh"]), 1),
-                "Scenario Export (kWh)": round(float(sim_scn["export_kwh"]), 1),
-            })
-
-        df_scn_res = pd.DataFrame(rows_scn).sort_values("Scenario Total ($)").reset_index(drop=True)
-
-        st.subheader("Scenario comparison (GST inclusive)")
-        df_scn_res_disp = _add_current_flag(df_scn_res)
-        _show_dataframe_with_frozen_column(df_scn_res_disp, freeze_col="Plan")
-
-        if not df_scn_res.empty:
-            scn_winner = df_scn_res.iloc[0]["Plan"]
-            st.success(f"Cheapest plan under scenario: **{scn_winner}**")
-
-            cur = _current_plan_name()
-            if cur and (cur in df_scn_res['Plan'].values):
-                cur_total = float(df_scn_res.loc[df_scn_res['Plan']==cur, 'Scenario Total ($)'].iloc[0])
-                best_total = float(df_scn_res.loc[df_scn_res['Plan']==scn_winner, 'Scenario Total ($)'].iloc[0])
-                st.info(f"**Your current retailer under this scenario:** {cur} - **${cur_total:.2f}**.  ")
-                st.info(f"Difference vs scenario cheapest: **${cur_total - best_total:+.2f}** over this period.")
-
-        # Delta vs baseline (same plan names)
-        st.subheader("Delta vs baseline")
-        base_map = {r["Plan"]: float(r["Total ($)"]) for _, r in res.iterrows()} if "res" in locals() and res is not None and not res.empty else {}
-        if base_map:
-            df_delta = df_scn_res[["Plan", "Scenario Total ($)"]].copy()
-            df_delta["Baseline Total ($)"] = df_delta["Plan"].map(base_map).astype(float)
-            df_delta["Delta ($)"] = (df_delta["Scenario Total ($)"] - df_delta["Baseline Total ($)"]).round(2)
-            df_delta_disp = _add_current_flag(df_delta.sort_values("Delta ($)"))
-            st.dataframe(_style_current_rows(df_delta_disp), use_container_width=True)
+        risk_signature_payload = {
+            "dataset_sig": dict(dataset_sig),
+            "plans_sig": _plan_list_signature(risk_scenario_plans),
+            "battery_context_kwh": round(float(risk_battery_context_kwh), 4),
+        }
+        risk_signature_hash = _stable_json_digest(risk_signature_payload)
+        risk_cache = st.session_state.get("risk_tab_cache")
+        risk_cache_hit = (
+            isinstance(risk_cache, dict)
+            and str(risk_cache.get("signature", "")) == str(risk_signature_hash)
+        )
+        risk_df = pd.DataFrame()
+        monthly_wide = None
+    
+        if risk_cache_hit:
+            risk_df_cached = risk_cache.get("risk_df")
+            if isinstance(risk_df_cached, pd.DataFrame):
+                risk_df = risk_df_cached.copy()
+            monthly_wide_cached = risk_cache.get("monthly_wide")
+            if isinstance(monthly_wide_cached, pd.DataFrame) and not monthly_wide_cached.empty:
+                monthly_wide = monthly_wide_cached.copy()
+        elif show_plan_library_only:
+            st.caption("Risk calculations are paused in Plan Library mode to keep editing responsive.")
         else:
-            st.info("Baseline comparison table not available for delta calculation.")
-
+            risk_rows = []
+            for p in risk_scenario_plans:
+                m = monthly_totals(df_int, p, battery_kwh_context=risk_battery_context_kwh)
+                if m.empty:
+                    continue
+    
+                mean = float(m["total_$"].mean())
+                std = float(m["total_$"].std(ddof=0)) if len(m) > 1 else 0.0
+                worst = float(m["total_$"].max())
+                best = float(m["total_$"].min())
+                cv = (std / mean * 100.0) if mean > 0 else 0.0
+    
+                risk_rows.append({
+                    "Plan": p.name,
+                    "Avg monthly ($)": round(mean, 2),
+                    "Std dev ($)": round(std, 2),
+                    "Worst month ($)": round(worst, 2),
+                    "Best month ($)": round(best, 2),
+                    "Risk index (CV %)": round(cv, 1),
+                })
+    
+                # Build wide monthly table for charting
+                w = m.copy()
+                w["month"] = pd.to_datetime(w["month"])
+                w = w.rename(columns={"total_$": p.name}).set_index("month")
+                monthly_wide = w if monthly_wide is None else _dedupe_columns(
+                    monthly_wide.merge(w, how="outer", left_index=True, right_index=True, suffixes=("", "_dup"))
+                )
+    
+            if risk_rows:
+                risk_df = pd.DataFrame(risk_rows).sort_values(["Avg monthly ($)", "Risk index (CV %)"]).reset_index(drop=True)
+            st.session_state["risk_tab_cache"] = {
+                "signature": risk_signature_hash,
+                "risk_df": risk_df.copy(),
+                "monthly_wide": (monthly_wide.copy() if isinstance(monthly_wide, pd.DataFrame) else pd.DataFrame()),
+            }
+    
+        if risk_df.empty:
+            if not show_plan_library_only:
+                st.info("Not enough data to compute monthly volatility (need at least one full month of data).")
+            if (not show_plan_library_only) or risk_cache_hit:
+                st.session_state["risk_snapshot"] = {
+                    "signature": risk_signature_hash,
+                    "status": "no_data",
+                    "message": "No monthly volatility output yet (need at least one full month of data).",
+                }
+        else:
+            st.markdown("#### Plan risk summary")
+            st.caption("Risk index (CV %) = std dev / average monthly bill. Lower means more stable bills.")
+            risk_df_disp = _add_current_flag(risk_df)
+            _show_table(_style_current_rows(risk_df_disp), use_container_width=True)
+    
+            st.markdown("#### Monthly bill history (by plan)")
+            if monthly_wide is not None and not monthly_wide.empty:
+                st.line_chart(monthly_wide)
+    
+            cheapest_avg = risk_df.sort_values("Avg monthly ($)", ascending=True).head(1).iloc[0]
+            lowest_vol = risk_df.sort_values("Risk index (CV %)", ascending=True).head(1).iloc[0]
+    
+            st.success(
+                f"Cheapest on average (monthly): **{cheapest_avg['Plan']}** at **${cheapest_avg['Avg monthly ($)']:.2f}/month**."
+            )
+            st.info(
+                f"Most stable (lowest volatility): **{lowest_vol['Plan']}** with risk index **{lowest_vol['Risk index (CV %)']:.1f}%**."
+            )
+            st.session_state["risk_snapshot"] = {
+                "signature": risk_signature_hash,
+                "status": "ok",
+                "cheapest_plan": str(cheapest_avg["Plan"]),
+                "cheapest_avg_monthly": float(cheapest_avg["Avg monthly ($)"]),
+                "stable_plan": str(lowest_vol["Plan"]),
+                "stable_cv": float(lowest_vol["Risk index (CV %)"]),
+            }
+    
+    
+    with tab7:
+        st.subheader("Scenario & sensitivity")
+        st.caption("Stress-test plan rankings for solar households by adjusting usage/export and escalating tariffs.")
+        if excluded_battery_dependent_risk_scenario:
+            st.info(
+                f"No-battery mode: excluded {len(excluded_battery_dependent_risk_scenario)} battery-dependent plan(s) from this tab."
+            )
+            with st.expander("Show excluded plans for this tab"):
+                _show_table(
+                    pd.DataFrame([{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_battery_dependent_risk_scenario]),
+                    use_container_width=True,
+                )
+    
+        if df_int is None or df_int.empty:
+            st.info("Upload a dataset to enable scenarios.")
+            st.session_state["scenario_snapshot"] = {
+                "status": "no_data",
+                "message": "Upload a dataset to enable scenarios.",
+            }
+        else:
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                usage_multiplier = st.slider(
+                    "Import usage multiplier (E1+E2)",
+                    min_value=0.80,
+                    max_value=1.50,
+                    value=1.00,
+                    step=0.05,
+                    help="Scales imported energy (general + controlled). Example: 1.20 simulates +20% household usage (e.g., new appliance/EV charging).",
+                )
+            with s2:
+                export_multiplier = st.slider(
+                    "Solar export multiplier (B1)",
+                    min_value=0.50,
+                    max_value=1.20,
+                    value=1.00,
+                    step=0.05,
+                    help="Scales exported energy. Example: 0.80 simulates a 20% drop in PV export (e.g., shading, seasonal change, higher self-consumption).",
+                )
+            with s3:
+                tariff_uplift = st.slider(
+                    "Tariff uplift (%)",
+                    min_value=0.0,
+                    max_value=25.0,
+                    value=0.0,
+                    step=1.0,
+                    help="Applies a uniform uplift to selected tariff components below (useful for 'what if prices rise?').",
+                ) / 100.0
+    
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                uplift_import_rates = st.checkbox("Apply uplift to import rates", value=True)
+            with a2:
+                uplift_supply_charges = st.checkbox("Apply uplift to supply/monthly fees", value=False)
+            with a3:
+                uplift_fit_rates = st.checkbox("Apply uplift to FiT rates", value=False)
+    
+            scenario_battery_context_kwh = (
+                float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
+                if bool(has_home_battery)
+                else 0.0
+            )
+            scenario_signature_payload = {
+                "dataset_sig": dict(dataset_sig),
+                "plans_sig": _plan_list_signature(risk_scenario_plans),
+                "battery_context_kwh": round(float(scenario_battery_context_kwh), 4),
+                "usage_multiplier": round(float(usage_multiplier), 4),
+                "export_multiplier": round(float(export_multiplier), 4),
+                "tariff_uplift": round(float(tariff_uplift), 5),
+                "uplift_import_rates": bool(uplift_import_rates),
+                "uplift_supply_charges": bool(uplift_supply_charges),
+                "uplift_fit_rates": bool(uplift_fit_rates),
+            }
+            scenario_signature_hash = _stable_json_digest(scenario_signature_payload)
+            scenario_cache = st.session_state.get("scenario_tab_cache")
+            scenario_cache_hit = (
+                isinstance(scenario_cache, dict)
+                and str(scenario_cache.get("signature", "")) == str(scenario_signature_hash)
+            )
+    
+            def _uplift_plan(p: Plan) -> Plan:
+                pp = copy.deepcopy(p)
+                u = float(tariff_uplift)
+    
+                if u <= 0:
+                    return pp
+    
+                if uplift_supply_charges:
+                    pp.supply_cents_per_day = float(pp.supply_cents_per_day or 0.0) * (1 + u)
+                    pp.controlled_supply_cents_per_day = float(pp.controlled_supply_cents_per_day or 0.0) * (1 + u)
+                    pp.monthly_fee_cents = float(pp.monthly_fee_cents or 0.0) * (1 + u)
+    
+                if uplift_import_rates:
+                    if pp.flat:
+                        pp.flat.cents_per_kwh = float(pp.flat.cents_per_kwh or 0.0) * (1 + u)
+                    if pp.tou and pp.tou.bands:
+                        for b in pp.tou.bands:
+                            b.cents_per_kwh = float(b.cents_per_kwh or 0.0) * (1 + u)
+                    pp.controlled_cents_per_kwh = float(pp.controlled_cents_per_kwh or 0.0) * (1 + u)
+    
+                if uplift_fit_rates:
+                    pp.feed_in_flat_cents_per_kwh = float(pp.feed_in_flat_cents_per_kwh or 0.0) * (1 + u)
+                    if pp.feed_in_tiered:
+                        pp.feed_in_tiered.high_rate_cents = float(pp.feed_in_tiered.high_rate_cents or 0.0) * (1 + u)
+                        pp.feed_in_tiered.low_rate_cents = float(pp.feed_in_tiered.low_rate_cents or 0.0) * (1 + u)
+                    if pp.feed_in_tou and pp.feed_in_tou.bands:
+                        for b in pp.feed_in_tou.bands:
+                            b.cents_per_kwh = float(b.cents_per_kwh or 0.0) * (1 + u)
+                return pp
+    
+            df_scn_res = pd.DataFrame()
+            if scenario_cache_hit:
+                df_scn_cached = scenario_cache.get("df_scn_res")
+                if isinstance(df_scn_cached, pd.DataFrame):
+                    df_scn_res = df_scn_cached.copy()
+            elif show_plan_library_only:
+                st.caption("Scenario calculations are paused in Plan Library mode to keep editing responsive.")
+            else:
+                # Scenario-adjust the interval dataset
+                df_scn = df_int.copy()
+                df_scn.loc[df_scn["register"].isin(["E1", "E2"]), "kwh"] = (
+                    df_scn.loc[df_scn["register"].isin(["E1", "E2"]), "kwh"] * float(usage_multiplier)
+                )
+                df_scn.loc[df_scn["register"] == "B1", "kwh"] = (
+                    df_scn.loc[df_scn["register"] == "B1", "kwh"] * float(export_multiplier)
+                )
+    
+                rows_scn = []
+                for p in risk_scenario_plans:
+                    p_scn = _uplift_plan(p)
+                    sim_scn = simulate_plan(
+                        df_scn,
+                        p_scn,
+                        include_signup_credit=True,
+                        battery_kwh_context=scenario_battery_context_kwh,
+                    )
+    
+                    rows_scn.append({
+                        "Plan": p.name,
+                        "Scenario Total ($)": round(float(sim_scn["total_cents"]) / 100.0, 2),
+                        "Scenario Supply ($)": round(float(sim_scn["supply_cents"]) / 100.0, 2),
+                        "Scenario Usage ($)": round((float(sim_scn["general_cents"]) + float(sim_scn["controlled_cents"])) / 100.0, 2),
+                        "Scenario FiT credit ($)": round(float(sim_scn["export_credit_cents"]) / 100.0, 2),
+                        "Scenario sign-up credit ($)": round(float(sim_scn.get("signup_credit_cents_applied", 0.0)) / 100.0, 2),
+                        "Scenario Days": int(sim_scn["days"]),
+                        "Scenario Import (kWh)": round(float(sim_scn["general_kwh"]) + float(sim_scn["controlled_kwh"]), 1),
+                        "Scenario Export (kWh)": round(float(sim_scn["export_kwh"]), 1),
+                    })
+    
+                df_scn_res = pd.DataFrame(rows_scn).sort_values("Scenario Total ($)").reset_index(drop=True)
+                st.session_state["scenario_tab_cache"] = {
+                    "signature": scenario_signature_hash,
+                    "df_scn_res": df_scn_res.copy(),
+                }
+    
+            st.subheader("Scenario comparison (GST inclusive)")
+            if df_scn_res.empty:
+                if not show_plan_library_only:
+                    st.info("No scenario rows were produced for the current settings.")
+                if (not show_plan_library_only) or scenario_cache_hit:
+                    st.session_state["scenario_snapshot"] = {
+                        "signature": scenario_signature_hash,
+                        "status": "no_data",
+                        "message": "No scenario rows were produced for the current settings.",
+                    }
+            else:
+                df_scn_res_disp = _add_current_flag(df_scn_res)
+                _show_dataframe_with_frozen_column(df_scn_res_disp, freeze_col="Plan")
+    
+                scn_winner = str(df_scn_res.iloc[0]["Plan"])
+                best_total = float(df_scn_res.loc[df_scn_res["Plan"] == scn_winner, "Scenario Total ($)"].iloc[0])
+                st.success(f"Cheapest plan under scenario: **{scn_winner}**")
+    
+                cur = _current_plan_name()
+                cur_total_for_snapshot = None
+                delta_vs_current_for_snapshot = None
+                if cur and (cur in df_scn_res["Plan"].values):
+                    cur_total = float(df_scn_res.loc[df_scn_res["Plan"] == cur, "Scenario Total ($)"].iloc[0])
+                    cur_total_for_snapshot = cur_total
+                    delta_vs_current_for_snapshot = cur_total - best_total
+                    st.info(f"**Your current retailer under this scenario:** {cur} - **${cur_total:.2f}**.  ")
+                    st.info(f"Difference vs scenario cheapest: **${cur_total - best_total:+.2f}** over this period.")
+    
+                # Delta vs baseline (same plan names) using a dedicated cached baseline.
+                st.subheader("Delta vs baseline")
+                if show_plan_library_only:
+                    st.caption("Delta baseline table is paused in Plan Library mode.")
+                else:
+                    baseline_signature_payload = {
+                        "dataset_sig": dict(dataset_sig),
+                        "plans_sig": _plan_list_signature(risk_scenario_plans),
+                        "battery_context_kwh": round(float(scenario_battery_context_kwh), 4),
+                    }
+                    baseline_signature_hash = _stable_json_digest(baseline_signature_payload)
+                    baseline_cache = st.session_state.get("scenario_baseline_cache")
+                    base_map = {}
+                    if (
+                        isinstance(baseline_cache, dict)
+                        and str(baseline_cache.get("signature", "")) == str(baseline_signature_hash)
+                        and isinstance(baseline_cache.get("base_map"), dict)
+                    ):
+                        for _k, _v in baseline_cache.get("base_map", {}).items():
+                            try:
+                                base_map[str(_k)] = float(_v)
+                            except Exception:
+                                continue
+                    else:
+                        for p in risk_scenario_plans:
+                            sim_base = simulate_plan(
+                                df_int,
+                                p,
+                                include_signup_credit=True,
+                                battery_kwh_context=scenario_battery_context_kwh,
+                            )
+                            base_map[str(p.name)] = round(float(sim_base.get("total_cents", 0.0)) / 100.0, 2)
+                        st.session_state["scenario_baseline_cache"] = {
+                            "signature": baseline_signature_hash,
+                            "base_map": dict(base_map),
+                        }
+    
+                    if base_map:
+                        df_delta = df_scn_res[["Plan", "Scenario Total ($)"]].copy()
+                        df_delta["Baseline Total ($)"] = pd.to_numeric(
+                            df_delta["Plan"].map(base_map),
+                            errors="coerce",
+                        )
+                        df_delta = df_delta.dropna(subset=["Baseline Total ($)"])
+                        if not df_delta.empty:
+                            df_delta["Delta ($)"] = (df_delta["Scenario Total ($)"] - df_delta["Baseline Total ($)"]).round(2)
+                            df_delta_disp = _add_current_flag(df_delta.sort_values("Delta ($)"))
+                            _show_table(_style_current_rows(df_delta_disp), use_container_width=True)
+                        else:
+                            st.info("Baseline comparison table not available for delta calculation.")
+                    else:
+                        st.info("Baseline comparison table not available for delta calculation.")
+    
+                st.session_state["scenario_snapshot"] = {
+                    "signature": scenario_signature_hash,
+                    "status": "ok",
+                    "winner": scn_winner,
+                    "winner_total": float(best_total),
+                    "current_plan": (str(cur) if cur else None),
+                    "current_total": (float(cur_total_for_snapshot) if cur_total_for_snapshot is not None else None),
+                    "delta_vs_current": (float(delta_vs_current_for_snapshot) if delta_vs_current_for_snapshot is not None else None),
+                }
+if show_breakdowns_only:
+    st.stop()
 
 with tab9:
-    st.subheader("Plan Library")
     st.caption("Flow: 1) pick a plan, 2) edit it, 3) save. Add/duplicate/delete save immediately.")
 
     plans_lib = st.session_state["plans_lib"]
@@ -9502,3 +9990,4 @@ with tab9:
             st.error(f"Could not import add-ons: {e}")
 
     st.divider()
+
