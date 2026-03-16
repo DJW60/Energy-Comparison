@@ -69,6 +69,7 @@
         }
       ]
     },
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -99,6 +100,7 @@
       "cents_per_kwh": 35.36
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -158,6 +160,7 @@
         }
       ]
     },
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -231,6 +234,7 @@
         }
       ]
     },
+    "flat_daily_block": null,
     "feed_in_tiered": {
       "high_rate_cents": 10.0,
       "high_kwh_per_day": 10.0,
@@ -265,6 +269,7 @@
       "cents_per_kwh": 28.39
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -295,6 +300,7 @@
       "cents_per_kwh": 35.244
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": {
       "high_rate_cents": 10.0,
       "high_kwh_per_day": 10.0,
@@ -329,6 +335,7 @@
       "cents_per_kwh": 26.0
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -381,6 +388,7 @@
         }
       ]
     },
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": {
       "bands": [
@@ -421,6 +429,7 @@
       "cents_per_kwh": 33.49
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -480,6 +489,7 @@
         }
       ]
     },
+    "flat_daily_block": null,
     "feed_in_tiered": {
       "high_rate_cents": 1.0,
       "high_kwh_per_day": 5.0,
@@ -514,6 +524,7 @@
       "cents_per_kwh": 28.39
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -544,6 +555,7 @@
       "cents_per_kwh": 26.38
     },
     "tou": null,
+    "flat_daily_block": null,
     "feed_in_tiered": null,
     "feed_in_tou": null
   },
@@ -574,6 +586,40 @@
       "cents_per_kwh": 28.67
     },
     "tou": null,
+    "flat_daily_block": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": null
+  },
+  {
+    "name": "Engie Single +CL",
+    "supply_cents_per_day": 119.196,
+    "import_type": "flat",
+    "controlled_supply_cents_per_day": 0.0,
+    "controlled_cents_per_kwh": 18.744,
+    "feed_in_flat_cents_per_kwh": 3.0,
+    "fit_requires_home_battery": false,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 0.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 15000.0,
+    "signup_credit_expiry": null,
+    "demand_enabled": false,
+    "demand_cents_per_kw_day": 0.0,
+    "demand_window_minutes": 30,
+    "demand_days": "all",
+    "demand_start": "00:00",
+    "demand_end": "00:00",
+    "demand_min_kw": 0.0,
+    "discount_pct": 10.0,
+    "discount_applies_to": "usage_and_supply",
+    "include_in_outputs": true,
+    "flat": null,
+    "tou": null,
+    "flat_daily_block": {
+      "first_rate_cents": 37.632,
+      "first_kwh_per_day": 13.0,
+      "additional_rate_cents": 18.744
+    },
     "feed_in_tiered": null,
     "feed_in_tou": null
   }
