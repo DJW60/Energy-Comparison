@@ -95,7 +95,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "flat": {
       "cents_per_kwh": 35.36
     },
@@ -264,7 +264,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "flat": {
       "cents_per_kwh": 28.39
     },
@@ -455,7 +455,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 5.0,
     "discount_applies_to": "usage_and_supply",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "flat": null,
     "tou": {
       "bands": [
@@ -622,5 +622,68 @@
     },
     "feed_in_tiered": null,
     "feed_in_tou": null
+  },
+  {
+    "name": "Origin Battery Starter",
+    "supply_cents_per_day": 146.85,
+    "import_type": "tou",
+    "controlled_supply_cents_per_day": 3.97,
+    "controlled_cents_per_kwh": 17.78,
+    "feed_in_flat_cents_per_kwh": 5.0,
+    "fit_requires_home_battery": true,
+    "fit_min_battery_kwh": 0.0,
+    "fit_unqualified_feed_in_flat_cents_per_kwh": 5.0,
+    "monthly_fee_cents": 0.0,
+    "signup_credit_cents": 0.0,
+    "signup_credit_expiry": null,
+    "demand_enabled": false,
+    "demand_cents_per_kw_day": 0.0,
+    "demand_window_minutes": 30,
+    "demand_days": "all",
+    "demand_start": "00:00",
+    "demand_end": "00:00",
+    "demand_min_kw": 0.0,
+    "discount_pct": 0.0,
+    "discount_applies_to": "none",
+    "include_in_outputs": true,
+    "flat": null,
+    "tou": {
+      "bands": [
+        {
+          "name": "off peak",
+          "cents_per_kwh": 31.52,
+          "days": "all",
+          "start": "21:00",
+          "end": "00:00"
+        },
+        {
+          "name": "peak",
+          "cents_per_kwh": 42.9,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        },
+        {
+          "name": "off peak",
+          "cents_per_kwh": 31.52,
+          "days": "all",
+          "start": "00:00",
+          "end": "16:00"
+        }
+      ]
+    },
+    "flat_daily_block": null,
+    "feed_in_tiered": null,
+    "feed_in_tou": {
+      "bands": [
+        {
+          "name": "bonus night",
+          "cents_per_kwh": 18.0,
+          "days": "all",
+          "start": "16:00",
+          "end": "21:00"
+        }
+      ]
+    }
   }
 ]

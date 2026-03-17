@@ -150,6 +150,121 @@ def compute_monthly_max_demand(
     )
     return out
 
+
+def compute_monthly_energy_overview(
+    df_intervals: pd.DataFrame,
+    solar_profile: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Monthly overview of import, export, and PV production."""
+    if df_intervals is None or df_intervals.empty:
+        return pd.DataFrame(
+            columns=[
+                "month",
+                "e1_kwh",
+                "e2_kwh",
+                "b1_kwh",
+                "avg_daily_gen_import_kwh",
+                "avg_daily_cl_import_kwh",
+                "avg_daily_export_kwh",
+                "pv_production_kwh",
+                "avg_daily_pv_production_kwh",
+            ]
+        )
+
+    wide = _intervals_wide_from_long(df_intervals)
+    if wide.empty:
+        return pd.DataFrame(
+            columns=[
+                "month",
+                "e1_kwh",
+                "e2_kwh",
+                "b1_kwh",
+                "avg_daily_gen_import_kwh",
+                "avg_daily_cl_import_kwh",
+                "avg_daily_export_kwh",
+                "pv_production_kwh",
+                "avg_daily_pv_production_kwh",
+            ]
+        )
+
+    wide = wide.copy()
+    wide["timestamp"] = pd.to_datetime(wide["timestamp"], errors="coerce")
+    wide = wide.dropna(subset=["timestamp"])
+    if wide.empty:
+        return pd.DataFrame(
+            columns=[
+                "month",
+                "e1_kwh",
+                "e2_kwh",
+                "b1_kwh",
+                "avg_daily_gen_import_kwh",
+                "avg_daily_cl_import_kwh",
+                "avg_daily_export_kwh",
+                "pv_production_kwh",
+                "avg_daily_pv_production_kwh",
+            ]
+        )
+
+    wide["month"] = wide["timestamp"].dt.to_period("M").dt.to_timestamp()
+    wide["day"] = wide["timestamp"].dt.normalize()
+
+    monthly = (
+        wide.groupby("month", as_index=False)
+        .agg(
+            e1_kwh=("general_kwh", "sum"),
+            e2_kwh=("controlled_kwh", "sum"),
+            b1_kwh=("export_kwh", "sum"),
+            days_observed=("day", "nunique"),
+        )
+        .sort_values("month")
+        .reset_index(drop=True)
+    )
+    monthly["avg_daily_gen_import_kwh"] = monthly["e1_kwh"] / monthly["days_observed"].replace(0, pd.NA)
+    monthly["avg_daily_cl_import_kwh"] = monthly["e2_kwh"] / monthly["days_observed"].replace(0, pd.NA)
+    monthly["avg_daily_export_kwh"] = monthly["b1_kwh"] / monthly["days_observed"].replace(0, pd.NA)
+    monthly["pv_production_kwh"] = pd.NA
+    monthly["avg_daily_pv_production_kwh"] = pd.NA
+
+    if (
+        isinstance(solar_profile, pd.DataFrame)
+        and not solar_profile.empty
+        and {"timestamp", "pv_kwh"}.issubset(solar_profile.columns)
+    ):
+        solar_monthly = solar_profile.copy()
+        solar_monthly["timestamp"] = pd.to_datetime(solar_monthly["timestamp"], errors="coerce")
+        solar_monthly["pv_kwh"] = pd.to_numeric(solar_monthly["pv_kwh"], errors="coerce").fillna(0.0)
+        solar_monthly = solar_monthly.dropna(subset=["timestamp"])
+        if not solar_monthly.empty:
+            solar_monthly["month"] = solar_monthly["timestamp"].dt.to_period("M").dt.to_timestamp()
+            solar_monthly = (
+                solar_monthly.groupby("month", as_index=False)["pv_kwh"]
+                .sum()
+                .rename(columns={"pv_kwh": "pv_production_kwh"})
+            )
+            monthly = monthly.drop(columns=["pv_production_kwh"]).merge(
+                solar_monthly,
+                on="month",
+                how="left",
+            )
+            monthly["avg_daily_pv_production_kwh"] = (
+                monthly["pv_production_kwh"] / monthly["days_observed"].replace(0, pd.NA)
+            )
+
+    return monthly[
+        [
+            "month",
+            "e1_kwh",
+            "e2_kwh",
+            "b1_kwh",
+            "avg_daily_gen_import_kwh",
+            "avg_daily_cl_import_kwh",
+            "avg_daily_export_kwh",
+            "pv_production_kwh",
+            "avg_daily_pv_production_kwh",
+        ]
+    ]
+
+
 def _markdown_to_pdf_bytes(markdown_text: str) -> bytes | None:
     """Render markdown-like text into a simple multi-page PDF byte stream.
 
@@ -500,6 +615,8 @@ def _build_joint_optimizer_report_markdown(
                 f"- Best plan: {best.get('Plan', '-')}",
                 f"- Best solar size: {_format_report_value(best.get('Optimal solar size (kW)'))} kW",
                 f"- Best battery size: {_format_report_value(best.get('Optimal battery (kWh)'))} kWh",
+                f"- Optimized load shift: {best.get('Load shift scenario', 'Off')}",
+                f"- Load-shift capex: ${float(pd.to_numeric([best.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}",
                 f"- Annual bill with battery: ${float(pd.to_numeric([best.get('Estimated annual bill with battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
                 f"- Total savings vs current solar/no battery: ${float(pd.to_numeric([best.get('Total savings vs current solar, no battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
                 f"- Battery NPV: ${float(pd.to_numeric([best.get('Battery NPV ($)')], errors='coerce')[0] or 0.0):,.0f}",
@@ -531,7 +648,9 @@ def _build_joint_optimizer_report_markdown(
                 f"lifetime cost ${float(pd.to_numeric([rr.get('PV lifetime cost incl battery ($)')], errors='coerce')[0] or 0.0):,.0f}; "
                 f"savings ${float(pd.to_numeric([rr.get('Total savings vs current solar, no battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr; "
                 f"solar {_format_report_value(rr.get('Optimal solar size (kW)'))} kW; "
-                f"battery {_format_report_value(rr.get('Optimal battery (kWh)'))} kWh."
+                f"battery {_format_report_value(rr.get('Optimal battery (kWh)'))} kWh; "
+                f"load shift {rr.get('Load shift scenario', 'Off')}; "
+                f"load-shift capex ${float(pd.to_numeric([rr.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}."
             )
         lines.append("")
 
@@ -773,6 +892,78 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 _ST_DATAFRAME = st.dataframe
+
+_BATTERY_SIMULATOR_PERSISTED_WIDGET_KEYS = (
+    "battery_view",
+    "battery_sim_plan_name",
+    "battery_ui_detail",
+    "battery_power_kw",
+    "battery_reserve_pct",
+    "battery_roundtrip_eff",
+    "battery_init_soc_pct",
+    "battery_cost_mode",
+    "battery_cost_per_kwh",
+    "battery_total_cost_fixed",
+    "battery_total_cost_quote_kwh",
+    "scenario_preset",
+    "battery_life_years",
+    "battery_discount_rate_pct",
+    "battery_degradation_rate_pct",
+    "battery_price_growth_rate_pct",
+    "battery_aging_model",
+    "battery_assumption_preset",
+    "battery_cycle_life_efc",
+    "battery_eol_capacity_pct",
+    "battery_discharge_threshold",
+    "batt_sizes_compare",
+    "opt_min_kwh",
+    "opt_max_kwh",
+    "opt_step_kwh",
+    "opt_include_zero",
+    "joint_use_modelled_solar",
+    "joint_modelled_postcode",
+    "joint_modelled_tilt_deg",
+    "joint_modelled_azimuth_deg",
+    "joint_modelled_losses_pct",
+    "joint_assume_no_existing_export",
+    "joint_enable_solar_sweep",
+    "joint_current_pv_kw",
+    "joint_pv_cost_per_kw",
+    "joint_pv_min_kw",
+    "joint_pv_max_kw",
+    "joint_pv_step_kw",
+    "joint_pv_include_zero",
+    "joint_min_kwh",
+    "joint_max_kwh",
+    "joint_step_kwh",
+    "joint_include_zero",
+    "whatif_simple_current_plan",
+    "whatif_simple_current_solar_kw",
+    "whatif_simple_current_batt_kwh",
+    "whatif_simple_current_batt_power_kw",
+    "whatif_simple_current_ev_enabled",
+    "whatif_simple_current_ev_km",
+    "whatif_simple_choice",
+    "whatif_simple_custom_plan",
+    "whatif_simple_custom_solar_kw",
+    "whatif_simple_custom_batt_kwh",
+    "whatif_simple_custom_batt_power_kw",
+    "whatif_simple_custom_ev_enabled",
+    "whatif_simple_custom_ev_km",
+)
+
+
+def _preserve_widget_state(keys: tuple[str, ...] | list[str]) -> None:
+    """Keep widget-backed values when a different subview hides those widgets."""
+    for key in keys:
+        if key in st.session_state:
+            try:
+                st.session_state[key] = st.session_state[key]
+            except Exception:
+                pass
+
+
+_preserve_widget_state(_BATTERY_SIMULATOR_PERSISTED_WIDGET_KEYS)
 
 
 def _is_currency_table_column(col_name: object) -> bool:
@@ -3434,6 +3625,137 @@ def apply_modelled_pv_to_intervals(
     return out, scaled_solar, meta
 
 
+def _apply_solar_case_to_intervals(
+    df_int: pd.DataFrame,
+    solar_mode: str,
+    pv_kw: float,
+    base_uploaded_pv_kw: float,
+    uploaded_solar_profile: Optional[pd.DataFrame],
+    modelled_solar_profile_1kw: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], bool, str]:
+    """Apply the selected solar scenario to an interval profile."""
+    note = ""
+    solar_case = None
+    solar_applied = False
+    pv_kw_eff = max(float(pv_kw or 0.0), 0.0)
+    mode = str(solar_mode or "none").strip().lower()
+
+    if (
+        mode == "uploaded"
+        and isinstance(uploaded_solar_profile, pd.DataFrame)
+        and not uploaded_solar_profile.empty
+    ):
+        if float(base_uploaded_pv_kw or 0.0) > 0.0:
+            pv_scale = pv_kw_eff / float(base_uploaded_pv_kw)
+            df_out, solar_case, _solar_meta = apply_pv_scale_to_intervals(
+                df_int,
+                uploaded_solar_profile,
+                pv_scale,
+            )
+            solar_applied = bool(pv_kw_eff > 0.0)
+            return df_out, solar_case, solar_applied, note
+        solar_case = uploaded_solar_profile
+        if pv_kw_eff > 0.0:
+            note = "Solar scaling unavailable (set current solar size > 0)."
+        return df_int.copy(), solar_case, solar_applied, note
+
+    if (
+        mode == "modelled"
+        and isinstance(modelled_solar_profile_1kw, pd.DataFrame)
+        and not modelled_solar_profile_1kw.empty
+    ):
+        solar_case = modelled_solar_profile_1kw.copy()
+        solar_case["pv_kwh"] = (
+            pd.to_numeric(solar_case["pv_kwh"], errors="coerce")
+            .fillna(0.0)
+            .clip(lower=0.0)
+            .astype(float)
+            * pv_kw_eff
+        )
+        df_out, solar_case, _solar_meta = apply_modelled_pv_to_intervals(
+            df_int,
+            solar_case,
+        )
+        solar_applied = bool(pv_kw_eff > 0.0)
+        return df_out, solar_case, solar_applied, note
+
+    if mode == "uploaded":
+        solar_case = uploaded_solar_profile
+    return df_int.copy(), solar_case, solar_applied, note
+
+
+def _restate_load_shift_summary_for_case(
+    df_no_shift_case: pd.DataFrame,
+    df_shifted_case: pd.DataFrame,
+    shift_summary: dict | None,
+) -> dict:
+    """Recalculate the solar-vs-grid split for a scenario-specific load-shift case."""
+    if not isinstance(shift_summary, dict):
+        return {}
+
+    summary = copy.deepcopy(shift_summary)
+    shifted_total = max(float(summary.get("shifted_kwh", 0.0) or 0.0), 0.0)
+    if shifted_total <= 1e-9:
+        summary["solar_diverted_kwh"] = 0.0
+        summary["grid_kwh"] = 0.0
+        return summary
+
+    def _wide_general_export_view(df_int: pd.DataFrame) -> pd.DataFrame:
+        wide = _intervals_wide_from_long(df_int)
+        if wide.empty:
+            return pd.DataFrame(columns=["timestamp", "general_kwh", "export_kwh"])
+        out = wide[["timestamp"]].copy()
+        for col in ("general_kwh", "export_kwh"):
+            if col not in wide.columns:
+                out[col] = 0.0
+            else:
+                out[col] = (
+                    pd.to_numeric(wide[col], errors="coerce")
+                    .fillna(0.0)
+                    .clip(lower=0.0)
+                    .astype(float)
+                )
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        return out
+
+    no_shift_view = _wide_general_export_view(df_no_shift_case)
+    shifted_view = _wide_general_export_view(df_shifted_case)
+    if no_shift_view.empty or shifted_view.empty:
+        return summary
+
+    merged = no_shift_view.merge(
+        shifted_view,
+        on="timestamp",
+        how="outer",
+        suffixes=("_no_shift", "_shifted"),
+    )
+    for col in (
+        "general_kwh_no_shift",
+        "export_kwh_no_shift",
+        "general_kwh_shifted",
+        "export_kwh_shifted",
+    ):
+        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float)
+
+    solar_diverted = float(
+        (merged["export_kwh_no_shift"] - merged["export_kwh_shifted"]).clip(lower=0.0).sum()
+    )
+    grid_topup = float(
+        (merged["general_kwh_shifted"] - merged["general_kwh_no_shift"]).clip(lower=0.0).sum()
+    )
+
+    solar_diverted = min(max(solar_diverted, 0.0), shifted_total)
+    grid_topup = min(max(grid_topup, 0.0), shifted_total)
+    split_total = solar_diverted + grid_topup
+    if split_total > 1e-9 and abs(split_total - shifted_total) > 1e-6:
+        grid_topup = max(shifted_total - solar_diverted, 0.0)
+
+    summary["solar_diverted_kwh"] = float(solar_diverted)
+    summary["grid_kwh"] = float(grid_topup)
+    return summary
+
+
 def estimate_solar_self_consumption_metrics(
     df_int: pd.DataFrame,
     solar_profile: Optional[pd.DataFrame],
@@ -3755,6 +4077,58 @@ class TimedLoadShiftParams:
     timer_start: str = "10:00"
     timer_end: str = "15:00"
     max_power_kw: float = 3.6
+    infra_capex: float = 0.0
+
+
+def _build_load_shift_scenarios(loads: list[TimedLoadShiftParams] | None) -> list[dict]:
+    """Return feasible optimizer scenarios from the currently enabled load-shift models."""
+    base_loads = copy.deepcopy(list(loads or []))
+    enabled_idx = [
+        idx
+        for idx, ld in enumerate(base_loads)
+        if isinstance(ld, TimedLoadShiftParams) and bool(ld.enabled)
+    ]
+    if not enabled_idx:
+        return [{"label": "Off", "enabled": False, "enabled_count": 0, "params": base_loads}]
+
+    scenarios: list[dict] = []
+    for mask in range(1 << len(enabled_idx)):
+        selected_positions = {
+            enabled_idx[bit]
+            for bit in range(len(enabled_idx))
+            if bool(mask & (1 << bit))
+        }
+        params = copy.deepcopy(base_loads)
+        labels: list[str] = []
+        enabled_count = 0
+        for idx, ld in enumerate(params):
+            if not isinstance(ld, TimedLoadShiftParams):
+                continue
+            is_enabled = bool(idx in selected_positions)
+            ld.enabled = is_enabled
+            if is_enabled:
+                enabled_count += 1
+                labels.append(str(ld.name or f"Load {idx + 1}"))
+        scenarios.append(
+            {
+                "label": (" + ".join(labels) if labels else "Off"),
+                "enabled": bool(labels),
+                "enabled_count": int(enabled_count),
+                "params": params,
+            }
+        )
+
+    scenarios.sort(key=lambda rr: (int(rr.get("enabled_count", 0)), str(rr.get("label", ""))))
+    return scenarios
+
+
+def _load_shift_capex_for_params(loads: list[TimedLoadShiftParams] | None) -> float:
+    """Return total infrastructure capex for the enabled load-shift configuration."""
+    total = 0.0
+    for ld in (loads or []):
+        if isinstance(ld, TimedLoadShiftParams) and bool(ld.enabled):
+            total += max(float(getattr(ld, "infra_capex", 0.0) or 0.0), 0.0)
+    return float(total)
 
 
 def _remove_shifted_source_energy(
@@ -5104,6 +5478,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
         "Moves selected appliance energy out of the chosen source register and into a timer window across the app. "
         "Inside that window, export is reduced first and any remainder becomes general import."
     )
+    st.caption("Optional infrastructure capex below is included when the optimizer selects that load-shift scenario.")
     st.markdown("**Hot water**")
     hot_water_shift_enabled = st.checkbox(
         "Shift hot water to timer window",
@@ -5166,6 +5541,16 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             key="hot_water_shift_power_kw",
             disabled=not hot_water_shift_enabled,
             help="Used to cap how much hot-water energy can fit inside the timer window each interval.",
+        )
+        hot_water_shift_capex = st.number_input(
+            "Hot water shift capex ($)",
+            min_value=0.0,
+            max_value=50000.0,
+            value=float(st.session_state.get("hot_water_shift_capex", 0.0)),
+            step=50.0,
+            key="hot_water_shift_capex",
+            disabled=not hot_water_shift_enabled,
+            help="One-off infrastructure/control cost to enable this hot-water load shift.",
         )
 
     st.markdown("**Pool pump**")
@@ -5231,6 +5616,16 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             disabled=not pool_shift_enabled,
             help="Used to cap how much pool energy can fit inside the timer window each interval.",
         )
+        pool_shift_capex = st.number_input(
+            "Pool shift capex ($)",
+            min_value=0.0,
+            max_value=50000.0,
+            value=float(st.session_state.get("pool_shift_capex", 0.0)),
+            step=50.0,
+            key="pool_shift_capex",
+            disabled=not pool_shift_enabled,
+            help="One-off infrastructure/control cost to enable this pool load shift.",
+        )
 
 load_shift_params = [
     TimedLoadShiftParams(
@@ -5242,6 +5637,7 @@ load_shift_params = [
         timer_start=hot_water_shift_start_t.strftime("%H:%M"),
         timer_end=hot_water_shift_end_t.strftime("%H:%M"),
         max_power_kw=float(hot_water_shift_power_kw),
+        infra_capex=float(hot_water_shift_capex),
     ),
     TimedLoadShiftParams(
         name="Pool pump",
@@ -5252,6 +5648,7 @@ load_shift_params = [
         timer_start=pool_shift_start_t.strftime("%H:%M"),
         timer_end=pool_shift_end_t.strftime("%H:%M"),
         max_power_kw=float(pool_shift_power_kw),
+        infra_capex=float(pool_shift_capex),
     ),
 ]
 
@@ -5366,6 +5763,7 @@ load_shift_signature = {
             "timer_start": str(ld.timer_start),
             "timer_end": str(ld.timer_end),
             "max_power_kw": round(float(ld.max_power_kw or 0.0), 4),
+            "infra_capex": round(float(getattr(ld, "infra_capex", 0.0) or 0.0), 2),
         }
         for ld in load_shift_params
     ],
@@ -5587,16 +5985,25 @@ def _max_demand_kw(df: pd.DataFrame, import_registers=("E1","E2")) -> float:
     return float(g.max() * (60.0 / mins))
 
 days_in_data = int(df_int["timestamp"].dt.date.nunique()) if not df_int.empty else 0
+total_general_import_kwh = float(df_int[df_int["register"].isin(["E1"])]["kwh"].sum()) if not df_int.empty else 0.0
+total_cl_import_kwh = float(df_int[df_int["register"].isin(["E2"])]["kwh"].sum()) if not df_int.empty else 0.0
 total_import_kwh = float(df_int[df_int["register"].isin(["E1","E2"])]["kwh"].sum()) if not df_int.empty else 0.0
 total_export_kwh = float(df_int[df_int["register"].isin(["B1"])]["kwh"].sum()) if not df_int.empty else 0.0
 avg_daily_pv_production = None
+self_cons_pct_overview = None
+solar_cov_pct_overview = None
 if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty and "pv_kwh" in solar_profile_for_battery.columns:
     total_pv_prod_kwh = float(pd.to_numeric(solar_profile_for_battery["pv_kwh"], errors="coerce").fillna(0.0).sum())
     avg_daily_pv_production = (total_pv_prod_kwh / days_in_data) if days_in_data else 0.0
+    solar_metrics_overview = estimate_solar_self_consumption_metrics(df_int, solar_profile_for_battery)
+    self_cons_pct_overview = float(solar_metrics_overview.get("self_consumption_pct", 0.0) or 0.0)
+    solar_cov_pct_overview = float(solar_metrics_overview.get("solar_coverage_pct", 0.0) or 0.0)
 avg_daily_import = (total_import_kwh / days_in_data) if days_in_data else 0.0
+cl_share_of_import_pct = (total_cl_import_kwh / total_import_kwh * 100.0) if total_import_kwh > 0 else 0.0
 max_demand_30 = compute_max_demand_kw(df_int, window_minutes=30)
 max_demand_5 = compute_max_demand_kw(df_int, window_minutes=5)
 monthly_max_demand = compute_monthly_max_demand(df_int, window_minutes=30)
+monthly_energy_overview = compute_monthly_energy_overview(df_int, solar_profile_for_battery)
 
 show_dataset_overview = show_overview_only
 if show_dataset_overview:
@@ -5609,13 +6016,18 @@ if show_dataset_overview:
         c4.metric("Avg daily PV production", f"{avg_daily_pv_production:,.1f} kWh/day")
         c5.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
         c6.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Self-consumption", f"{float(self_cons_pct_overview or 0.0):.1f}%")
+        d2.metric("Solar coverage", f"{float(solar_cov_pct_overview or 0.0):.1f}%")
+        d3.metric("CL share of import", f"{cl_share_of_import_pct:.1f}%")
     else:
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Days", f"{days_in_data}")
         c2.metric("Import (E1+E2)", f"{total_import_kwh:,.1f} kWh")
         c3.metric("Export (B1)", f"{total_export_kwh:,.1f} kWh")
         c4.metric("Avg daily import", f"{avg_daily_import:,.1f} kWh/day")
         c5.metric("Max demand (30-min avg)", f"{max_demand_30:,.2f} kW")
+        c6.metric("CL share of import", f"{cl_share_of_import_pct:.1f}%")
     st.caption(f"Max 5-minute interval: {max_demand_5:,.2f} kW")
     st.caption(
         "Max demand (30-min avg) is a rolling 30-minute average demand metric; "
@@ -5624,12 +6036,71 @@ if show_dataset_overview:
 
     st.divider()
 
-    # Monthly max demand (30-min average) - matches Energex-style reporting
-    if 'monthly_max_demand' in locals() and monthly_max_demand is not None and not monthly_max_demand.empty:
-        st.subheader("Monthly maximum demand (30-min average)")
-        md = monthly_max_demand.copy()
-        md["month"] = pd.to_datetime(md["month"]).dt.strftime("%b %Y")
-        _show_table(md.rename(columns={"month":"Month","max_demand_kw":"Max demand (kW)"}), use_container_width=True)
+    monthly_overview = pd.merge(
+        monthly_max_demand if monthly_max_demand is not None else pd.DataFrame(columns=["month", "max_demand_kw"]),
+        monthly_energy_overview if monthly_energy_overview is not None else pd.DataFrame(columns=["month"]),
+        on="month",
+        how="outer",
+    )
+    if not monthly_overview.empty:
+        st.subheader("Monthly energy overview")
+        mo = monthly_overview.copy().sort_values("month").reset_index(drop=True)
+        mo["month"] = pd.to_datetime(mo["month"], errors="coerce")
+        mo["Month"] = mo["month"].dt.strftime("%b %Y")
+        for col_name, decimals in [
+            ("max_demand_kw", 1),
+            ("e1_kwh", 1),
+            ("e2_kwh", 1),
+            ("b1_kwh", 1),
+            ("avg_daily_gen_import_kwh", 1),
+            ("avg_daily_cl_import_kwh", 1),
+            ("avg_daily_export_kwh", 1),
+            ("pv_production_kwh", 1),
+            ("avg_daily_pv_production_kwh", 1),
+        ]:
+            if col_name in mo.columns:
+                mo[col_name] = pd.to_numeric(mo[col_name], errors="coerce").round(decimals)
+        mo = mo.rename(
+            columns={
+                "max_demand_kw": "Max demand (kW)",
+                "e1_kwh": "Gen Import (kWh)",
+                "e2_kwh": "Import CL (kWh)",
+                "b1_kwh": "Export (kWh)",
+                "avg_daily_gen_import_kwh": "Avg daily Gen Import (kWh/day)",
+                "avg_daily_cl_import_kwh": "Avg daily CL Import (kWh/day)",
+                "avg_daily_export_kwh": "Avg daily export (kWh/day)",
+                "pv_production_kwh": "PV production (kWh)",
+                "avg_daily_pv_production_kwh": "Avg daily production (kWh/day)",
+            }
+        )
+        _show_table(
+            mo[
+                [
+                    "Month",
+                    "Max demand (kW)",
+                    "Gen Import (kWh)",
+                    "Import CL (kWh)",
+                    "Export (kWh)",
+                    "PV production (kWh)",
+                    "Avg daily Gen Import (kWh/day)",
+                    "Avg daily CL Import (kWh/day)",
+                    "Avg daily export (kWh/day)",
+                    "Avg daily production (kWh/day)",
+                ]
+            ],
+            use_container_width=True,
+            column_config={
+                "Max demand (kW)": st.column_config.NumberColumn(format="%.1f"),
+                "Gen Import (kWh)": st.column_config.NumberColumn(format="%.1f"),
+                "Import CL (kWh)": st.column_config.NumberColumn(format="%.1f"),
+                "Export (kWh)": st.column_config.NumberColumn(format="%.1f"),
+                "Avg daily Gen Import (kWh/day)": st.column_config.NumberColumn(format="%.1f"),
+                "Avg daily CL Import (kWh/day)": st.column_config.NumberColumn(format="%.1f"),
+                "Avg daily export (kWh/day)": st.column_config.NumberColumn(format="%.1f"),
+                "PV production (kWh)": st.column_config.NumberColumn(format="%.1f"),
+                "Avg daily production (kWh/day)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
 
 if show_overview_only:
     st.stop()
@@ -6293,8 +6764,17 @@ if show_battery_only:
         if not plan_names:
             st.info("No plans loaded.")
         else:
-            default_plan_name = plan_names[0]
-            sim_plan_name = st.selectbox("Plan to simulate", plan_names, index=_default_plan_index(plan_names, 0))
+            default_plan_name = str(st.session_state.get("current_retailer", plan_names[0]) or plan_names[0])
+            if default_plan_name not in plan_names:
+                default_plan_name = plan_names[0]
+            if st.session_state.get("battery_sim_plan_name") not in plan_names:
+                st.session_state["battery_sim_plan_name"] = default_plan_name
+            sim_plan_name = st.selectbox(
+                "Plan to simulate",
+                plan_names,
+                index=plan_names.index(str(st.session_state.get("battery_sim_plan_name", default_plan_name))),
+                key="battery_sim_plan_name",
+            )
             plan_obj = next((p for p in plans_lib if p.name == sim_plan_name), plans_lib[0])
 
             ui_detail = st.radio(
@@ -6756,24 +7236,35 @@ if show_battery_only:
                 "joint_assume_no_existing_export": bool(st.session_state.get("joint_assume_no_existing_export", False)),
             }
 
+            joint_result_state_keys = (
+                "joint_opt_df",
+                "joint_opt_full_df",
+                "joint_best",
+                "joint_days",
+                "joint_meta",
+                "joint_signature",
+                "joint_stage_df",
+                "joint_stage_meta",
+                "joint_report_assumptions",
+            )
             prev_joint_signature = st.session_state.get("joint_signature")
-            if ("joint_best" in st.session_state) and (prev_joint_signature is not None) and (prev_joint_signature != joint_signature_current):
-                for k in (
-                    "joint_opt_df",
-                    "joint_opt_full_df",
-                    "joint_best",
-                    "joint_days",
-                    "joint_meta",
-                    "joint_signature",
-                    "joint_stage_df",
-                    "joint_stage_meta",
-                    "joint_report_assumptions",
-                ):
-                    st.session_state.pop(k, None)
-                st.info("Decision summary was cleared because assumptions changed. Re-run the optimizer in subtab 3.")
+            joint_results_stale = (
+                ("joint_best" in st.session_state)
+                and (prev_joint_signature is not None)
+                and (prev_joint_signature != joint_signature_current)
+            )
 
             st.markdown("### Decision summary")
             if "joint_best" in st.session_state:
+                if joint_results_stale:
+                    st.warning(
+                        "Optimizer inputs changed since the last run, so these results may be stale. "
+                        "They are still shown below so you can compare outputs, and you can rerun the optimizer when ready."
+                    )
+                    if st.button("Clear stale optimizer results", key="btn_clear_joint_stale"):
+                        for k in joint_result_state_keys:
+                            st.session_state.pop(k, None)
+                        st.rerun()
                 joint_meta = st.session_state.get("joint_meta") or {}
                 run_at = joint_meta.get("run_at")
                 run_notes = joint_meta.get("summary")
@@ -7324,26 +7815,24 @@ if show_battery_only:
                     key="joint_assume_no_existing_export",
                     help="Sets existing B1 export to zero for this joint optimizer run. Useful when testing new-solar decisions with a dataset that already includes export.",
                 )
-                df_joint_base = df_int
+                df_joint_base = df_int_ev
                 df_joint_stage_seed = df_int_ev
                 if assume_no_existing_export:
                     try:
-                        d0 = df_int.copy()
+                        d0 = df_int_ev.copy()
                         reg = d0["register"].astype(str)
                         mask_export = reg.isin(EXPORT_REGS)
                         removed_export_kwh = float(pd.to_numeric(d0.loc[mask_export, "kwh"], errors="coerce").fillna(0.0).sum())
                         d0.loc[mask_export, "kwh"] = 0.0
                         df_joint_base = d0
-                        d0_stage = df_int_ev.copy()
-                        reg_stage = d0_stage["register"].astype(str)
-                        mask_export_stage = reg_stage.isin(EXPORT_REGS)
-                        d0_stage.loc[mask_export_stage, "kwh"] = 0.0
+                        d0_stage = d0.copy()
                         df_joint_stage_seed = d0_stage
                         st.caption(f"Baseline export removed for optimizer: {removed_export_kwh:,.1f} kWh over dataset period.")
                     except Exception:
-                        df_joint_base = df_int
+                        df_joint_base = df_int_ev
                         df_joint_stage_seed = df_int_ev
                         st.warning("Could not apply baseline export override; using original dataset profile.")
+                joint_load_shift_scenarios = _build_load_shift_scenarios(load_shift_params)
                 enable_solar_sweep = st.checkbox(
                     "Sweep solar system size",
                     value=solar_available_for_sweep,
@@ -7504,20 +7993,26 @@ if show_battery_only:
                     if not joint_sizes:
                         joint_err = "No battery sizes to simulate with this range."
 
-                run_count = len(joint_sizes) * len(plans_lib) * len(joint_pv_sizes)
+                run_count = len(joint_sizes) * len(plans_lib) * len(joint_pv_sizes) * len(joint_load_shift_scenarios)
                 if enable_solar_sweep:
                     if solar_mode == "modelled":
                         st.caption(
                             f"Estimated run size: {run_count} simulations "
-                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} modelled solar sizes x {len(joint_sizes)} battery sizes)."
+                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} modelled solar sizes x {len(joint_sizes)} battery sizes"
+                            f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
                         )
                     else:
                         st.caption(
                             f"Estimated run size: {run_count} simulations "
-                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes)."
+                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes"
+                            f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
                         )
                 else:
-                    st.caption(f"Estimated run size: {run_count} simulations ({len(plans_lib)} plans x {len(joint_sizes)} battery sizes).")
+                    st.caption(
+                        f"Estimated run size: {run_count} simulations "
+                        f"({len(plans_lib)} plans x {len(joint_sizes)} battery sizes"
+                        f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
+                    )
                 if run_count > 400:
                     st.warning("Very large run selected. Expect a longer wait.")
                 if joint_err:
@@ -7555,7 +8050,15 @@ if show_battery_only:
                                 "solar_intervals_total": int(solar_intervals_total or 0),
                                 "nem_intervals_total": int(nem_intervals_total or 0),
                             },
-                            "load_shift": dict(load_shift_signature),
+                            "load_shift": {
+                                **dict(load_shift_signature),
+                                "optimizer_mode": (
+                                    "scenario_sweep"
+                                    if any(bool(rr.get("enabled", False)) for rr in joint_load_shift_scenarios)
+                                    else "off_only"
+                                ),
+                                "optimizer_scenarios": [str(rr.get("label", "")) for rr in joint_load_shift_scenarios],
+                            },
                             "plans": {
                                 "included_count": int(len(plans_lib)),
                                 "included_names": [str(pp.name) for pp in plans_lib],
@@ -7747,151 +8250,168 @@ if show_battery_only:
                             for pv_case in pv_cases:
                                 pv_kw = float(pv_case["pv_kw"])
                                 pv_capex = float(pv_case["pv_capex"])
-                                df_case = pv_case["df_int"]
+                                df_case_solar = pv_case["df_int"]
+                                solar_profile_case = pv_case["solar_profile"]
                                 solar_metrics_case = pv_case.get("solar_metrics") if isinstance(pv_case, dict) else {}
                                 if not isinstance(solar_metrics_case, dict):
                                     solar_metrics_case = {}
                                 solar_self_cons_pct = float(solar_metrics_case.get("self_consumption_pct", 0.0) or 0.0)
                                 solar_cov_pct_case = float(solar_metrics_case.get("solar_coverage_pct", 0.0) or 0.0)
                                 solar_pv_gen_case = float(solar_metrics_case.get("pv_generated_kwh", 0.0) or 0.0)
-                                baseline = simulate_plan(df_case, p, include_signup_credit=False, battery_kwh_context=0.0)
-                                base_total = float(baseline.get("total_cents", 0.0))
-                                days = float(baseline.get("days", 0.0) or 0.0)
-                                annual_base_bill = (base_total / 100.0) * (365.0 / days) if days > 0 else (base_total / 100.0)
-
-                                for size_idx, cap in enumerate(joint_sizes, start=1):
-                                    if enable_solar_sweep:
-                                        status.caption(
-                                            f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
-                                            f"solar {pv_kw:.1f} kW | battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
-                                        )
-                                    else:
-                                        status.caption(
-                                            f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
-                                            f"battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
-                                        )
-
-                                    batt = BatteryParams(
-                                        capacity_kwh=float(cap),
-                                        power_kw=float(power_kw),
-                                        roundtrip_eff=float(roundtrip_eff),
-                                        reserve_frac=float(reserve_pct) / 100.0,
-                                        initial_soc_frac=float(init_soc_pct) / 100.0,
-                                        discharge_min_rate_cents=None,
-                                        charge_from_export_only=True,
+                                for load_shift_case in joint_load_shift_scenarios:
+                                    load_shift_label = str(load_shift_case.get("label", "Off") or "Off")
+                                    load_shift_capex = _load_shift_capex_for_params(load_shift_case.get("params"))
+                                    df_case, load_shift_case_summary = apply_timed_load_shifts_to_intervals(
+                                        df_case_solar,
+                                        load_shift_case.get("params"),
                                     )
-                                    sim_b = simulate_plan_with_battery(
-                                        df_case,
-                                        p,
-                                        batt,
-                                        baseline=baseline,
-                                        wide_base=pv_case["wide_base"],
-                                        solar_profile=pv_case["solar_profile"],
-                                    )
-                                    tot = float(sim_b.get("total_cents", 0.0))
-                                    savings = (base_total - tot) / 100.0
-                                    annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
-                                    annual_bill_with_battery = float(max(0.0, annual_base_bill - annual_savings))
-                                    total_savings_vs_current_solar = float(annual_bill_current_solar - annual_bill_with_battery)
-                                    batt_cost = _battery_capex_for_size(cap)
+                                    wide_case = _intervals_wide_from_long(df_case)
+                                    baseline = simulate_plan(df_case, p, include_signup_credit=False, battery_kwh_context=0.0)
+                                    base_total = float(baseline.get("total_cents", 0.0))
+                                    days = float(baseline.get("days", 0.0) or 0.0)
+                                    annual_base_bill = (base_total / 100.0) * (365.0 / days) if days > 0 else (base_total / 100.0)
 
-                                    battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
-                                    cycle_metrics = _battery_cycle_metrics(
-                                        battery_cycles_equiv=battery_cycles_equiv,
-                                        days=days,
-                                        assumed_life_years=float(battery_life_years),
-                                        cycle_life_efc=float(cycle_life_efc),
-                                    )
-                                    cf_model = _build_battery_cashflows(
-                                        annual_savings=float(annual_savings),
-                                        batt_cost=float(batt_cost),
-                                        battery_life_years=float(battery_life_years),
-                                        degradation_rate=float(degradation_rate),
-                                        price_growth_rate=float(price_growth_rate or 0.0),
-                                        cycle_aware=bool(cycle_aware),
-                                        efc_per_year=float(cycle_metrics.get("efc_per_year", 0.0)),
-                                        cycle_life_efc=float(cycle_life_efc),
-                                        eol_capacity_frac=float(eol_capacity_frac),
-                                    )
-                                    savings_by_year = list(cf_model.get("savings_by_year", []))
-                                    year_fractions = list(cf_model.get("year_fractions", [1.0] * len(savings_by_year)))
-                                    cashflows = list(cf_model.get("cashflows", [-float(batt_cost)]))
-                                    effective_life_years = float(cf_model.get("effective_life_years", battery_life_years) or 0.0)
-
-                                    npv_val = _npv(cashflows, float(discount_rate))
-                                    irr_val = None if float(cap) <= 0.0 else _irr_bisection(cashflows)
-                                    r = float(discount_rate or 0.0)
-                                    pv_bills = 0.0
-                                    pv_bills_no_batt = 0.0
-                                    for yr, (sav, yr_frac) in enumerate(zip(savings_by_year, year_fractions), start=1):
-                                        growth = (1.0 + float(price_growth_rate or 0.0)) ** (yr - 1)
-                                        annual_base_bill_t = float(annual_base_bill) * float(growth) * float(yr_frac)
-                                        disc = ((1.0 + r) ** yr) if (1.0 + r) != 0 else 1.0
-                                        pv_bills += max(0.0, annual_base_bill_t - float(sav)) / disc
-                                        pv_bills_no_batt += annual_base_bill_t / disc
-
-                                    system_lifetime_cost = float(pv_capex + batt_cost + pv_bills)
-                                    system_saving_vs_no_batt = float(pv_bills_no_batt - (batt_cost + pv_bills))
-
-                                    cand = {
-                                        "Plan": p.name,
-                                        "Optimal solar size (kW)": (pv_kw if enable_solar_sweep else None),
-                                        "Optimal battery (kWh)": float(cap),
-                                        "Battery NPV ($)": float(npv_val),
-                                        "IRR (%)": (float(irr_val) * 100.0 if irr_val is not None else None),
-                                        "Annualised savings ($/yr)": float(annual_savings),
-                                        "Battery incremental savings vs same solar ($/yr)": float(annual_savings),
-                                        "Total savings vs current solar, no battery ($/yr)": float(total_savings_vs_current_solar),
-                                        "Estimated annual bill with battery ($/yr)": annual_bill_with_battery,
-                                        "Current solar/no-battery annual bill ($/yr)": float(annual_bill_current_solar),
-                                        "Incremental solar capex ($)": float(pv_capex),
-                                        "Battery cost ($)": float(batt_cost),
-                                        "Est. PV generated (solar-only, kWh)": float(solar_pv_gen_case),
-                                        "Est. self-consumption (solar-only, %)": float(solar_self_cons_pct),
-                                        "Est. solar coverage of load (solar-only, %)": float(solar_cov_pct_case),
-                                        "Cycles equiv": round(battery_cycles_equiv, 2),
-                                        "Cycles/yr (EFC)": round(float(cycle_metrics.get("efc_per_year", 0.0)), 1),
-                                        "Implied cycle life (yrs)": (
-                                            round(float(cycle_metrics["implied_cycle_life_years"]), 1)
-                                            if cycle_metrics.get("implied_cycle_life_years") is not None
-                                            else None
-                                        ),
-                                        "Life used in model (yrs)": round(float(effective_life_years), 2),
-                                        "Cycle stress": ("High" if cycle_metrics.get("is_cycle_stress") else ""),
-                                        "PV lifetime cost incl battery ($)": system_lifetime_cost,
-                                        "PV lifetime saving vs same solar, no battery ($)": system_saving_vs_no_batt,
-                                    }
-                                    all_results.append(cand.copy())
-                                    if best is None:
-                                        best = cand
-                                    else:
-                                        best_cost = float(best.get("PV lifetime cost incl battery ($)", 0.0))
-                                        cand_cost = float(cand.get("PV lifetime cost incl battery ($)", 0.0))
-                                        best_pv = float(best.get("Optimal solar size (kW)") or 0.0)
-                                        cand_pv = float(cand.get("Optimal solar size (kW)") or 0.0)
-                                        best_b = float(best.get("Optimal battery (kWh)", 0.0))
-                                        cand_b = float(cand.get("Optimal battery (kWh)", 0.0))
-                                        if (cand_cost < best_cost) or (
-                                            cand_cost == best_cost and (
-                                                (cand_pv < best_pv) or (cand_pv == best_pv and cand_b < best_b)
+                                    for size_idx, cap in enumerate(joint_sizes, start=1):
+                                        if enable_solar_sweep:
+                                            status.caption(
+                                                f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
+                                                f"solar {pv_kw:.1f} kW | load shift {load_shift_label} | "
+                                                f"battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
                                             )
-                                        ):
-                                            best = cand
+                                        else:
+                                            status.caption(
+                                                f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
+                                                f"load shift {load_shift_label} | "
+                                                f"battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
+                                            )
 
-                                    step_idx += 1
-                                    overall_progress.progress(float(step_idx) / float(total_steps))
-                                    elapsed_seconds_live = float((dt.datetime.now() - run_started_at).total_seconds())
-                                    avg_seconds_per_sim = (elapsed_seconds_live / float(step_idx)) if step_idx > 0 else 0.0
-                                    eta_seconds = avg_seconds_per_sim * float(max(total_steps - step_idx, 0))
-                                    progress_header.info(
-                                        f"Optimise run in progress: {step_idx:,}/{total_steps:,} simulations complete "
-                                        f"({(100.0 * float(step_idx) / float(total_steps)):.1f}%)."
-                                    )
-                                    overall_progress_caption.caption(
-                                        f"Elapsed {_fmt_runtime(elapsed_seconds_live)} | "
-                                        f"ETA {_fmt_runtime(eta_seconds)} | "
-                                        f"Avg {avg_seconds_per_sim:.2f}s/sim"
-                                    )
+                                        batt = BatteryParams(
+                                            capacity_kwh=float(cap),
+                                            power_kw=float(power_kw),
+                                            roundtrip_eff=float(roundtrip_eff),
+                                            reserve_frac=float(reserve_pct) / 100.0,
+                                            initial_soc_frac=float(init_soc_pct) / 100.0,
+                                            discharge_min_rate_cents=None,
+                                            charge_from_export_only=True,
+                                        )
+                                        sim_b = simulate_plan_with_battery(
+                                            df_case,
+                                            p,
+                                            batt,
+                                            baseline=baseline,
+                                            wide_base=wide_case,
+                                            solar_profile=solar_profile_case,
+                                        )
+                                        tot = float(sim_b.get("total_cents", 0.0))
+                                        savings = (base_total - tot) / 100.0
+                                        annual_savings = (savings * (365.0 / days)) if days > 0 else 0.0
+                                        annual_bill_with_battery = float(max(0.0, annual_base_bill - annual_savings))
+                                        total_savings_vs_current_solar = float(annual_bill_current_solar - annual_bill_with_battery)
+                                        batt_cost = _battery_capex_for_size(cap)
+
+                                        battery_cycles_equiv = float(sim_b.get("battery_cycles_equiv", 0.0) or 0.0)
+                                        cycle_metrics = _battery_cycle_metrics(
+                                            battery_cycles_equiv=battery_cycles_equiv,
+                                            days=days,
+                                            assumed_life_years=float(battery_life_years),
+                                            cycle_life_efc=float(cycle_life_efc),
+                                        )
+                                        cf_model = _build_battery_cashflows(
+                                            annual_savings=float(annual_savings),
+                                            batt_cost=float(batt_cost),
+                                            battery_life_years=float(battery_life_years),
+                                            degradation_rate=float(degradation_rate),
+                                            price_growth_rate=float(price_growth_rate or 0.0),
+                                            cycle_aware=bool(cycle_aware),
+                                            efc_per_year=float(cycle_metrics.get("efc_per_year", 0.0)),
+                                            cycle_life_efc=float(cycle_life_efc),
+                                            eol_capacity_frac=float(eol_capacity_frac),
+                                        )
+                                        savings_by_year = list(cf_model.get("savings_by_year", []))
+                                        year_fractions = list(cf_model.get("year_fractions", [1.0] * len(savings_by_year)))
+                                        cashflows = list(cf_model.get("cashflows", [-float(batt_cost)]))
+                                        effective_life_years = float(cf_model.get("effective_life_years", battery_life_years) or 0.0)
+
+                                        npv_val = _npv(cashflows, float(discount_rate))
+                                        irr_val = None if float(cap) <= 0.0 else _irr_bisection(cashflows)
+                                        r = float(discount_rate or 0.0)
+                                        pv_bills = 0.0
+                                        pv_bills_no_batt = 0.0
+                                        for yr, (sav, yr_frac) in enumerate(zip(savings_by_year, year_fractions), start=1):
+                                            growth = (1.0 + float(price_growth_rate or 0.0)) ** (yr - 1)
+                                            annual_base_bill_t = float(annual_base_bill) * float(growth) * float(yr_frac)
+                                            disc = ((1.0 + r) ** yr) if (1.0 + r) != 0 else 1.0
+                                            pv_bills += max(0.0, annual_base_bill_t - float(sav)) / disc
+                                            pv_bills_no_batt += annual_base_bill_t / disc
+
+                                        system_lifetime_cost = float(pv_capex + batt_cost + load_shift_capex + pv_bills)
+                                        system_saving_vs_no_batt = float(pv_bills_no_batt - (batt_cost + load_shift_capex + pv_bills))
+
+                                        cand = {
+                                            "Plan": p.name,
+                                            "Load shift scenario": load_shift_label,
+                                            "Load shift": ("On" if bool(load_shift_case_summary.get("enabled", False)) else "Off"),
+                                            "Shifted kWh": round(float(load_shift_case_summary.get("shifted_kwh", 0.0) or 0.0), 1),
+                                            "Shift solar absorbed (kWh)": round(float(load_shift_case_summary.get("solar_diverted_kwh", 0.0) or 0.0), 1),
+                                            "Shift grid top-up (kWh)": round(float(load_shift_case_summary.get("grid_kwh", 0.0) or 0.0), 1),
+                                            "Optimal solar size (kW)": (pv_kw if enable_solar_sweep else None),
+                                            "Optimal battery (kWh)": float(cap),
+                                            "Battery NPV ($)": float(npv_val),
+                                            "IRR (%)": (float(irr_val) * 100.0 if irr_val is not None else None),
+                                            "Annualised savings ($/yr)": float(annual_savings),
+                                            "Battery incremental savings vs same solar ($/yr)": float(annual_savings),
+                                            "Total savings vs current solar, no battery ($/yr)": float(total_savings_vs_current_solar),
+                                            "Estimated annual bill with battery ($/yr)": annual_bill_with_battery,
+                                            "Current solar/no-battery annual bill ($/yr)": float(annual_bill_current_solar),
+                                            "Incremental solar capex ($)": float(pv_capex),
+                                            "Load shift capex ($)": float(load_shift_capex),
+                                            "Battery cost ($)": float(batt_cost),
+                                            "Est. PV generated (solar-only, kWh)": float(solar_pv_gen_case),
+                                            "Est. self-consumption (solar-only, %)": float(solar_self_cons_pct),
+                                            "Est. solar coverage of load (solar-only, %)": float(solar_cov_pct_case),
+                                            "Cycles equiv": round(battery_cycles_equiv, 2),
+                                            "Cycles/yr (EFC)": round(float(cycle_metrics.get("efc_per_year", 0.0)), 1),
+                                            "Implied cycle life (yrs)": (
+                                                round(float(cycle_metrics["implied_cycle_life_years"]), 1)
+                                                if cycle_metrics.get("implied_cycle_life_years") is not None
+                                                else None
+                                            ),
+                                            "Life used in model (yrs)": round(float(effective_life_years), 2),
+                                            "Cycle stress": ("High" if cycle_metrics.get("is_cycle_stress") else ""),
+                                            "PV lifetime cost incl battery ($)": system_lifetime_cost,
+                                            "PV lifetime saving vs same solar, no battery ($)": system_saving_vs_no_batt,
+                                        }
+                                        all_results.append(cand.copy())
+                                        if best is None:
+                                            best = cand
+                                        else:
+                                            best_cost = float(best.get("PV lifetime cost incl battery ($)", 0.0))
+                                            cand_cost = float(cand.get("PV lifetime cost incl battery ($)", 0.0))
+                                            best_pv = float(best.get("Optimal solar size (kW)") or 0.0)
+                                            cand_pv = float(cand.get("Optimal solar size (kW)") or 0.0)
+                                            best_b = float(best.get("Optimal battery (kWh)", 0.0))
+                                            cand_b = float(cand.get("Optimal battery (kWh)", 0.0))
+                                            if (cand_cost < best_cost) or (
+                                                cand_cost == best_cost and (
+                                                    (cand_pv < best_pv) or (cand_pv == best_pv and cand_b < best_b)
+                                                )
+                                            ):
+                                                best = cand
+
+                                        step_idx += 1
+                                        overall_progress.progress(float(step_idx) / float(total_steps))
+                                        elapsed_seconds_live = float((dt.datetime.now() - run_started_at).total_seconds())
+                                        avg_seconds_per_sim = (elapsed_seconds_live / float(step_idx)) if step_idx > 0 else 0.0
+                                        eta_seconds = avg_seconds_per_sim * float(max(total_steps - step_idx, 0))
+                                        progress_header.info(
+                                            f"Optimise run in progress: {step_idx:,}/{total_steps:,} simulations complete "
+                                            f"({(100.0 * float(step_idx) / float(total_steps)):.1f}%)."
+                                        )
+                                        overall_progress_caption.caption(
+                                            f"Elapsed {_fmt_runtime(elapsed_seconds_live)} | "
+                                            f"ETA {_fmt_runtime(eta_seconds)} | "
+                                            f"Avg {avg_seconds_per_sim:.2f}s/sim"
+                                        )
 
                             if best is not None:
                                 results.append(best)
@@ -7947,6 +8467,8 @@ if show_battery_only:
                                 if "Optimal solar size (kW)" in df_joint_full_run.columns:
                                     full_sort_cols.append("Optimal solar size (kW)")
                                 full_sort_cols.append("Optimal battery (kWh)")
+                                if "Load shift scenario" in df_joint_full_run.columns:
+                                    full_sort_cols.append("Load shift scenario")
                                 df_joint_full_run = df_joint_full_run.sort_values(full_sort_cols, ascending=[True] * len(full_sort_cols)).reset_index(drop=True)
                             st.session_state["joint_opt_df"] = df_joint_run
                             st.session_state["joint_opt_full_df"] = df_joint_full_run
@@ -7963,6 +8485,7 @@ if show_battery_only:
                                     f"solar_source={solar_mode}; "
                                     f"baseline_export_override={'on' if assume_no_existing_export else 'off'}; "
                                     f"solar_sweep={'on' if enable_solar_sweep else 'off'}; "
+                                    f"load_shift_scenarios={len(joint_load_shift_scenarios)}; "
                                     f"power={float(power_kw):.1f}kW; reserve={float(reserve_pct):.0f}%; "
                                     f"eff={float(roundtrip_eff):.2f}; aging={'cycle-aware' if cycle_aware else 'calendar-only'}; "
                                     f"assumptions={assumption_preset_name}; "
@@ -7981,77 +8504,61 @@ if show_battery_only:
                                     else:
                                         best_solar_kw = float(max(float(best_solar_raw), 0.0))
                                     best_batt_kwh = float(max(float(best_row.get("Optimal battery (kWh)", 0.0) or 0.0), 0.0))
-                                    load_shift_enabled_global = bool(load_shift_summary.get("enabled", False))
+                                    best_load_shift_label = str(best_row.get("Load shift scenario", "Off") or "Off")
+                                    off_load_shift_case = next(
+                                        (rr for rr in joint_load_shift_scenarios if str(rr.get("label", "")) == "Off"),
+                                        {"label": "Off", "enabled": False, "params": []},
+                                    )
+                                    best_load_shift_case = next(
+                                        (rr for rr in joint_load_shift_scenarios if str(rr.get("label", "")) == best_load_shift_label),
+                                        off_load_shift_case,
+                                    )
+                                    best_load_shift_enabled = bool(best_load_shift_case.get("enabled", False))
 
-                                    if load_shift_enabled_global:
-                                        stage_cases: list[tuple[str, bool, float, float]] = [
-                                            ("Plan only", False, 0.0, 0.0),
-                                            ("Plan + load shift", True, 0.0, 0.0),
+                                    if best_load_shift_enabled:
+                                        stage_cases: list[tuple[str, str, float, float]] = [
+                                            ("Plan only", "Off", 0.0, 0.0),
+                                            ("Plan + load shift", best_load_shift_label, 0.0, 0.0),
                                         ]
                                         if best_solar_kw > 0:
-                                            stage_cases.append(("Plan + load shift + solar", True, best_solar_kw, 0.0))
+                                            stage_cases.append(("Plan + load shift + solar", best_load_shift_label, best_solar_kw, 0.0))
                                         if best_batt_kwh > 0:
                                             stage_cases.append(
                                                 (
                                                     ("Plan + load shift + solar + battery" if best_solar_kw > 0 else "Plan + load shift + battery"),
-                                                    True,
+                                                    best_load_shift_label,
                                                     (best_solar_kw if best_solar_kw > 0 else 0.0),
                                                     best_batt_kwh,
                                                 )
                                             )
                                     else:
-                                        stage_cases = [("Plan only", False, 0.0, 0.0)]
+                                        stage_cases = [("Plan only", "Off", 0.0, 0.0)]
                                         if best_solar_kw > 0:
-                                            stage_cases.append(("Plan + solar", False, best_solar_kw, 0.0))
+                                            stage_cases.append(("Plan + solar", "Off", best_solar_kw, 0.0))
                                         if best_batt_kwh > 0:
-                                            stage_cases.append(("Plan + battery", False, 0.0, best_batt_kwh))
+                                            stage_cases.append(("Plan + battery", "Off", 0.0, best_batt_kwh))
                                         if best_solar_kw > 0 and best_batt_kwh > 0:
-                                            stage_cases.append(("Plan + solar + battery", False, best_solar_kw, best_batt_kwh))
+                                            stage_cases.append(("Plan + solar + battery", "Off", best_solar_kw, best_batt_kwh))
 
-                                    for scenario_label, use_load_shift_stage, pv_kw_case, batt_kwh_case in stage_cases:
+                                    for scenario_label, stage_shift_label, pv_kw_case, batt_kwh_case in stage_cases:
                                         scenario_note = ""
-                                        solar_case = None
-                                        solar_applied = False
-                                        stage_shift_params = copy.deepcopy(load_shift_params)
-                                        if not bool(use_load_shift_stage):
-                                            for ld in stage_shift_params:
-                                                if isinstance(ld, TimedLoadShiftParams):
-                                                    ld.enabled = False
-                                        df_stage_base, stage_shift_summary = apply_timed_load_shifts_to_intervals(
+                                        stage_shift_case = next(
+                                            (rr for rr in joint_load_shift_scenarios if str(rr.get("label", "")) == stage_shift_label),
+                                            off_load_shift_case,
+                                        )
+                                        stage_shift_params = copy.deepcopy(stage_shift_case.get("params") or [])
+                                        df_stage_base, solar_case, solar_applied, scenario_note = _apply_solar_case_to_intervals(
                                             df_joint_stage_seed,
+                                            solar_mode,
+                                            float(pv_kw_case),
+                                            float(current_pv_kw),
+                                            solar_profile_for_battery,
+                                            modelled_solar_profile_1kw,
+                                        )
+                                        df_stage, stage_shift_summary = apply_timed_load_shifts_to_intervals(
+                                            df_stage_base,
                                             stage_shift_params,
                                         )
-                                        if (solar_mode == "uploaded") and isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
-                                            if float(current_pv_kw) > 0:
-                                                pv_scale_case = float(pv_kw_case) / float(current_pv_kw)
-                                                df_stage, solar_case, _stage_meta = apply_pv_scale_to_intervals(
-                                                    df_stage_base,
-                                                    solar_profile_for_battery,
-                                                    pv_scale_case,
-                                                )
-                                                solar_applied = bool(float(pv_kw_case) > 0.0)
-                                            else:
-                                                df_stage = df_stage_base
-                                                solar_case = solar_profile_for_battery
-                                                if float(pv_kw_case) > 0:
-                                                    scenario_note = "Solar scaling unavailable (set current solar size > 0)."
-                                        elif (solar_mode == "modelled") and isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
-                                            solar_case = modelled_solar_profile_1kw.copy()
-                                            solar_case["pv_kwh"] = (
-                                                pd.to_numeric(solar_case["pv_kwh"], errors="coerce")
-                                                .fillna(0.0)
-                                                .clip(lower=0.0)
-                                                .astype(float)
-                                                * float(max(pv_kw_case, 0.0))
-                                            )
-                                            df_stage, solar_case, _stage_meta = apply_modelled_pv_to_intervals(
-                                                df_stage_base,
-                                                solar_case,
-                                            )
-                                            solar_applied = bool(float(pv_kw_case) > 0.0)
-                                        else:
-                                            df_stage = df_stage_base
-                                            solar_case = solar_profile_for_battery if solar_mode == "uploaded" else None
 
                                         baseline_stage = simulate_plan(
                                             df_stage,
@@ -8089,13 +8596,14 @@ if show_battery_only:
                                                 (total_stage / 100.0) * (365.0 / days_stage)
                                                 if days_stage > 0
                                                 else (total_stage / 100.0)
-                                            )
+                                        )
 
                                         solar_capex_stage = (
                                             max(float(pv_kw_case) - float(current_pv_kw), 0.0) * float(pv_cost_per_kw)
                                             if (solar_mode != "none" and solar_applied)
                                             else 0.0
                                         )
+                                        load_shift_capex_stage = _load_shift_capex_for_params(stage_shift_params)
                                         batt_capex_stage = _battery_capex_for_size(float(batt_kwh_case))
                                         stage_rows.append(
                                             {
@@ -8103,14 +8611,15 @@ if show_battery_only:
                                                 "Plan": best_plan_name,
                                                 "Solar size (kW)": round(float(pv_kw_case), 2),
                                                 "Battery size (kWh)": round(float(batt_kwh_case), 2),
-                                                "Load shift": ("On" if bool(stage_shift_summary.get("enabled", False)) else "Off"),
+                                                "Load shift": stage_shift_label,
                                                 "Shifted kWh": round(float(stage_shift_summary.get("shifted_kwh", 0.0) or 0.0), 1),
                                                 "Shift solar absorbed (kWh)": round(float(stage_shift_summary.get("solar_diverted_kwh", 0.0) or 0.0), 1),
                                                 "Shift grid top-up (kWh)": round(float(stage_shift_summary.get("grid_kwh", 0.0) or 0.0), 1),
                                                 "Estimated annual bill ($/yr)": round(float(annual_stage_bill), 0),
                                                 "Incremental solar capex ($)": round(float(solar_capex_stage), 0),
+                                                "Load shift capex ($)": round(float(load_shift_capex_stage), 0),
                                                 "Battery capex ($)": round(float(batt_capex_stage), 0),
-                                                "Total incremental capex ($)": round(float(solar_capex_stage + batt_capex_stage), 0),
+                                                "Total incremental capex ($)": round(float(solar_capex_stage + load_shift_capex_stage + batt_capex_stage), 0),
                                                 "Scenario notes": scenario_note or "-",
                                             }
                                         )
@@ -8126,6 +8635,7 @@ if show_battery_only:
                                 st.session_state["joint_stage_meta"] = {
                                     "plan": best_plan_name,
                                     "solar_mode": solar_mode,
+                                    "load_shift_scenario": best_load_shift_label,
                                 }
                             except Exception as stage_ex:
                                 st.session_state["joint_stage_df"] = pd.DataFrame()
@@ -8147,7 +8657,11 @@ if show_battery_only:
                                      best.get("Annualised savings ($/yr)", 0.0))
                             or 0.0
                         )
-                        bc = float(best.get("Battery cost ($)", 0.0) or 0.0) + float(best.get("Incremental solar capex ($)", 0.0) or 0.0)
+                        bc = (
+                            float(best.get("Battery cost ($)", 0.0) or 0.0)
+                            + float(best.get("Incremental solar capex ($)", 0.0) or 0.0)
+                            + float(best.get("Load shift capex ($)", 0.0) or 0.0)
+                        )
                         if sav > 0:
                             payback = bc / sav
                     except Exception:
@@ -8172,6 +8686,9 @@ if show_battery_only:
                             f"${float(best.get('Total savings vs current solar, no battery ($/yr)', best.get('Annualised savings ($/yr)', 0.0))):.0f}/yr",
                         )
                         s4.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
+
+                    best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
+                    st.caption(f"Optimized load shift: {best_load_shift_label}.")
 
                     best_self_cons = pd.to_numeric(
                         [best.get("Est. self-consumption (solar-only, %)", None)],
@@ -8199,13 +8716,18 @@ if show_battery_only:
 
                     stage_df = st.session_state.get("joint_stage_df")
                     if isinstance(stage_df, pd.DataFrame) and not stage_df.empty:
+                        stage_meta = st.session_state.get("joint_stage_meta") or {}
+                        stage_load_shift_label = str(stage_meta.get("load_shift_scenario", best_load_shift_label) or "Off")
                         st.markdown("**Staged pathway (best plan):**")
                         _show_dataframe_with_frozen_column(stage_df, freeze_col="Scenario")
                         stage_caption = (
                             "Savings vs Plan only compares each staged setup to the same best-plan, no-solar/no-battery baseline."
                         )
-                        if bool(load_shift_summary.get("enabled", False)):
-                            stage_caption += " For load shifting, 'Plan only' uses the same EV-adjusted baseline with load shifting turned off."
+                        if stage_load_shift_label != "Off":
+                            stage_caption += (
+                                f" Optimizer-selected load shift profile: {stage_load_shift_label}. "
+                                "For load shifting, 'Plan only' uses the same EV-adjusted baseline with load shifting turned off."
+                            )
                         st.caption(stage_caption)
 
                     df_joint_full = st.session_state.get("joint_opt_full_df")
@@ -8334,10 +8856,10 @@ if show_battery_only:
 
                     _show_dataframe_with_frozen_column(df_joint, freeze_col="Plan")
                     st.caption(
-                        "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + battery cost. Lower is better."
+                        "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + load-shift capex + battery cost. Lower is better."
                     )
-                    st.caption("`Battery incremental savings vs same solar` isolates battery-only impact at that solar size.")
-                    st.caption("`Total savings vs current solar, no battery` includes both solar-size and battery effects.")
+                    st.caption("`Battery incremental savings vs same solar` isolates battery-only impact at that solar size and load-shift scenario.")
+                    st.caption("`Total savings vs current solar, no battery` includes solar-size, load-shift, and battery effects.")
                     st.caption(
                         "`Est. self-consumption (solar-only, %)` and `Est. solar coverage of load (solar-only, %)` "
                         "are based on the selected/uploaded/modelled solar profile before battery dispatch."
@@ -8711,34 +9233,38 @@ if show_battery_only:
                             load_shift_case_params,
                         )
 
+                        solar_mode_case = (
+                            "uploaded"
+                            if has_uploaded_solar_profile
+                            else ("modelled" if use_modelled_solar_for_whatif else "none")
+                        )
                         note = None
-                        pv_scale_case = 1.0
-                        if has_uploaded_solar_profile:
-                            if float(base_solar_kw_for_scaling) > 0:
-                                pv_scale_case = float(solar_kw) / float(base_solar_kw_for_scaling)
-                            df_case, solar_case, _ = apply_pv_scale_to_intervals(
-                                df_case_shift,
-                                solar_profile_for_battery,
-                                float(pv_scale_case),
+                        df_case_no_shift, _case_solar_compare, _case_solar_compare_applied, _case_compare_note = _apply_solar_case_to_intervals(
+                            df_case_ev,
+                            solar_mode_case,
+                            float(solar_kw),
+                            float(base_solar_kw_for_scaling),
+                            solar_profile_for_battery,
+                            modelled_solar_profile_1kw_whatif,
+                        )
+                        df_case, solar_case, _solar_case_applied, solar_note = _apply_solar_case_to_intervals(
+                            df_case_shift,
+                            solar_mode_case,
+                            float(solar_kw),
+                            float(base_solar_kw_for_scaling),
+                            solar_profile_for_battery,
+                            modelled_solar_profile_1kw_whatif,
+                        )
+                        if solar_note:
+                            note = f"{case_name}: {solar_note}"
+                        elif (solar_mode_case == "none") and abs(float(solar_kw) - float(base_solar_kw_for_scaling)) > 0.01:
+                            note = f"{case_name}: solar size change ignored (no uploaded/modelled solar profile available)."
+                        if bool(load_shift_case_summary.get("enabled", False)):
+                            load_shift_case_summary = _restate_load_shift_summary_for_case(
+                                df_case_no_shift,
+                                df_case,
+                                load_shift_case_summary,
                             )
-                        elif use_modelled_solar_for_whatif:
-                            solar_case = modelled_solar_profile_1kw_whatif.copy()
-                            solar_case["pv_kwh"] = (
-                                pd.to_numeric(solar_case["pv_kwh"], errors="coerce")
-                                .fillna(0.0)
-                                .clip(lower=0.0)
-                                .astype(float)
-                                * max(float(solar_kw), 0.0)
-                            )
-                            df_case, solar_case, _ = apply_modelled_pv_to_intervals(
-                                df_case_shift,
-                                solar_case,
-                            )
-                        else:
-                            df_case = df_case_shift
-                            solar_case = None
-                            if abs(float(solar_kw) - float(base_solar_kw_for_scaling)) > 0.01:
-                                note = f"{case_name}: solar size change ignored (no uploaded/modelled solar profile available)."
 
                         baseline_case = simulate_plan(
                             df_case,
