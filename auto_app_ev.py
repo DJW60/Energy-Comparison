@@ -30,6 +30,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -10450,7 +10451,7 @@ with tab9:
 
     if add_submit:
         np_name = _unique_name([x.name for x in plans_lib], (new_plan_name or "").strip() or "New retailer plan")
-        np = Plan(
+        new_plan = Plan(
             name=np_name,
             supply_cents_per_day=0.0,
             import_type=new_plan_type,
@@ -10469,7 +10470,7 @@ with tab9:
             discount_pct=0.0,
             discount_applies_to="none",
         )
-        plans_lib.append(np)
+        plans_lib.append(new_plan)
         save_plans(plans_lib)
         st.session_state["force_select_plan_idx"] = len(plans_lib) - 1
         st.success("Added and saved.")
