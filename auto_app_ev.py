@@ -1791,6 +1791,15 @@ def save_plans(plans: list[Plan]) -> None:
     PLANS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _uploader_widget_key(counter_state_key: str, prefix: str) -> str:
+    counter = int(st.session_state.get(counter_state_key, 0) or 0)
+    return f"{prefix}_{counter}"
+
+
+def _reset_uploader_widget(counter_state_key: str) -> None:
+    st.session_state[counter_state_key] = int(st.session_state.get(counter_state_key, 0) or 0) + 1
+
+
 def _default_battery_assumptions_config() -> dict:
     return copy.deepcopy(DEFAULT_BATTERY_ASSUMPTIONS_CONFIG)
 
@@ -5235,7 +5244,7 @@ if show_plan_library_only and not uploaded:
     quick_uploaded_plans = st.file_uploader(
         "Upload plans.json to replace library",
         type=["json"],
-        key="plans_upload_quick_mode",
+        key=_uploader_widget_key("plans_upload_quick_mode_version", "plans_upload_quick_mode"),
     )
     if quick_uploaded_plans is not None:
         try:
@@ -5243,6 +5252,7 @@ if show_plan_library_only and not uploaded:
             quick_imported = [_dict_to_plan(x) for x in quick_data]
             st.session_state["plans_lib"] = quick_imported
             save_plans(quick_imported)
+            _reset_uploader_widget("plans_upload_quick_mode_version")
             st.success("Imported and saved plans.json.")
             st.rerun()
         except Exception as e:
@@ -5262,7 +5272,7 @@ if show_plan_library_only and not uploaded:
     quick_uploaded_addons = st.file_uploader(
         "Upload plan_addons.json to replace add-ons library",
         type=["json"],
-        key="plan_addons_upload_quick_mode",
+        key=_uploader_widget_key("plan_addons_upload_quick_mode_version", "plan_addons_upload_quick_mode"),
     )
     if quick_uploaded_addons is not None:
         try:
@@ -5285,6 +5295,7 @@ if show_plan_library_only and not uploaded:
             quick_imported_cfg = {"addons": quick_clean_addons}
             save_plan_addons_config(quick_imported_cfg)
             st.session_state["plan_addons_cfg"] = quick_imported_cfg
+            _reset_uploader_widget("plan_addons_upload_quick_mode_version")
             st.success(
                 f"Imported add-ons library ({len(quick_clean_addons)} rows saved, {quick_skipped_rows} rows skipped)."
             )
@@ -11031,7 +11042,11 @@ with tab9:
     export_json = json.dumps([_plan_to_dict(x) for x in plans_lib], indent=2)
     st.download_button("Download plans.json", export_json, file_name="plans.json", mime="application/json")
 
-    uploaded_plans = st.file_uploader("Upload plans.json to replace library", type=["json"], key="plans_upload")
+    uploaded_plans = st.file_uploader(
+        "Upload plans.json to replace library",
+        type=["json"],
+        key=_uploader_widget_key("plans_upload_version", "plans_upload"),
+    )
     if uploaded_plans is not None:
         try:
             data = json.loads(uploaded_plans.getvalue().decode("utf-8"))
@@ -11039,6 +11054,7 @@ with tab9:
             st.session_state["plans_lib"] = imported
             save_plans(imported)
             st.session_state["force_select_plan_idx"] = 0
+            _reset_uploader_widget("plans_upload_version")
             st.success("Imported and saved.")
             st.rerun()
         except Exception as e:
@@ -11485,7 +11501,7 @@ with tab9:
     uploaded_addons = st.file_uploader(
         "Upload plan_addons.json to replace add-ons library",
         type=["json"],
-        key="plan_addons_upload",
+        key=_uploader_widget_key("plan_addons_upload_version", "plan_addons_upload"),
     )
     if uploaded_addons is not None:
         try:
@@ -11509,6 +11525,7 @@ with tab9:
             save_plan_addons_config(imported_cfg)
             st.session_state["plan_addons_cfg"] = imported_cfg
             st.session_state[addon_editor_rows_key] = [_addon_to_editor_row(x) for x in imported_clean]
+            _reset_uploader_widget("plan_addons_upload_version")
             st.success(
                 f"Imported add-ons library ({len(imported_clean)} rows saved, {skipped_rows} rows skipped)."
             )
