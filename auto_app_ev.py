@@ -6126,6 +6126,38 @@ else:
             st.caption("No-battery mode is enabled, but battery-dependent plans are included in this table (override ON).")
         else:
             st.caption("No-battery mode is enabled for this table: battery-dependent plans are excluded.")
+
+    ev_adjustment_active = bool(ev_summary.get("enabled", False))
+    load_shift_adjustment_active = bool(load_shift_summary.get("enabled", False))
+    comparison_adjustments_active = ev_adjustment_active or load_shift_adjustment_active
+    comparison_source_basis = "Uploaded NEM12 dataset (raw intervals)"
+    if ev_adjustment_active and load_shift_adjustment_active:
+        comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions, then timer-based load shifting."
+        comparison_path = "Uploaded raw -> EV-adjusted -> load-shift-adjusted"
+    elif ev_adjustment_active:
+        comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions."
+        comparison_path = "Uploaded raw -> EV-adjusted"
+    elif load_shift_adjustment_active:
+        comparison_basis = "Uploaded NEM12 dataset adjusted by timer-based load shifting."
+        comparison_path = "Uploaded raw -> load-shift-adjusted"
+    else:
+        comparison_basis = comparison_source_basis
+        comparison_path = "Uploaded raw only"
+    if comparison_adjustments_active:
+        st.caption(f"Source interval basis: {comparison_source_basis}.")
+        st.caption(f"Current comparison basis: {comparison_basis}")
+        if ev_adjustment_active:
+            st.caption(
+                f"EV adjustment summary: requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"solar diverted {float(ev_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh."
+            )
+        if load_shift_adjustment_active:
+            st.caption(
+                f"Load-shift summary: shifted {float(load_shift_summary.get('shifted_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"solar absorbed {float(load_shift_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"grid top-up {float(load_shift_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh."
+            )
     
     comparison_plans = list(plans)
     excluded_battery_dependent_plans: list[tuple[Plan, str]] = []
@@ -6144,7 +6176,8 @@ else:
     
     rows = []
     net_total_col = "Net Total including add-ons and one off credits ($)"
-    base_totals_by_plan = {}
+    uploaded_totals_by_plan = {}
+    ev_only_totals_by_plan = {}
     comparison_battery_context_kwh = (
         float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
         if bool(has_home_battery)
@@ -6206,15 +6239,24 @@ else:
         cached_rows = comparison_cache.get("rows", [])
         if isinstance(cached_rows, list):
             rows = [dict(r) for r in cached_rows if isinstance(r, dict)]
-        cached_totals = comparison_cache.get("base_totals_by_plan", {})
-        if isinstance(cached_totals, dict):
+        cached_uploaded_totals = comparison_cache.get("uploaded_totals_by_plan", {})
+        if isinstance(cached_uploaded_totals, dict):
             safe_totals: dict[str, float] = {}
-            for k, v in cached_totals.items():
+            for k, v in cached_uploaded_totals.items():
                 try:
                     safe_totals[str(k)] = float(v)
                 except Exception:
                     continue
-            base_totals_by_plan = safe_totals
+            uploaded_totals_by_plan = safe_totals
+        cached_ev_totals = comparison_cache.get("ev_only_totals_by_plan", {})
+        if isinstance(cached_ev_totals, dict):
+            safe_ev_totals: dict[str, float] = {}
+            for k, v in cached_ev_totals.items():
+                try:
+                    safe_ev_totals[str(k)] = float(v)
+                except Exception:
+                    continue
+            ev_only_totals_by_plan = safe_ev_totals
     else:
         for p in comparison_plans:
             sim = simulate_plan(
@@ -6223,16 +6265,25 @@ else:
                 include_signup_credit=True,
                 battery_kwh_context=comparison_battery_context_kwh,
             )
-            if ev_summary.get("enabled"):
-                sim_base = simulate_plan(
+            if comparison_adjustments_active:
+                sim_uploaded = simulate_plan(
                     df_int_base,
                     p,
                     include_signup_credit=True,
                     battery_kwh_context=comparison_battery_context_kwh,
                 )
-                base_total_cents = float(sim_base.get("total_cents", 0.0))
-                base_signup_credit_cents = float(sim_base.get("signup_credit_cents_applied", 0.0))
-                base_totals_by_plan[p.name] = (base_total_cents + base_signup_credit_cents) / 100.0
+                uploaded_total_cents = float(sim_uploaded.get("total_cents", 0.0))
+                uploaded_signup_credit_cents = float(sim_uploaded.get("signup_credit_cents_applied", 0.0))
+                uploaded_totals_by_plan[p.name] = (uploaded_total_cents + uploaded_signup_credit_cents) / 100.0
+                sim_ev_only = simulate_plan(
+                    df_int_ev,
+                    p,
+                    include_signup_credit=True,
+                    battery_kwh_context=comparison_battery_context_kwh,
+                )
+                ev_total_cents = float(sim_ev_only.get("total_cents", 0.0))
+                ev_signup_credit_cents = float(sim_ev_only.get("signup_credit_cents_applied", 0.0))
+                ev_only_totals_by_plan[p.name] = (ev_total_cents + ev_signup_credit_cents) / 100.0
     
             general_kwh = float(sim["general_kwh"])
             controlled_kwh = float(sim["controlled_kwh"])
@@ -6325,7 +6376,8 @@ else:
         st.session_state["comparison_results_cache"] = {
             "signature": comparison_signature_hash,
             "rows": rows,
-            "base_totals_by_plan": base_totals_by_plan,
+            "uploaded_totals_by_plan": uploaded_totals_by_plan,
+            "ev_only_totals_by_plan": ev_only_totals_by_plan,
         }
     
     res = pd.DataFrame(rows)
@@ -6446,25 +6498,39 @@ else:
         _show_comparison_with_frozen_plan(res_display, plan_col="Plan")
         st.caption("Sign-up credits are excluded from 'Total ($)' and 'Effective Rate (c/kWh)' for comparison purposes.")
     
-    if ev_summary.get("enabled") and base_totals_by_plan:
-        st.markdown("#### EV impact vs no-EV baseline")
-        st.caption("Positive EV impact means the bill increased after adding EV charging assumptions.")
-        ev_delta = res[[
-            "Plan",
-            "Total ($)",
-            "Import kWh (E1+E2)",
-            "Export kWh (B1)",
-        ]].copy()
-        ev_delta["Total without EV ($)"] = ev_delta["Plan"].map(base_totals_by_plan)
-        ev_delta["EV impact ($)"] = (ev_delta["Total ($)"] - ev_delta["Total without EV ($)"]).round(2)
-        ev_delta = ev_delta.rename(
-            columns={
-                "Total ($)": "Total with EV ($)",
-                "Import kWh (E1+E2)": "Import with EV (kWh)",
-                "Export kWh (B1)": "Export with EV (kWh)",
-            }
+    if comparison_adjustments_active and uploaded_totals_by_plan:
+        st.markdown("#### Dataset adjustment impact vs uploaded data")
+        st.caption(
+            "Positive impacts mean the adjusted interval dataset increased the bill for that plan. "
+            "These deltas use base plan totals only (before add-on ranking adjustments)."
         )
-        _show_table(ev_delta, use_container_width=True)
+        adjustment_delta = pd.DataFrame({"Plan": res["Plan"].astype(str)})
+        adjustment_delta["Total uploaded data ($)"] = adjustment_delta["Plan"].map(uploaded_totals_by_plan)
+        if ev_adjustment_active:
+            adjustment_delta["Total with EV only ($)"] = adjustment_delta["Plan"].map(ev_only_totals_by_plan)
+            adjustment_delta["EV impact ($)"] = (
+                adjustment_delta["Total with EV only ($)"] - adjustment_delta["Total uploaded data ($)"]
+            ).round(2)
+        current_total_label = (
+            "Total with EV + load shift ($)"
+            if (ev_adjustment_active and load_shift_adjustment_active)
+            else ("Total with load shift ($)" if load_shift_adjustment_active else "Total with current adjustments ($)")
+        )
+        adjustment_delta[current_total_label] = (
+            adjustment_delta["Plan"].map(
+                {str(r["Plan"]): float(r["Total ($)"]) for _, r in res.iterrows()}
+            )
+        )
+        if load_shift_adjustment_active:
+            load_shift_baseline_col = "Total with EV only ($)" if ev_adjustment_active else "Total uploaded data ($)"
+            adjustment_delta["Load shift impact ($)"] = (
+                adjustment_delta[current_total_label] - adjustment_delta[load_shift_baseline_col]
+            ).round(2)
+        if ev_adjustment_active and load_shift_adjustment_active:
+            adjustment_delta["Total adjustment vs uploaded ($)"] = (
+                adjustment_delta[current_total_label] - adjustment_delta["Total uploaded data ($)"]
+            ).round(2)
+        _show_table(adjustment_delta, use_container_width=True)
     
     winner = res.iloc[0]["Plan"]
     st.success(f"Cheapest for this dataset: **{winner}**")
@@ -6600,6 +6666,9 @@ else:
                 {"Metric": "Days covered", "Value": int(days_in_data)},
                 {"Metric": "Intervals seen", "Value": f"{interval_count_report:,}"},
                 {"Metric": "Approx completeness", "Value": f"{completeness_pct_report:.1f}%"},
+                {"Metric": "Source interval basis", "Value": comparison_source_basis},
+                {"Metric": "Comparison interval basis", "Value": comparison_basis},
+                {"Metric": "Adjustment path", "Value": comparison_path},
                 {"Metric": "EV scenario applied", "Value": ("Yes" if bool(ev_summary.get("enabled", False)) else "No")},
                 {"Metric": "Load shift applied", "Value": ("Yes" if bool(load_shift_summary.get("enabled", False)) else "No")},
                 {"Metric": "Solar source", "Value": solar_source_report},
@@ -6668,6 +6737,9 @@ else:
             f"- Days covered: {int(days_in_data)}",
             f"- Intervals seen: {interval_count_report:,}",
             f"- Approx completeness: {completeness_pct_report:.1f}%",
+            f"- Source interval basis: {comparison_source_basis}",
+            f"- Comparison interval basis: {comparison_basis}",
+            f"- Adjustment path: {comparison_path}",
             f"- EV scenario applied: {'Yes' if bool(ev_summary.get('enabled', False)) else 'No'}",
             f"- Load shift applied: {'Yes' if bool(load_shift_summary.get('enabled', False)) else 'No'}",
             f"- Solar source: {solar_source_report}",
@@ -6679,6 +6751,22 @@ else:
             f"- Peak demand (30-min avg): {float(max_demand_30):,.2f} kW",
             f"- Peak demand (5-min): {float(max_demand_5):,.2f} kW",
             f"- TOU exposure (winner plan): {tou_profile_report}",
+            "",
+            "## Dataset adjustments",
+            (
+                f"- EV adjustment: requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"solar diverted {float(ev_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh."
+                if ev_adjustment_active
+                else "- EV adjustment: not applied."
+            ),
+            (
+                f"- Load shift adjustment: shifted {float(load_shift_summary.get('shifted_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"solar absorbed {float(load_shift_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh; "
+                f"grid top-up {float(load_shift_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh."
+                if load_shift_adjustment_active
+                else "- Load shift adjustment: not applied."
+            ),
             "",
             "## Action checklist",
             f"- Confirm and verify conditions for {winner}.",

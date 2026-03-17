@@ -126,7 +126,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "flat": null,
     "tou": {
       "bands": [
@@ -264,7 +264,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": false,
+    "include_in_outputs": true,
     "flat": {
       "cents_per_kwh": 28.39
     },
