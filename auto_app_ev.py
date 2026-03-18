@@ -1097,6 +1097,61 @@ def _norm_discount_scope(s: str) -> str:
     return "none"
 
 
+PLAN_METER_TYPE_LABELS = {
+    "all": "All Meters",
+    "basic": "Basic Meter",
+    "smart": "Smart Meter",
+}
+CURRENT_METER_TYPE_LABELS = {
+    "unknown": "Unknown / not set",
+    "all": "All Meters",
+    "basic": "Basic Meter",
+    "smart": "Smart Meter",
+}
+
+
+def _norm_plan_meter_type(value) -> str:
+    t = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if t in ("basic", "basic_meter"):
+        return "basic"
+    if t in ("smart", "smart_meter"):
+        return "smart"
+    return "all"
+
+
+def _norm_current_meter_type(value) -> str:
+    t = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if t in ("basic", "basic_meter"):
+        return "basic"
+    if t in ("smart", "smart_meter"):
+        return "smart"
+    if t in ("all", "all_meters"):
+        return "all"
+    return "unknown"
+
+
+def _plan_meter_type_label(value) -> str:
+    return PLAN_METER_TYPE_LABELS.get(_norm_plan_meter_type(value), "All Meters")
+
+
+def _current_meter_type_label(value) -> str:
+    return CURRENT_METER_TYPE_LABELS.get(_norm_current_meter_type(value), "Unknown / not set")
+
+
+def _default_plan_meter_type_value(import_type: str, demand_enabled: bool = False, has_fit_tou: bool = False) -> str:
+    if str(import_type or "").strip().lower() == "tou" or bool(demand_enabled) or bool(has_fit_tou):
+        return "smart"
+    return "all"
+
+
+def _default_plan_meter_type_from_dict(d: dict) -> str:
+    return _default_plan_meter_type_value(
+        import_type=str(d.get("import_type", "flat")),
+        demand_enabled=bool(d.get("demand_enabled", False)),
+        has_fit_tou=bool(d.get("feed_in_tou")),
+    )
+
+
 def _parse_iso_date(value) -> Optional[dt.date]:
     """Parse a date-like value into a date (YYYY-MM-DD), or None if invalid/blank."""
     if value is None:
@@ -1483,6 +1538,7 @@ class Plan:
     monthly_fee_cents: float = 0.0
     signup_credit_cents: float = 0.0
     signup_credit_expiry: Optional[str] = None  # YYYY-MM-DD (optional); expired credits are not applied
+    connection_fee_cents: float = 0.0  # one-time connection / establishment fee
     demand_enabled: bool = False
     demand_cents_per_kw_day: float = 0.0
     demand_window_minutes: int = 30
@@ -1493,6 +1549,7 @@ class Plan:
     discount_pct: float = 0.0
     discount_applies_to: str = "none"  # none | usage | usage_and_supply
     include_in_outputs: bool = True
+    meter_type: str = "all"  # all | basic | smart
 
 
 def _signup_credit_is_active(plan: Plan, as_of_date: Optional[dt.date] = None) -> bool:
@@ -1509,6 +1566,10 @@ def _signup_credit_is_active(plan: Plan, as_of_date: Optional[dt.date] = None) -
 def _signup_credit_available_cents(plan: Plan, as_of_date: Optional[dt.date] = None) -> float:
     configured = float(getattr(plan, "signup_credit_cents", 0.0) or 0.0)
     return configured if _signup_credit_is_active(plan, as_of_date=as_of_date) else 0.0
+
+
+def _connection_fee_available_cents(plan: Plan) -> float:
+    return max(float(getattr(plan, "connection_fee_cents", 0.0) or 0.0), 0.0)
 
 
 def _has_flat_daily_block(plan: Plan) -> bool:
@@ -1615,6 +1676,7 @@ def _plan_to_dict(p: Plan) -> dict:
         "monthly_fee_cents": p.monthly_fee_cents,
         "signup_credit_cents": p.signup_credit_cents,
         "signup_credit_expiry": _norm_iso_date_or_none(getattr(p, "signup_credit_expiry", None)),
+        "connection_fee_cents": float(getattr(p, "connection_fee_cents", 0.0) or 0.0),
         "demand_enabled": bool(getattr(p, "demand_enabled", False)),
         "demand_cents_per_kw_day": float(getattr(p, "demand_cents_per_kw_day", 0.0) or 0.0),
         "demand_window_minutes": int(getattr(p, "demand_window_minutes", 30) or 30),
@@ -1625,6 +1687,7 @@ def _plan_to_dict(p: Plan) -> dict:
         "discount_pct": float(p.discount_pct or 0.0),
         "discount_applies_to": _norm_discount_scope(getattr(p, "discount_applies_to", "none")),
         "include_in_outputs": bool(getattr(p, "include_in_outputs", True)),
+        "meter_type": _norm_plan_meter_type(getattr(p, "meter_type", "all")),
         "flat": {"cents_per_kwh": p.flat.cents_per_kwh} if p.flat else None,
         "tou": {"bands": [b.__dict__ for b in p.tou.bands]} if p.tou else None,
         "flat_daily_block": {
@@ -1691,6 +1754,7 @@ def _dict_to_plan(d: dict) -> Plan:
         monthly_fee_cents=float(d.get("monthly_fee_cents", 0.0)),
         signup_credit_cents=float(d.get("signup_credit_cents", 0.0)),
         signup_credit_expiry=_norm_iso_date_or_none(d.get("signup_credit_expiry", None)),
+        connection_fee_cents=max(float(d.get("connection_fee_cents", 0.0) or 0.0), 0.0),
         demand_enabled=bool(d.get("demand_enabled", False)),
         demand_cents_per_kw_day=max(float(d.get("demand_cents_per_kw_day", 0.0) or 0.0), 0.0),
         demand_window_minutes=max(int(float(d.get("demand_window_minutes", 30) or 30)), 1),
@@ -1701,6 +1765,7 @@ def _dict_to_plan(d: dict) -> Plan:
         discount_pct=max(min(float(d.get("discount_pct", 0.0) or 0.0), 100.0), 0.0),
         discount_applies_to=_norm_discount_scope(d.get("discount_applies_to", "none")),
         include_in_outputs=bool(d.get("include_in_outputs", True)),
+        meter_type=_norm_plan_meter_type(d.get("meter_type", _default_plan_meter_type_from_dict(d))),
     )
 
 
@@ -1720,7 +1785,7 @@ def load_plans(defaults: list[Plan]) -> list[Plan]:
         }
         return defaults
 
-    raw = PLANS_FILE.read_text(encoding="utf-8")
+    raw = PLANS_FILE.read_text(encoding="utf-8-sig")
 
     try:
         data = json.loads(raw)
@@ -1791,6 +1856,15 @@ def save_plans(plans: list[Plan]) -> None:
     PLANS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _file_signature(path: Path) -> str:
+    try:
+        if not path.exists():
+            return "missing"
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return "unreadable"
+
+
 def _uploader_widget_key(counter_state_key: str, prefix: str) -> str:
     counter = int(st.session_state.get(counter_state_key, 0) or 0)
     return f"{prefix}_{counter}"
@@ -1842,7 +1916,7 @@ def load_battery_assumptions_config() -> dict:
         }
         return defaults
 
-    raw = BATTERY_ASSUMPTIONS_FILE.read_text(encoding="utf-8")
+    raw = BATTERY_ASSUMPTIONS_FILE.read_text(encoding="utf-8-sig")
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -2002,7 +2076,7 @@ def load_plan_addons_config() -> dict:
         }
         return defaults
 
-    raw = PLAN_ADDONS_FILE.read_text(encoding="utf-8")
+    raw = PLAN_ADDONS_FILE.read_text(encoding="utf-8-sig")
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -2099,6 +2173,8 @@ ORIGIN = Plan(
     controlled_cents_per_kwh=17.765,
     # NOTE: default tier based on your earlier statement; adjust in Plan Library as needed
     feed_in_tiered=TieredFiT(high_rate_cents=10.0, high_kwh_per_day=10.0, low_rate_cents=3.0),
+    connection_fee_cents=0.0,
+    meter_type="all",
 )
 
 ALINTA = Plan(
@@ -2118,6 +2194,8 @@ ALINTA = Plan(
     ]),
     controlled_cents_per_kwh=15.323,
     feed_in_flat_cents_per_kwh=4.0,
+    connection_fee_cents=0.0,
+    meter_type="smart",
 )
 
 
@@ -2388,6 +2466,33 @@ def _battery_dependent_plan_reason(plan: Plan) -> str | None:
     return None
 
 
+def _optimizer_plan_pool_for_meter_type(
+    plans: list[Plan],
+    current_meter_type,
+    include_meter_ineligible_battery: bool = False,
+) -> dict:
+    current = _norm_current_meter_type(current_meter_type)
+    eligible: list[Plan] = []
+    excluded: list[tuple[Plan, str, str | None]] = []
+    override_added: list[tuple[Plan, str, str]] = []
+    for plan in list(plans or []):
+        meter_reason = _meter_type_exclusion_reason(plan, current)
+        if not meter_reason:
+            eligible.append(plan)
+            continue
+        battery_reason = _battery_dependent_plan_reason(plan)
+        if bool(include_meter_ineligible_battery) and battery_reason:
+            eligible.append(plan)
+            override_added.append((plan, meter_reason, battery_reason))
+        else:
+            excluded.append((plan, meter_reason, battery_reason))
+    return {
+        "plans": eligible,
+        "excluded": excluded,
+        "override_added": override_added,
+    }
+
+
 def _effective_plan_for_battery_context(plan: Plan, battery_kwh_context: float | None) -> tuple[Plan, str]:
     """Return (effective_plan, fit_mode) for the provided battery context."""
     if battery_kwh_context is None:
@@ -2500,6 +2605,24 @@ def evaluate_plan_addons_for_plan(
         "eligible_labels": eligible_labels,
         "benefit": float(benefit),
     }
+
+
+def _plan_matches_current_meter_type(plan: Plan, current_meter_type) -> bool:
+    current = _norm_current_meter_type(current_meter_type)
+    if current in ("unknown", "all"):
+        return True
+    plan_meter_type = _norm_plan_meter_type(getattr(plan, "meter_type", "all"))
+    return plan_meter_type in ("all", current)
+
+
+def _meter_type_exclusion_reason(plan: Plan, current_meter_type) -> str:
+    current = _norm_current_meter_type(current_meter_type)
+    if current in ("unknown", "all"):
+        return ""
+    if _plan_matches_current_meter_type(plan, current):
+        return ""
+    plan_meter_type = _norm_plan_meter_type(getattr(plan, "meter_type", "all"))
+    return f"Plan is limited to {_plan_meter_type_label(plan_meter_type)}"
 
 
 def _flat_plan_uses_single_import_rate(plan: Plan) -> bool:
@@ -2627,6 +2750,7 @@ def simulate_plan(
     battery_kwh_context: float | None = None,
 ) -> dict:
     signup_credit_cents_available = _signup_credit_available_cents(plan)
+    connection_fee_cents_available = _connection_fee_available_cents(plan)
     if df_intervals.empty:
         return {
             "days": 0,
@@ -2648,6 +2772,8 @@ def simulate_plan(
             "signup_credit_cents_applied": 0.0,
             "signup_credit_expiry": _norm_iso_date_or_none(getattr(plan, "signup_credit_expiry", None)),
             "signup_credit_active": bool(signup_credit_cents_available > 0.0),
+            "connection_fee_cents_available": float(connection_fee_cents_available),
+            "connection_fee_cents_applied": 0.0,
             "discount_usage_cents": 0.0,
             "discount_supply_cents": 0.0,
             "discount_total_cents": 0.0,
@@ -2710,6 +2836,8 @@ def simulate_plan(
     monthly_fee_cents = float(plan_eff.monthly_fee_cents or 0.0) * (n_days / 30.4375)
     signup_credit_cents_available = _signup_credit_available_cents(plan_eff)
     signup_credit_cents_applied = signup_credit_cents_available if include_signup_credit else 0.0
+    connection_fee_cents_available = _connection_fee_available_cents(plan_eff)
+    connection_fee_cents_applied = connection_fee_cents_available if include_signup_credit else 0.0
     demand_res = _compute_demand_charge_for_plan(df_intervals, plan_eff, n_days=n_days)
     demand_cents = float(demand_res.get("demand_cents", 0.0) or 0.0)
 
@@ -2771,6 +2899,7 @@ def simulate_plan(
         + monthly_fee_cents
         + general_cents
         + controlled_cents
+        + connection_fee_cents_applied
         - export_credit_cents
         - signup_credit_cents_applied
     )
@@ -2913,6 +3042,14 @@ def simulate_plan(
             "rate": -(signup_credit_cents_applied / 100.0),
             "amount": -(signup_credit_cents_applied / 100.0),
         })
+    if connection_fee_cents_applied > 0:
+        line_items.append({
+            "item": "One-time Connection Fee",
+            "qty": 1,
+            "unit": "fee",
+            "rate": connection_fee_cents_applied / 100.0,
+            "amount": connection_fee_cents_applied / 100.0,
+        })
 
     return {
         "days": n_days,
@@ -2934,6 +3071,8 @@ def simulate_plan(
         "signup_credit_cents_applied": signup_credit_cents_applied,
         "signup_credit_expiry": _norm_iso_date_or_none(getattr(plan_eff, "signup_credit_expiry", None)),
         "signup_credit_active": bool(signup_credit_cents_available > 0.0),
+        "connection_fee_cents_available": connection_fee_cents_available,
+        "connection_fee_cents_applied": connection_fee_cents_applied,
         "discount_usage_cents": usage_discount_cents,
         "discount_supply_cents": supply_discount_cents,
         "discount_total_cents": discount_total_cents,
@@ -4684,8 +4823,8 @@ def simulate_plan_with_battery(
       2) convert to wide, dispatch battery, convert back to long
       3) simulate adjusted on long-format
 
-    One-time plan sign-up credits are excluded from this model so NPV/IRR are not distorted
-    by non-recurring switching incentives.
+    One-time plan credits and connection fees are excluded from this model so NPV/IRR are not distorted
+    by non-recurring switching adjustments.
     """
     # Baseline (no battery) can be injected by callers during sweeps to avoid recomputation.
     baseline_sim = (
@@ -4985,8 +5124,8 @@ def render_help_and_glossary() -> None:
 
     with st.expander("How to interpret key outputs", expanded=False):
         st.markdown(
-            "- `Total ($)`: Estimated total bill over the dataset period (GST inclusive), excluding one-time sign-up credit.\n"
-            "- `Effective Rate (c/kWh)`: Total bill (excluding one-time sign-up credit) divided by total imported kWh.\n"
+            "- `Total ($)`: Estimated total bill over the dataset period (GST inclusive), excluding one-time plan adjustments such as sign-up credits and connection fees.\n"
+            "- `Effective Rate (c/kWh)`: Total bill (excluding one-time plan adjustments) divided by total imported kWh.\n"
             "- `Avg import rate excl supply (c/kWh)`: Usage-only import charges divided by total imported kWh (E1+E2), excluding fixed daily charges and FiT credits.\n"
             "- `FiT credit ($)`: Credit for exported energy based on plan feed-in settings.\n"
             "- `Supply ($)`: Total daily fixed charges over the period, including both main and controlled supply where applicable.\n"
@@ -4995,8 +5134,8 @@ def render_help_and_glossary() -> None:
             "- `Max demand (30-min avg)`: Highest rolling 30-minute average import demand."
         )
         st.caption(
-            "Sign-up credits are shown separately in Comparison, excluded from `Total ($)`, and included in "
-            "`Net Total including add-ons and one off credits ($)`. Forecast and optimizer modelling excludes them."
+            "One-time plan adjustments are shown separately in Comparison, excluded from `Total ($)`, and included in "
+            "`Net Total including add-ons and one off plan adjustments ($)`. Forecast and optimizer modelling excludes them."
         )
 
     with st.expander("Screen-by-screen guide", expanded=False):
@@ -5148,16 +5287,28 @@ if regs:
 
 # Load plan library into session
 defaults = [ORIGIN, ALINTA]
-if "plans_lib" not in st.session_state:
+plans_file_signature = _file_signature(PLANS_FILE)
+if (
+    "plans_lib" not in st.session_state
+    or str(st.session_state.get("_plans_file_signature", "")) != str(plans_file_signature)
+):
     st.session_state["plans_lib"] = load_plans(defaults)
+    st.session_state["_plans_file_signature"] = _file_signature(PLANS_FILE)
 if "battery_assumptions_cfg" not in st.session_state:
     st.session_state["battery_assumptions_cfg"] = load_battery_assumptions_config()
 if "plan_addons_cfg" not in st.session_state:
     st.session_state["plan_addons_cfg"] = load_plan_addons_config()
+if "current_setup_meter_type" not in st.session_state:
+    st.session_state["current_setup_meter_type"] = "unknown"
+else:
+    st.session_state["current_setup_meter_type"] = _norm_current_meter_type(
+        st.session_state.get("current_setup_meter_type", "unknown")
+    )
 
 all_plans = st.session_state["plans_lib"]
 battery_assumptions_cfg = st.session_state["battery_assumptions_cfg"]
 plan_addons_cfg = st.session_state["plan_addons_cfg"]
+current_setup_meter_type = _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "unknown"))
 
 # Back-compat alias (some sections refer to `plans_lib`)
 plans_lib = all_plans
@@ -5169,14 +5320,31 @@ if not all_plans:
 plans_lib = all_plans
 
 # Only included plans are used across app outputs; Plan Library still shows full list.
-included_plan_count_actual = sum(1 for p in all_plans if bool(getattr(p, "include_in_outputs", True)))
-plans = [p for p in all_plans if bool(getattr(p, "include_in_outputs", True))]
+included_plans_all = [p for p in all_plans if bool(getattr(p, "include_in_outputs", True))]
+included_plan_count_actual = len(included_plans_all)
+plans = list(included_plans_all)
 if not plans and all_plans:
     plans = [all_plans[0]]
     st.warning(
         "No plans are currently marked as included in outputs. "
         f"Temporarily using '{all_plans[0].name}'. Re-enable plans in Plan Library."
     )
+excluded_meter_limited_plans: list[tuple[Plan, str]] = []
+if plans and current_setup_meter_type in ("basic", "smart"):
+    eligible_plans: list[Plan] = []
+    for _plan in plans:
+        _reason = _meter_type_exclusion_reason(_plan, current_setup_meter_type)
+        if _reason:
+            excluded_meter_limited_plans.append((_plan, _reason))
+        else:
+            eligible_plans.append(_plan)
+    if eligible_plans:
+        plans = eligible_plans
+    else:
+        excluded_meter_limited_plans = []
+        st.warning(
+            "No plans remained after meter-type filtering, so all currently included plans are shown."
+        )
 plans_lib = plans
 
 if show_overview_only or show_plan_library_only:
@@ -5198,6 +5366,14 @@ if show_overview_only or show_plan_library_only:
             f"Loaded {LAST_PLANS_LOAD_STATUS.get('count', len(plans))} plans from file; "
             f"skipped {LAST_PLANS_LOAD_STATUS.get('skipped', 0)} invalid entries."
         )
+    if current_setup_meter_type in ("basic", "smart"):
+        st.caption(
+            f"Current meter type filter: {_current_meter_type_label(current_setup_meter_type)}."
+        )
+        if excluded_meter_limited_plans:
+            st.info(
+                f"Excluded {len(excluded_meter_limited_plans)} included plan(s) from active outputs due to meter type."
+            )
 
     if LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("source") != "file":
         reason = str(LAST_BATTERY_ASSUMPTIONS_LOAD_STATUS.get("reason", "unknown")).replace("_", " ")
@@ -5248,7 +5424,7 @@ if show_plan_library_only and not uploaded:
     )
     if quick_uploaded_plans is not None:
         try:
-            quick_data = json.loads(quick_uploaded_plans.getvalue().decode("utf-8"))
+            quick_data = json.loads(quick_uploaded_plans.getvalue().decode("utf-8-sig"))
             quick_imported = [_dict_to_plan(x) for x in quick_data]
             st.session_state["plans_lib"] = quick_imported
             save_plans(quick_imported)
@@ -5276,7 +5452,7 @@ if show_plan_library_only and not uploaded:
     )
     if quick_uploaded_addons is not None:
         try:
-            quick_raw_addons = json.loads(quick_uploaded_addons.getvalue().decode("utf-8"))
+            quick_raw_addons = json.loads(quick_uploaded_addons.getvalue().decode("utf-8-sig"))
             if not isinstance(quick_raw_addons, dict):
                 raise ValueError("plan_addons.json must be a JSON object with an 'addons' list.")
             quick_rows_raw = quick_raw_addons.get("addons")
@@ -5698,6 +5874,23 @@ with st.sidebar.expander("Current setup profile", expanded=False):
         "Used to prefill What-if inputs and assess add-on eligibility only (does not alter interval data). "
         "Battery size defaults to 0 kWh when home battery is off, and can still be overridden."
     )
+    st.selectbox(
+        "Current meter type",
+        options=["unknown", "basic", "smart", "all"],
+        index=["unknown", "basic", "smart", "all"].index(
+            _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "unknown"))
+        ),
+        format_func=_current_meter_type_label,
+        key="current_setup_meter_type",
+        help=(
+            "When set to Basic or Smart, plans limited to a different meter type are excluded from "
+            "comparison and other active output lists. All Meters and Unknown leave plans unfiltered."
+        ),
+    )
+    if excluded_meter_limited_plans and _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "unknown")) in ("basic", "smart"):
+        st.caption(
+            f"{len(excluded_meter_limited_plans)} included plan(s) are currently hidden by the meter-type filter."
+        )
     st.number_input(
         "Current solar size (kW)",
         min_value=0.0,
@@ -6125,13 +6318,13 @@ else:
     st.caption(
         "Effective import (c/kWh) includes fixed charges and nets off FiT credit. "
         "Demand charges are included when enabled on a plan. "
-        "One-time sign-up credits are excluded from this c/kWh metric. "
+        "One-time sign-up credits and connection fees are excluded from this c/kWh metric. "
         "Avg import rate excl supply is usage-only import charges divided by import kWh (excludes fixed charges and FiT credits)."
     )
     st.caption(
-        "`Total ($)` excludes one-time sign-up credit. "
-        "`Net Total including add-ons and one off credits ($)` includes one-time sign-up credit and add-on value. "
-        "Forecast and optimizer modelling excludes sign-up credit."
+        "`Total ($)` excludes one-time plan adjustments such as sign-up credits and connection fees. "
+        "`Net Total including add-ons and one off plan adjustments ($)` includes those one-off plan adjustments and add-on value. "
+        "Forecast and optimizer modelling excludes one-time plan adjustments."
     )
     if not bool(has_home_battery):
         if bool(include_battery_dependent_in_comparison):
@@ -6187,7 +6380,7 @@ else:
             st.warning("No plans remained after filtering, so all plans are shown.")
     
     rows = []
-    net_total_col = "Net Total including add-ons and one off credits ($)"
+    net_total_col = "Net Total including add-ons and one off plan adjustments ($)"
     uploaded_totals_by_plan = {}
     ev_only_totals_by_plan = {}
     comparison_battery_context_kwh = (
@@ -6286,7 +6479,10 @@ else:
                 )
                 uploaded_total_cents = float(sim_uploaded.get("total_cents", 0.0))
                 uploaded_signup_credit_cents = float(sim_uploaded.get("signup_credit_cents_applied", 0.0))
-                uploaded_totals_by_plan[p.name] = (uploaded_total_cents + uploaded_signup_credit_cents) / 100.0
+                uploaded_connection_fee_cents = float(sim_uploaded.get("connection_fee_cents_applied", 0.0))
+                uploaded_totals_by_plan[p.name] = (
+                    uploaded_total_cents + uploaded_signup_credit_cents - uploaded_connection_fee_cents
+                ) / 100.0
                 sim_ev_only = simulate_plan(
                     df_int_ev,
                     p,
@@ -6295,7 +6491,10 @@ else:
                 )
                 ev_total_cents = float(sim_ev_only.get("total_cents", 0.0))
                 ev_signup_credit_cents = float(sim_ev_only.get("signup_credit_cents_applied", 0.0))
-                ev_only_totals_by_plan[p.name] = (ev_total_cents + ev_signup_credit_cents) / 100.0
+                ev_connection_fee_cents = float(sim_ev_only.get("connection_fee_cents_applied", 0.0))
+                ev_only_totals_by_plan[p.name] = (
+                    ev_total_cents + ev_signup_credit_cents - ev_connection_fee_cents
+                ) / 100.0
     
             general_kwh = float(sim["general_kwh"])
             controlled_kwh = float(sim["controlled_kwh"])
@@ -6307,6 +6506,7 @@ else:
             import_usage_cents = float(sim.get("import_cents", general_cents + controlled_cents))
             export_credit_cents = float(sim["export_credit_cents"])
             signup_credit_cents = float(sim.get("signup_credit_cents_applied", 0.0))
+            connection_fee_cents = float(sim.get("connection_fee_cents_applied", 0.0))
             supply_cents = float(sim["supply_cents"])
             controlled_supply_cents = float(sim["controlled_supply_cents"])
             demand_cents = float(sim.get("demand_cents", 0.0) or 0.0)
@@ -6323,10 +6523,15 @@ else:
             )
             addon_benefit = float(addon_eval.get("benefit", 0.0) or 0.0)
             signup_credit_dollars = float(signup_credit_cents) / 100.0
-            # Base comparison total excludes one-off sign-up credit.
-            total_dollars = (float(total_cents) + float(signup_credit_cents)) / 100.0
-            # Final comparison total explicitly includes one-off sign-up credit and add-on benefit.
-            final_total_with_addons_and_oneoff = total_dollars - signup_credit_dollars - float(addon_benefit)
+            connection_fee_dollars = float(connection_fee_cents) / 100.0
+            # Base comparison total excludes one-off credits and fees.
+            total_dollars = (
+                float(total_cents) + float(signup_credit_cents) - float(connection_fee_cents)
+            ) / 100.0
+            # Final comparison total explicitly includes one-off plan adjustments and add-on benefit.
+            final_total_with_addons_and_oneoff = (
+                total_dollars - signup_credit_dollars + connection_fee_dollars - float(addon_benefit)
+            )
             addon_labels = addon_eval.get("eligible_labels", []) or []
             single_rate_all_import = bool(sim.get("flat_applies_to_all_import", False))
             controlled_tou_fallback = bool(sim.get("controlled_uses_general_tou_fallback", False))
@@ -6341,8 +6546,12 @@ else:
             # Usage-only average import rate (excludes daily supply charges and FiT credits).
             avg_import_ex_supply_c_per_kwh = (import_usage_cents / import_kwh) if import_kwh > 0 else 0.0
             # "Effective Rate" includes supply charges (and nets off FiT credit) per total imported kWh,
-            # but excludes one-time sign-up credits so plans are comparable on ongoing import economics.
-            effective_rate_c_per_kwh = ((total_cents + signup_credit_cents) / import_kwh) if import_kwh > 0 else 0.0
+            # but excludes one-time sign-up credits and connection fees so plans are comparable on ongoing import economics.
+            effective_rate_c_per_kwh = (
+                ((total_cents + signup_credit_cents - connection_fee_cents) / import_kwh)
+                if import_kwh > 0
+                else 0.0
+            )
             if controlled_tou_fallback:
                 e2_pricing_method = "General TOU fallback"
             elif float(p_comp_eff.controlled_cents_per_kwh or 0.0) > 0.0:
@@ -6355,6 +6564,7 @@ else:
             rows.append({
                 "Plan": p.name,
                 "Tariff type": import_tariff_type_for_plan(p_comp_eff),
+                "Meter type": _plan_meter_type_label(getattr(p, "meter_type", "all")),
                 "FiT type": fit_mode_for_plan(p),
                 "Days": days,
                 "Import kWh (E1+E2)": round(import_kwh, 3),
@@ -6380,6 +6590,7 @@ else:
                 "FiT credit ($)": round(float(sim["export_credit_cents"]) / 100.0, 2),
                 "Total ($)": round(total_dollars, 2),
                 "Sign-up credit ($)": round(signup_credit_dollars, 2),
+                "Connection fee ($)": round(connection_fee_dollars, 2),
                 "Add-on eligible programs": "; ".join(str(v) for v in addon_labels) if addon_labels else "-",
                 "Add-on benefit ($)": round(addon_benefit, 2),
                 net_total_col: round(final_total_with_addons_and_oneoff, 2),
@@ -6443,8 +6654,18 @@ else:
             )
             _show_comparison_with_frozen_plan(df_excluded, plan_col="Plan")
         st.caption(
-            "Battery and Solar Simulator tab and optimiser views still use the full plan library, including battery-dependent plans."
+            "Battery and Solar Simulator uses its own plan pool: meter-matched plans by default, with an optional upgrade-scenario override for battery-dependent plans."
         )
+    if excluded_meter_limited_plans and current_setup_meter_type in ("basic", "smart"):
+        st.info(
+            f"Excluded {len(excluded_meter_limited_plans)} meter-limited plan(s) because your current meter type is "
+            f"{_current_meter_type_label(current_setup_meter_type)}."
+        )
+        with st.expander("Show excluded meter-limited plans"):
+            df_excluded_meter = pd.DataFrame(
+                [{"Plan": pp.name, "Reason": rr} for pp, rr in excluded_meter_limited_plans]
+            )
+            _show_comparison_with_frozen_plan(df_excluded_meter, plan_col="Plan")
     
     # Highlight current retailer in displayed tables
     res_display = res.copy()
@@ -6458,7 +6679,7 @@ else:
         best_total = float(res[rank_col].iloc[0])
         best_plan = str(res["Plan"].iloc[0])
         delta = cur_total - best_total
-        rank_label = "Base bill total" if rank_col == "Total ($)" else "Net total including add-ons and one off credits"
+        rank_label = "Base bill total" if rank_col == "Total ($)" else "Net total including add-ons and one off plan adjustments"
         st.info(
             f"**Ranking basis:** {rank_label}\n\n"
             f"**Your current retailer:** {cur_name} - **${cur_total:,.2f}**\n\n"
@@ -6470,6 +6691,11 @@ else:
             f"Your current retailer ({cur_name}) is excluded from this no-battery comparison view. "
             "Enable 'Include battery-dependent plans in Comparison results' in the sidebar to include it."
         )
+    elif cur_name and any(str(pp.name) == str(cur_name) for pp, _ in excluded_meter_limited_plans):
+        st.info(
+            f"Your current retailer ({cur_name}) is excluded because your current meter type is "
+            f"{_current_meter_type_label(current_setup_meter_type)}."
+        )
     
     view = st.radio("View", ["Summary", "Detailed"], horizontal=True)
     
@@ -6477,6 +6703,7 @@ else:
         summary_front_cols = [
             "Plan",
             "Tariff type",
+            "Meter type",
             "FiT type",
             "Total ($)",
             "Supply ($)",
@@ -6485,6 +6712,7 @@ else:
             "Effective Rate (c/kWh)",
             "Demand charge ($)",
             "Sign-up credit ($)",
+            "Connection fee ($)",
             "Add-on benefit ($)",
             "Import kWh (E1+E2)",
             "Export kWh (B1)",
@@ -6498,17 +6726,18 @@ else:
             "FiT credit ($)": "FiT Credit $",
             "Demand charge ($)": "Demand Charge $",
             "Sign-up credit ($)": "Sign up Credits $*",
+            "Connection fee ($)": "Connection Fee $*",
             "Add-on benefit ($)": "Add on Benefits $",
             "Import kWh (E1+E2)": "Import kWh (E1 + E2)",
             "Export kWh (B1)": "Export kWh",
             "Effective Rate (c/kWh)": "Effective Import (c/kWh)",
         })
         _show_comparison_with_frozen_plan(summary, plan_col="Plan")
-        st.caption("\\* Sign-up credits are excluded from 'Total $' and 'Effective Import (c/kWh)' for comparison purposes.")
+        st.caption("\\* One-time plan adjustments are excluded from 'Total $' and 'Effective Import (c/kWh)' for comparison purposes.")
         st.caption("Night bonus export kWh is export volume that falls inside FiT bonus-night windows.")
     else:
         _show_comparison_with_frozen_plan(res_display, plan_col="Plan")
-        st.caption("Sign-up credits are excluded from 'Total ($)' and 'Effective Rate (c/kWh)' for comparison purposes.")
+        st.caption("One-time plan adjustments are excluded from 'Total ($)' and 'Effective Rate (c/kWh)' for comparison purposes.")
     
     if comparison_adjustments_active and uploaded_totals_by_plan:
         st.markdown("#### Dataset adjustment impact vs uploaded data")
@@ -6547,7 +6776,7 @@ else:
     winner = res.iloc[0]["Plan"]
     st.success(f"Cheapest for this dataset: **{winner}**")
     if rank_col != "Total ($)":
-        st.caption("Cheapest is based on net total including add-ons and one off sign-up credits.")
+        st.caption("Cheapest is based on net total including add-ons and one-off plan adjustments.")
     
     if len(res) >= 2:
         diff = float(res.iloc[1][rank_col]) - float(res.iloc[0][rank_col])
@@ -6840,7 +7069,7 @@ if show_battery_only:
   with tab8:
     st.subheader("Level 1: solar-only charging")
     st.caption("Simulates a behind-the-meter battery that **only charges from PV surplus (reduces export)** and discharges to offset imports during high-rate periods (no grid charging).")
-    st.caption("Battery economics and optimizer metrics exclude one-time plan sign-up credits.")
+    st.caption("Battery economics and optimizer metrics exclude one-time plan credits and connection fees.")
     if load_shift_summary.get("enabled"):
         st.info(
             "Using global hot-water / pool load shifting before battery analysis "
@@ -6848,9 +7077,61 @@ if show_battery_only:
         )
     if not bool(st.session_state.get("has_home_battery", False)):
         st.info(
-            "Battery optimiser still includes battery-only and battery-dependent plans. "
-            "No-battery filtering applies to Comparison, Risk & volatility, and Scenario & sensitivity."
+            "Battery optimiser can still assess battery-dependent plans, but meter-type filtering now applies by default. "
+            "Use the upgrade-scenario override below if you want to test meter-ineligible battery plans. "
+            "No-battery filtering still only applies to Comparison, Risk & volatility, and Scenario & sensitivity."
         )
+    optimizer_include_meter_upgrade_battery = False
+    battery_optimizer_plans = list(included_plans_all)
+    optimizer_meter_excluded_plans: list[tuple[Plan, str, str | None]] = []
+    optimizer_meter_override_added: list[tuple[Plan, str, str]] = []
+    if current_setup_meter_type in ("basic", "smart"):
+        optimizer_include_meter_upgrade_battery = st.checkbox(
+            "Include meter-ineligible battery-dependent plans for upgrade scenarios",
+            value=bool(st.session_state.get("optimizer_include_meter_upgrade_battery", False)),
+            key="optimizer_include_meter_upgrade_battery",
+            help=(
+                "Keeps the optimizer realistic by default for your current meter type, but can add back "
+                "battery-dependent plans that may be relevant if you are willing to upgrade the meter."
+            ),
+        )
+        optimizer_meter_filter = _optimizer_plan_pool_for_meter_type(
+            included_plans_all,
+            current_setup_meter_type,
+            include_meter_ineligible_battery=optimizer_include_meter_upgrade_battery,
+        )
+        battery_optimizer_plans = list(optimizer_meter_filter.get("plans", []) or [])
+        optimizer_meter_excluded_plans = list(optimizer_meter_filter.get("excluded", []) or [])
+        optimizer_meter_override_added = list(optimizer_meter_filter.get("override_added", []) or [])
+        st.caption(
+            f"Optimizer plan filter: {_current_meter_type_label(current_setup_meter_type)}."
+        )
+        if optimizer_meter_override_added:
+            st.info(
+                f"Including {len(optimizer_meter_override_added)} battery-dependent meter-ineligible plan(s) for upgrade-scenario testing."
+            )
+        elif optimizer_meter_excluded_plans:
+            st.caption(
+                f"Excluding {len(optimizer_meter_excluded_plans)} included plan(s) from the optimizer because they do not match your current meter type."
+            )
+        if optimizer_meter_override_added or optimizer_meter_excluded_plans:
+            with st.expander("Show optimizer meter-filter details", expanded=False):
+                optimizer_meter_rows: list[dict] = []
+                for pp, meter_reason, battery_reason in optimizer_meter_override_added:
+                    optimizer_meter_rows.append({
+                        "Plan": str(pp.name),
+                        "Status": "Included via upgrade override",
+                        "Meter reason": str(meter_reason),
+                        "Battery reason": str(battery_reason),
+                    })
+                for pp, meter_reason, battery_reason in optimizer_meter_excluded_plans:
+                    optimizer_meter_rows.append({
+                        "Plan": str(pp.name),
+                        "Status": "Excluded",
+                        "Meter reason": str(meter_reason),
+                        "Battery reason": (str(battery_reason) if battery_reason else "-"),
+                    })
+                _show_table(pd.DataFrame(optimizer_meter_rows), use_container_width=True)
     if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
         st.info(
             f"Using uploaded solar production file in dispatch calculations "
@@ -6860,9 +7141,9 @@ if show_battery_only:
     if df_int is None or df_int.empty:
         st.info("Upload a dataset to enable Battery and Solar Simulator.")
     else:
-        plan_names = [p.name for p in plans_lib] if plans_lib else []
+        plan_names = [p.name for p in battery_optimizer_plans] if battery_optimizer_plans else []
         if not plan_names:
-            st.info("No plans loaded.")
+            st.info("No included plans are currently eligible for the optimizer under the current meter-type settings.")
         else:
             default_plan_name = str(st.session_state.get("current_retailer", plan_names[0]) or plan_names[0])
             if default_plan_name not in plan_names:
@@ -6875,7 +7156,7 @@ if show_battery_only:
                 index=plan_names.index(str(st.session_state.get("battery_sim_plan_name", default_plan_name))),
                 key="battery_sim_plan_name",
             )
-            plan_obj = next((p for p in plans_lib if p.name == sim_plan_name), plans_lib[0])
+            plan_obj = next((p for p in battery_optimizer_plans if p.name == sim_plan_name), battery_optimizer_plans[0])
 
             ui_detail = st.radio(
                 "Input detail",
@@ -7297,6 +7578,9 @@ if show_battery_only:
                     else 0.0
                 ),
                 "plan_names": tuple(plan_names),
+                "optimizer_plan_names": tuple(str(p.name) for p in battery_optimizer_plans),
+                "optimizer_current_meter_type": str(current_setup_meter_type),
+                "optimizer_include_meter_upgrade_battery": bool(optimizer_include_meter_upgrade_battery),
                 "plan_to_simulate": str(sim_plan_name),
                 "power_kw": round(float(power_kw), 4),
                 "roundtrip_eff": round(float(roundtrip_eff), 4),
@@ -7795,7 +8079,10 @@ if show_battery_only:
                         },
                         {
                             "Input group": "Plan pricing and rules",
-                            "Source used by optimizer": "Included plans from Plan Library (TOU/flat rates, FiT, supply charges, credits, battery eligibility).",
+                            "Source used by optimizer": (
+                                "Included plans from Plan Library, then filtered by current meter type for this tab. "
+                                "Optional override can add back meter-ineligible battery-dependent plans for upgrade scenarios."
+                            ),
                             "Where to change it": "Navigate > Plan Library, then edit plan fields or include/exclude plans.",
                         },
                         {
@@ -8093,24 +8380,24 @@ if show_battery_only:
                     if not joint_sizes:
                         joint_err = "No battery sizes to simulate with this range."
 
-                run_count = len(joint_sizes) * len(plans_lib) * len(joint_pv_sizes) * len(joint_load_shift_scenarios)
+                run_count = len(joint_sizes) * len(battery_optimizer_plans) * len(joint_pv_sizes) * len(joint_load_shift_scenarios)
                 if enable_solar_sweep:
                     if solar_mode == "modelled":
                         st.caption(
                             f"Estimated run size: {run_count} simulations "
-                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} modelled solar sizes x {len(joint_sizes)} battery sizes"
+                            f"({len(battery_optimizer_plans)} plans x {len(joint_pv_sizes)} modelled solar sizes x {len(joint_sizes)} battery sizes"
                             f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
                         )
                     else:
                         st.caption(
                             f"Estimated run size: {run_count} simulations "
-                            f"({len(plans_lib)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes"
+                            f"({len(battery_optimizer_plans)} plans x {len(joint_pv_sizes)} solar sizes x {len(joint_sizes)} battery sizes"
                             f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
                         )
                 else:
                     st.caption(
                         f"Estimated run size: {run_count} simulations "
-                        f"({len(plans_lib)} plans x {len(joint_sizes)} battery sizes"
+                        f"({len(battery_optimizer_plans)} plans x {len(joint_sizes)} battery sizes"
                         f"{f' x {len(joint_load_shift_scenarios)} load-shift scenarios' if len(joint_load_shift_scenarios) > 1 else ''})."
                     )
                 if run_count > 400:
@@ -8160,8 +8447,11 @@ if show_battery_only:
                                 "optimizer_scenarios": [str(rr.get("label", "")) for rr in joint_load_shift_scenarios],
                             },
                             "plans": {
-                                "included_count": int(len(plans_lib)),
-                                "included_names": [str(pp.name) for pp in plans_lib],
+                                "included_count": int(len(battery_optimizer_plans)),
+                                "included_names": [str(pp.name) for pp in battery_optimizer_plans],
+                                "meter_type": str(current_setup_meter_type),
+                                "include_meter_upgrade_battery": bool(optimizer_include_meter_upgrade_battery),
+                                "meter_override_names": [str(pp.name) for pp, _, _ in optimizer_meter_override_added],
                             },
                             "solar": {
                                 "source": str(solar_mode),
@@ -8250,7 +8540,7 @@ if show_battery_only:
                         status = st.empty()
                         progress_header.info(f"Optimise run in progress: 0/{total_steps:,} simulations complete.")
                         overall_progress_caption.caption("Elapsed 0s | ETA calculating...")
-                        plan_progress_caption.caption(f"Plans completed: 0/{len(plans_lib):,}")
+                        plan_progress_caption.caption(f"Plans completed: 0/{len(battery_optimizer_plans):,}")
 
                         pv_cases = []
                         for pv_kw in joint_pv_sizes:
@@ -8329,9 +8619,9 @@ if show_battery_only:
                         else:
                             df_current_solar_case = df_joint_base
 
-                        for plan_idx, p in enumerate(plans_lib, start=1):
-                            plan_progress.progress(float(plan_idx - 1) / float(max(len(plans_lib), 1)))
-                            plan_progress_caption.caption(f"Plans completed: {plan_idx - 1:,}/{len(plans_lib):,}")
+                        for plan_idx, p in enumerate(battery_optimizer_plans, start=1):
+                            plan_progress.progress(float(plan_idx - 1) / float(max(len(battery_optimizer_plans), 1)))
+                            plan_progress_caption.caption(f"Plans completed: {plan_idx - 1:,}/{len(battery_optimizer_plans):,}")
                             best = None
                             baseline_current_solar = simulate_plan(
                                 df_current_solar_case,
@@ -8374,13 +8664,13 @@ if show_battery_only:
                                     for size_idx, cap in enumerate(joint_sizes, start=1):
                                         if enable_solar_sweep:
                                             status.caption(
-                                                f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
+                                                f"Plan {plan_idx}/{len(battery_optimizer_plans)} ({p.name}) | "
                                                 f"solar {pv_kw:.1f} kW | load shift {load_shift_label} | "
                                                 f"battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
                                             )
                                         else:
                                             status.caption(
-                                                f"Plan {plan_idx}/{len(plans_lib)} ({p.name}) | "
+                                                f"Plan {plan_idx}/{len(battery_optimizer_plans)} ({p.name}) | "
                                                 f"load shift {load_shift_label} | "
                                                 f"battery {size_idx}/{len(joint_sizes)} ({cap:.1f} kWh)"
                                             )
@@ -8517,7 +8807,7 @@ if show_battery_only:
                                 results.append(best)
 
                         plan_progress.progress(1.0)
-                        plan_progress_caption.caption(f"Plans completed: {len(plans_lib):,}/{len(plans_lib):,}")
+                        plan_progress_caption.caption(f"Plans completed: {len(battery_optimizer_plans):,}/{len(battery_optimizer_plans):,}")
                         overall_progress.progress(1.0)
                         elapsed_seconds_total = float((dt.datetime.now() - run_started_at).total_seconds())
                         progress_header.success(
@@ -8528,7 +8818,7 @@ if show_battery_only:
                             f"Completed in {_fmt_runtime(elapsed_seconds_total)} at "
                             f"{dt.datetime.now().strftime('%H:%M:%S')}."
                         )
-                        status.caption(f"Completed {step_idx:,} simulations across {len(plans_lib):,} plan(s).")
+                        status.caption(f"Completed {step_idx:,} simulations across {len(battery_optimizer_plans):,} plan(s).")
                         joint_assumptions["simulation"]["executed_combinations"] = int(step_idx)
                         joint_assumptions["simulation"]["elapsed_seconds"] = round(
                             elapsed_seconds_total,
@@ -8596,7 +8886,7 @@ if show_battery_only:
                             try:
                                 best_row = df_joint_run.iloc[0]
                                 best_plan_name = str(best_row.get("Plan", "") or "")
-                                best_plan_obj = next((pp for pp in plans_lib if str(pp.name) == best_plan_name), None)
+                                best_plan_obj = next((pp for pp in battery_optimizer_plans if str(pp.name) == best_plan_name), None)
                                 if best_plan_obj is not None:
                                     best_solar_raw = best_row.get("Optimal solar size (kW)")
                                     if best_solar_raw is None or pd.isna(best_solar_raw):
@@ -8990,7 +9280,7 @@ if show_battery_only:
                 if load_shift_summary.get("enabled"):
                     st.caption("Global hot-water / pool load shifting from the sidebar is also applied in these scenarios.")
 
-                plan_options_whatif = [p.name for p in plans_lib] if plans_lib else []
+                plan_options_whatif = [p.name for p in battery_optimizer_plans] if battery_optimizer_plans else []
                 if not plan_options_whatif:
                     st.info("No plans loaded.")
                 else:
@@ -9301,7 +9591,7 @@ if show_battery_only:
                         ev_km_case: float,
                         use_load_shift_case: bool,
                     ) -> tuple[dict | None, str | None]:
-                        plan_case = next((p for p in plans_lib if p.name == plan_name), None)
+                        plan_case = next((p for p in battery_optimizer_plans if p.name == plan_name), None)
                         if plan_case is None:
                             return None, f"{case_name}: plan '{plan_name}' not found."
                         ev_enabled_flag = bool(ev_enabled_case)
@@ -9814,7 +10104,7 @@ if show_breakdowns_only:
     
     with tab5:
         st.subheader("Forward Projection")
-        st.caption("Forecast totals exclude one-time plan sign-up credits.")
+        st.caption("Forecast totals exclude one-time plan credits and connection fees.")
     
         horizon = st.selectbox(
             "Select forecast horizon",
@@ -10291,6 +10581,7 @@ if show_breakdowns_only:
                         "Scenario Usage ($)": round((float(sim_scn["general_cents"]) + float(sim_scn["controlled_cents"])) / 100.0, 2),
                         "Scenario FiT credit ($)": round(float(sim_scn["export_credit_cents"]) / 100.0, 2),
                         "Scenario sign-up credit ($)": round(float(sim_scn.get("signup_credit_cents_applied", 0.0)) / 100.0, 2),
+                        "Scenario connection fee ($)": round(float(sim_scn.get("connection_fee_cents_applied", 0.0)) / 100.0, 2),
                         "Scenario Days": int(sim_scn["days"]),
                         "Scenario Import (kWh)": round(float(sim_scn["general_kwh"]) + float(sim_scn["controlled_kwh"]), 1),
                         "Scenario Export (kWh)": round(float(sim_scn["export_kwh"]), 1),
@@ -10475,11 +10766,13 @@ with tab9:
             feed_in_tiered=None,
             monthly_fee_cents=0.0,
             signup_credit_cents=0.0,
+            connection_fee_cents=0.0,
             fit_requires_home_battery=False,
             fit_min_battery_kwh=0.0,
             fit_unqualified_feed_in_flat_cents_per_kwh=0.0,
             discount_pct=0.0,
             discount_applies_to="none",
+            meter_type=_default_plan_meter_type_value(new_plan_type),
         )
         plans_lib.append(new_plan)
         save_plans(plans_lib)
@@ -10557,6 +10850,28 @@ with tab9:
         key=_ek("include_in_outputs"),
         help="If off, this plan is excluded from Comparison, Breakdowns, Forecast, and optimizer outputs until re-enabled.",
     )
+    meter_type_default = _norm_plan_meter_type(
+        getattr(
+            p,
+            "meter_type",
+            _default_plan_meter_type_value(
+                getattr(p, "import_type", "flat"),
+                demand_enabled=bool(getattr(p, "demand_enabled", False)),
+                has_fit_tou=_has_fit_tou(p),
+            ),
+        )
+    )
+    meter_type = st.selectbox(
+        "Eligible meter type",
+        options=["all", "basic", "smart"],
+        index=["all", "basic", "smart"].index(meter_type_default),
+        format_func=_plan_meter_type_label,
+        key=_ek("meter_type"),
+        help=(
+            "Use this to restrict a plan to Smart Meter or Basic Meter customers when known. "
+            "All Meters leaves it eligible for every site."
+        ),
+    )
 
     import_type = st.selectbox(
         "Import type",
@@ -10591,6 +10906,15 @@ with tab9:
         format="%.2f",
         key=_ek("signup_credit"),
         help="One-off credit applied for plan-switch comparison only. Excluded from forecast and optimizer modelling. You can set an expiry date below.",
+    )
+    connection_fee_dollars = st.number_input(
+        "One-time connection fee ($)",
+        min_value=0.0,
+        value=float(getattr(p, "connection_fee_cents", 0.0) or 0.0) / 100.0,
+        step=1.0,
+        format="%.2f",
+        key=_ek("connection_fee"),
+        help="One-off plan establishment or connection fee applied in comparison only. Excluded from forecast and optimizer modelling.",
     )
     signup_credit_expiry_default = _parse_iso_date(getattr(p, "signup_credit_expiry", None))
     signup_credit_has_expiry = st.checkbox(
@@ -10983,6 +11307,7 @@ with tab9:
         monthly_fee_cents=float(monthly_fee),
         signup_credit_cents=float(signup_credit_dollars) * 100.0,
         signup_credit_expiry=(signup_credit_expiry if float(signup_credit_dollars or 0.0) > 0.0 else None),
+        connection_fee_cents=float(connection_fee_dollars) * 100.0,
         demand_enabled=bool(demand_enabled),
         demand_cents_per_kw_day=float(demand_rate_c_per_kw_day),
         demand_window_minutes=int(demand_window_minutes),
@@ -10993,6 +11318,7 @@ with tab9:
         discount_pct=float(discount_pct),
         discount_applies_to=str(discount_applies_to),
         include_in_outputs=bool(include_in_outputs),
+        meter_type=_norm_plan_meter_type(meter_type),
     )
 
     has_unsaved_changes = _plan_to_dict(preview_plan) != _plan_to_dict(p)
@@ -11049,7 +11375,7 @@ with tab9:
     )
     if uploaded_plans is not None:
         try:
-            data = json.loads(uploaded_plans.getvalue().decode("utf-8"))
+            data = json.loads(uploaded_plans.getvalue().decode("utf-8-sig"))
             imported = [_dict_to_plan(x) for x in data]
             st.session_state["plans_lib"] = imported
             save_plans(imported)
@@ -11505,7 +11831,7 @@ with tab9:
     )
     if uploaded_addons is not None:
         try:
-            raw_addons = json.loads(uploaded_addons.getvalue().decode("utf-8"))
+            raw_addons = json.loads(uploaded_addons.getvalue().decode("utf-8-sig"))
             if not isinstance(raw_addons, dict):
                 raise ValueError("plan_addons.json must be a JSON object with an 'addons' list.")
             rows_raw = raw_addons.get("addons")
