@@ -352,7 +352,7 @@ def _render_joint_optimizer_visuals(
     try:
         import matplotlib.pyplot as plt
     except Exception:
-        st.caption("Optimizer charts unavailable in this runtime.")
+        st.caption("Optimiser charts unavailable in this runtime.")
         return
 
     chart_df = df_joint.copy()
@@ -366,7 +366,7 @@ def _render_joint_optimizer_visuals(
         if col in chart_df.columns:
             chart_df[col] = pd.to_numeric(chart_df[col], errors="coerce")
 
-    st.markdown("**Optimizer visual summary**")
+    st.markdown("**Optimiser visual summary**")
     v1, v2 = st.columns(2)
 
     with v1:
@@ -587,7 +587,133 @@ def _assumptions_legend_df(
         rows.append({"Assumption": "run.timestamp", "Value": _format_report_value(run_at)})
 
     for key, val in _flatten_dict_for_report(assumptions or {}):
-        rows.append({"Assumption": str(key), "Value": _format_report_value(val)})
+            rows.append({"Assumption": str(key), "Value": _format_report_value(val)})
+    return pd.DataFrame(rows)
+
+
+def _coerce_float(value: object) -> float | None:
+    """Best-effort numeric coercion for mixed report/UI values."""
+    try:
+        num = pd.to_numeric([value], errors="coerce")[0]
+    except Exception:
+        return None
+    try:
+        if pd.isna(num):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(num)
+    except Exception:
+        return None
+
+
+def _simple_payback_years(capex: object, annual_savings: object) -> float | None:
+    """Return simple payback in years when capex and annual savings are both positive."""
+    capex_f = _coerce_float(capex)
+    annual_savings_f = _coerce_float(annual_savings)
+    if capex_f is None or annual_savings_f is None or capex_f <= 0.0 or annual_savings_f <= 0.0:
+        return None
+    return float(capex_f) / float(annual_savings_f)
+
+
+def _discounted_payback_years(cashflows: list[float], discount_rate: float) -> float | None:
+    """Return discounted payback in years for annual cashflows, or None if not recovered."""
+    if not isinstance(cashflows, list) or len(cashflows) < 2:
+        return None
+    try:
+        rate = float(discount_rate or 0.0)
+    except Exception:
+        rate = 0.0
+
+    cumulative = float(cashflows[0] or 0.0)
+    if cumulative >= 0.0:
+        return 0.0
+
+    for year_idx, cf in enumerate(cashflows[1:], start=1):
+        try:
+            discounted_cf = float(cf or 0.0) / ((((1.0 + rate) ** year_idx) if (1.0 + rate) != 0 else 1.0))
+        except Exception:
+            continue
+        prev_cumulative = cumulative
+        cumulative += discounted_cf
+        if cumulative >= 0.0 and discounted_cf > 0.0:
+            fraction = min(max((-prev_cumulative) / discounted_cf, 0.0), 1.0)
+            return float(year_idx - 1) + float(fraction)
+    return None
+
+
+def _build_joint_finance_view_df(
+    annual_savings: object,
+    battery_cost: object,
+    battery_life_years: float,
+    degradation_rate: float,
+    cycle_aware: bool,
+    efc_per_year: float,
+    cycle_life_efc: float,
+    eol_capacity_frac: float,
+    current_discount_rate: float,
+    current_price_growth_rate: float,
+    current_label: str,
+) -> pd.DataFrame:
+    """Build conservative/typical/upside battery-only finance views for the winning setup."""
+    annual_savings_f = _coerce_float(annual_savings)
+    battery_cost_f = _coerce_float(battery_cost)
+    if annual_savings_f is None or battery_cost_f is None or annual_savings_f <= 0.0 or battery_cost_f <= 0.0:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+
+    def _append_row(label: str, discount_rate_value: float, price_growth_value: float, is_current: bool = False) -> None:
+        cf_model = _build_battery_cashflows(
+            annual_savings=float(annual_savings_f),
+            batt_cost=float(battery_cost_f),
+            battery_life_years=float(battery_life_years),
+            degradation_rate=float(degradation_rate),
+            price_growth_rate=float(price_growth_value),
+            cycle_aware=bool(cycle_aware),
+            efc_per_year=float(efc_per_year),
+            cycle_life_efc=float(cycle_life_efc),
+            eol_capacity_frac=float(eol_capacity_frac),
+        )
+        cashflows = list(cf_model.get("cashflows", [-float(battery_cost_f)]))
+        npv_val = _npv(cashflows, float(discount_rate_value))
+        irr_val = _irr_bisection(cashflows)
+        discounted_payback = _discounted_payback_years(cashflows, float(discount_rate_value))
+        rows.append(
+            {
+                "View": (f"{label} (current)" if is_current else str(label)),
+                "Price growth (%/yr)": round(float(price_growth_value) * 100.0, 1),
+                "Discount rate (%/yr)": round(float(discount_rate_value) * 100.0, 1),
+                "Battery NPV ($)": round(float(npv_val), 0),
+                "IRR (%)": (round(float(irr_val) * 100.0, 1) if irr_val is not None else None),
+                "Discounted payback (yrs)": (round(float(discounted_payback), 1) if discounted_payback is not None else None),
+                "Life used in model (yrs)": round(float(cf_model.get("effective_life_years", battery_life_years) or 0.0), 1),
+            }
+        )
+
+    preset_labels = ["Conservative", "Typical", "High price growth"]
+    current_clean = str(current_label or "").strip()
+    for label in preset_labels:
+        preset = SCENARIO_PRESETS.get(label)
+        if not isinstance(preset, dict):
+            continue
+        _append_row(
+            label=label,
+            discount_rate_value=float(preset.get("discount_rate", 0.0) or 0.0),
+            price_growth_value=float(preset.get("price_growth", 0.0) or 0.0),
+            is_current=(current_clean == label),
+        )
+
+    if current_clean and current_clean not in preset_labels:
+        display_label = "Current custom" if current_clean == "Custom" else current_clean
+        _append_row(
+            label=display_label,
+            discount_rate_value=float(current_discount_rate or 0.0),
+            price_growth_value=float(current_price_growth_rate or 0.0),
+            is_current=True,
+        )
+
     return pd.DataFrame(rows)
 
 
@@ -600,7 +726,7 @@ def _build_joint_optimizer_report_markdown(
 ) -> str:
     meta = run_meta or {}
     lines = [
-        "# Optimizer Run Report",
+        "# Optimiser Run Report",
         f"Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Run ID: {meta.get('run_id', '-')}",
         "",
@@ -610,13 +736,24 @@ def _build_joint_optimizer_report_markdown(
 
     if isinstance(df_joint, pd.DataFrame) and not df_joint.empty:
         best = df_joint.iloc[0]
+        current_bill = _coerce_float(best.get("Current solar/no-battery annual bill ($/yr)"))
+        recommended_bill = _coerce_float(best.get("Estimated annual bill with battery ($/yr)"))
+        household_savings = _coerce_float(best.get("Total savings vs current solar, no battery ($/yr)"))
+        battery_savings = _coerce_float(best.get("Annualised savings ($/yr)"))
+        battery_cost = _coerce_float(best.get("Battery cost ($)")) or 0.0
+        solar_capex = _coerce_float(best.get("Incremental solar capex ($)")) or 0.0
+        load_shift_capex = _coerce_float(best.get("Load shift capex ($)")) or 0.0
+        package_capex = float(battery_cost + solar_capex + load_shift_capex)
+        package_payback = _simple_payback_years(package_capex, household_savings)
+        battery_payback = _simple_payback_years(battery_cost, battery_savings)
+
         lines.extend(
             [
                 "## Decision snapshot",
                 f"- Best plan: {best.get('Plan', '-')}",
                 f"- Best solar size: {_format_report_value(best.get('Optimal solar size (kW)'))} kW",
                 f"- Best battery size: {_format_report_value(best.get('Optimal battery (kWh)'))} kWh",
-                f"- Optimized load shift: {best.get('Load shift scenario', 'Off')}",
+                f"- Optimised load shift: {best.get('Load shift scenario', 'Off')}",
                 f"- Load-shift capex: ${float(pd.to_numeric([best.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}",
                 f"- Annual bill with battery: ${float(pd.to_numeric([best.get('Estimated annual bill with battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
                 f"- Total savings vs current solar/no battery: ${float(pd.to_numeric([best.get('Total savings vs current solar, no battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
@@ -626,6 +763,16 @@ def _build_joint_optimizer_report_markdown(
                 "",
             ]
         )
+        if current_bill is not None:
+            lines.append(f"- Current setup annual bill: ${float(current_bill):,.0f}/yr")
+        if recommended_bill is not None:
+            lines.append(f"- Recommended setup annual bill: ${float(recommended_bill):,.0f}/yr")
+        lines.append(f"- Upfront package capex: ${float(package_capex):,.0f}")
+        if package_payback is not None:
+            lines.append(f"- Simple package payback: {float(package_payback):.1f} years")
+        if battery_payback is not None:
+            lines.append(f"- Simple battery-only payback: {float(battery_payback):.1f} years")
+        lines.append("")
         best_self_cons = pd.to_numeric(
             [best.get("Est. self-consumption (solar-only, %)", None)],
             errors="coerce",
@@ -639,6 +786,33 @@ def _build_joint_optimizer_report_markdown(
         if pd.notna(best_solar_cov):
             lines.append(f"- Est. solar coverage of load (solar-only): {float(best_solar_cov):.1f}%")
         if pd.notna(best_self_cons) or pd.notna(best_solar_cov):
+            lines.append("")
+
+        econ = assumptions.get("economics", {}) if isinstance(assumptions, dict) else {}
+        run = assumptions.get("run", {}) if isinstance(assumptions, dict) else {}
+        planning_df = _build_joint_finance_view_df(
+            annual_savings=battery_savings,
+            battery_cost=battery_cost,
+            battery_life_years=float(econ.get("battery_life_years", 0.0) or 0.0),
+            degradation_rate=float(econ.get("degradation_rate", 0.0) or 0.0),
+            cycle_aware=bool(econ.get("cycle_aware", False)),
+            efc_per_year=float(_coerce_float(best.get("Cycles/yr (EFC)")) or 0.0),
+            cycle_life_efc=float(econ.get("cycle_life_efc", 0.0) or 0.0),
+            eol_capacity_frac=float(econ.get("eol_capacity_frac", 1.0) or 1.0),
+            current_discount_rate=float(econ.get("discount_rate", 0.0) or 0.0),
+            current_price_growth_rate=float(econ.get("price_growth_rate", 0.0) or 0.0),
+            current_label=str(run.get("mode_label", "") or ""),
+        )
+        if isinstance(planning_df, pd.DataFrame) and not planning_df.empty:
+            lines.append("## Battery planning view")
+            for _, rr in planning_df.iterrows():
+                lines.append(
+                    f"- {rr.get('View', '-')}: price growth {_format_report_value(rr.get('Price growth (%/yr)'))}%/yr; "
+                    f"discount rate {_format_report_value(rr.get('Discount rate (%/yr)'))}%/yr; "
+                    f"NPV ${float(pd.to_numeric([rr.get('Battery NPV ($)')], errors='coerce')[0] or 0.0):,.0f}; "
+                    f"IRR {_format_report_value(rr.get('IRR (%)'))}%; "
+                    f"discounted payback {_format_report_value(rr.get('Discounted payback (yrs)'))} yrs."
+                )
             lines.append("")
 
         lines.append("## Top plan outcomes (best config per plan)")
@@ -658,10 +832,17 @@ def _build_joint_optimizer_report_markdown(
     if isinstance(stage_df, pd.DataFrame) and not stage_df.empty and {"Scenario", "Estimated annual bill ($/yr)"}.issubset(stage_df.columns):
         lines.append("## Staged pathway")
         for _, rr in stage_df.iterrows():
-            lines.append(
-                f"- {rr.get('Scenario', '-')}: annual bill ${float(pd.to_numeric([rr.get('Estimated annual bill ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr; "
-                f"incremental capex ${float(pd.to_numeric([rr.get('Total incremental capex ($)')], errors='coerce')[0] or 0.0):,.0f}."
+            stage_parts = [
+                f"- {rr.get('Scenario', '-')}: plan {rr.get('Plan', '-')}",
+                f"annual bill ${float(pd.to_numeric([rr.get('Estimated annual bill ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
+            ]
+            savings_vs_plan_only = _coerce_float(rr.get("Savings vs Plan only ($/yr)"))
+            if savings_vs_plan_only is not None:
+                stage_parts.append(f"savings vs Plan only ${float(savings_vs_plan_only):,.0f}/yr")
+            stage_parts.append(
+                f"incremental capex ${float(pd.to_numeric([rr.get('Total incremental capex ($)')], errors='coerce')[0] or 0.0):,.0f}"
             )
+            lines.append("; ".join(stage_parts) + ".")
         lines.append("")
 
     if isinstance(df_full, pd.DataFrame) and not df_full.empty:
@@ -5226,7 +5407,7 @@ def render_help_and_glossary() -> None:
         )
         st.caption(
             "One-time plan adjustments are shown separately in Comparison, excluded from `Total ($)`, and included in "
-            "`Net Total including add-ons and one off plan adjustments ($)`. Forecast and optimizer modelling excludes them."
+            "`Net Total including add-ons and one off plan adjustments ($)`. Forecast and optimiser modelling excludes them."
         )
 
     with st.expander("Screen-by-screen guide", expanded=False):
@@ -5614,8 +5795,8 @@ if plan_names_sidebar:
 
     with st.sidebar.expander("Current Setup", expanded=False):
         st.caption(
-            "Used to prefill What-if inputs and assess add-on eligibility only (does not alter interval data). "
-            "Battery size defaults to 0 kWh when home battery is off, and can still be overridden."
+            "Used to prefill What-if inputs and assess add-on eligibility only (does not alter the underlying "
+            "interval data). Battery size defaults to 0 kWh when home battery is off, and can still be overridden."
         )
         st.selectbox(
             "Current meter type",
@@ -5846,7 +6027,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
         "Moves selected appliance energy out of the chosen source register and into a timer window across the app. "
         "Inside that window, export is reduced first and any remainder becomes general import."
     )
-    st.caption("Optional infrastructure capex below is included when the optimizer selects that load-shift scenario.")
+    st.caption("Optional infrastructure capex below is included when the optimiser selects that load-shift scenario.")
     st.markdown("**Hot water**")
     hot_water_shift_enabled = st.checkbox(
         "Shift hot water to timer window",
@@ -6425,7 +6606,7 @@ else:
     st.caption(
         "`Total ($)` excludes one-time plan adjustments such as sign-up credits and connection fees. "
         "`Net Total including add-ons and one off plan adjustments ($)` includes those one-off plan adjustments and add-on value. "
-        "Forecast and optimizer modelling excludes one-time plan adjustments."
+        "Forecast and optimiser modelling excludes one-time plan adjustments."
     )
     if not bool(has_home_battery):
         if bool(include_battery_dependent_in_comparison):
@@ -6929,7 +7110,7 @@ else:
         if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
             solar_source_report = "Uploaded profile"
         elif bool(st.session_state.get("joint_use_modelled_solar", False)):
-            solar_source_report = "Modelled profile (optimizer/what-if workflows)"
+            solar_source_report = "Modelled profile (optimiser/what-if workflows)"
 
         winner_plan_obj_report = next((pp for pp in plans if str(pp.name) == str(winner)), None)
         tou_profile_report = "Not TOU (flat-rate winner)."
@@ -7170,7 +7351,7 @@ if show_battery_only:
   with tab8:
     st.subheader("Level 1: solar-only charging")
     st.caption("Simulates a behind-the-meter battery that **only charges from PV surplus (reduces export)** and discharges to offset imports during high-rate periods (no grid charging).")
-    st.caption("Battery economics and optimizer metrics exclude one-time plan credits and connection fees.")
+    st.caption("Battery economics and optimiser metrics exclude one-time plan credits and connection fees.")
     if load_shift_summary.get("enabled"):
         st.info(
             "Using global hot-water / pool load shifting before battery analysis "
@@ -7192,7 +7373,7 @@ if show_battery_only:
             value=bool(st.session_state.get("optimizer_include_meter_upgrade_battery", False)),
             key="optimizer_include_meter_upgrade_battery",
             help=(
-                "Keeps the optimizer realistic by default for your current meter type, but can add back "
+                "Keeps the optimiser realistic by default for your current meter type, but can add back "
                 "battery-dependent plans that may be relevant if you are willing to upgrade the meter."
             ),
         )
@@ -7205,7 +7386,7 @@ if show_battery_only:
         optimizer_meter_excluded_plans = list(optimizer_meter_filter.get("excluded", []) or [])
         optimizer_meter_override_added = list(optimizer_meter_filter.get("override_added", []) or [])
         st.caption(
-            f"Optimizer plan filter: {_current_meter_type_label(current_setup_meter_type)}."
+            f"Optimiser plan filter: {_current_meter_type_label(current_setup_meter_type)}."
         )
         if optimizer_meter_override_added:
             st.info(
@@ -7213,10 +7394,10 @@ if show_battery_only:
             )
         elif optimizer_meter_excluded_plans:
             st.caption(
-                f"Excluding {len(optimizer_meter_excluded_plans)} included plan(s) from the optimizer because they do not match your current meter type."
+                f"Excluding {len(optimizer_meter_excluded_plans)} included plan(s) from the optimiser because they do not match your current meter type."
             )
         if optimizer_meter_override_added or optimizer_meter_excluded_plans:
-            with st.expander("Show optimizer meter-filter details", expanded=False):
+            with st.expander("Show optimiser meter-filter details", expanded=False):
                 optimizer_meter_rows: list[dict] = []
                 for pp, meter_reason, battery_reason in optimizer_meter_override_added:
                     optimizer_meter_rows.append({
@@ -7244,7 +7425,7 @@ if show_battery_only:
     else:
         plan_names = [p.name for p in battery_optimizer_plans] if battery_optimizer_plans else []
         if not plan_names:
-            st.info("No included plans are currently eligible for the optimizer under the current meter-type settings.")
+            st.info("No included plans are currently eligible for the optimiser under the current meter-type settings.")
         else:
             default_plan_name = str(st.session_state.get("current_retailer", plan_names[0]) or plan_names[0])
             if default_plan_name not in plan_names:
@@ -7760,10 +7941,10 @@ if show_battery_only:
             if "joint_best" in st.session_state:
                 if joint_results_stale:
                     st.warning(
-                        "Optimizer inputs changed since the last run, so these results may be stale. "
-                        "They are still shown below so you can compare outputs, and you can rerun the optimizer when ready."
+                        "Optimiser inputs changed since the last run, so these results may be stale. "
+                        "They are still shown below so you can compare outputs, and you can rerun the optimiser when ready."
                     )
-                    if st.button("Clear stale optimizer results", key="btn_clear_joint_stale"):
+                    if st.button("Clear stale optimiser results", key="btn_clear_joint_stale"):
                         for k in joint_result_state_keys:
                             st.session_state.pop(k, None)
                         st.rerun()
@@ -7775,16 +7956,26 @@ if show_battery_only:
                 if run_notes:
                     st.caption(run_notes)
                 best = st.session_state.get("joint_best") or {}
-                best_plan = best.get("Plan")
-                best_size = best.get("Optimal battery (kWh)")
-                best_solar = best.get("Optimal solar size (kW)")
-                pv_cost = best.get("PV lifetime cost incl battery ($)")
-                pv_save = best.get("PV lifetime saving vs same solar, no battery ($)")
+                best_plan = str(best.get("Plan", "-") or "-")
+                best_size = _coerce_float(best.get("Optimal battery (kWh)"))
+                best_solar = _coerce_float(best.get("Optimal solar size (kW)"))
+                pv_cost = _coerce_float(best.get("PV lifetime cost incl battery ($)"))
+                pv_save = _coerce_float(best.get("PV lifetime saving vs same solar, no battery ($)"))
                 if pv_save is None:
-                    pv_save = best.get("PV lifetime saving vs no battery ($)")
-                irr = best.get("IRR (%)")
-                batt_npv = best.get("Battery NPV ($)")
-                ann = best.get("Annualised savings ($/yr)")
+                    pv_save = _coerce_float(best.get("PV lifetime saving vs no battery ($)"))
+                irr = _coerce_float(best.get("IRR (%)"))
+                batt_npv = _coerce_float(best.get("Battery NPV ($)"))
+                ann = _coerce_float(best.get("Annualised savings ($/yr)"))
+                household_savings = _coerce_float(best.get("Total savings vs current solar, no battery ($/yr)"))
+                current_bill = _coerce_float(best.get("Current solar/no-battery annual bill ($/yr)"))
+                recommended_bill = _coerce_float(best.get("Estimated annual bill with battery ($/yr)"))
+                battery_cost = float(_coerce_float(best.get("Battery cost ($)")) or 0.0)
+                solar_capex = float(_coerce_float(best.get("Incremental solar capex ($)")) or 0.0)
+                load_shift_capex = float(_coerce_float(best.get("Load shift capex ($)")) or 0.0)
+                package_capex = float(battery_cost + solar_capex + load_shift_capex)
+                package_payback = _simple_payback_years(package_capex, household_savings)
+                battery_payback = _simple_payback_years(battery_cost, ann)
+                best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
                 best_cycle_stress = str(best.get("Cycle stress", "")).strip().lower() == "high"
                 best_implied_life = best.get("Implied cycle life (yrs)")
                 best_model_life = best.get("Life used in model (yrs)")
@@ -7801,29 +7992,138 @@ if show_battery_only:
                     conf = "Low"
 
                 # Buy / Don't buy signal (investment attractiveness under your assumptions)
-                is_attractive = (batt_npv is not None and float(batt_npv) > 0) and (irr is not None and float(irr) / 100.0 > float(discount_rate or 0.0))
+                is_attractive = (
+                    batt_npv is not None
+                    and float(batt_npv) > 0.0
+                    and irr is not None
+                    and (float(irr) / 100.0) > float(discount_rate or 0.0)
+                )
 
-                if best_solar is not None and not pd.isna(best_solar):
-                    st.markdown(f"**Recommended setup:** {best_plan} + **{float(best_solar):.1f} kW** solar + **{best_size} kWh** battery")
-                else:
-                    st.markdown(f"**Recommended setup:** {best_plan} + **{best_size} kWh** battery")
-                cols = st.columns(4)
-                cost_label = "PV lifetime cost (incl incremental solar+battery)" if (best_solar is not None and not pd.isna(best_solar)) else "PV lifetime cost (incl battery)"
-                cols[0].metric(cost_label, f"${pv_cost:,.0f}" if pv_cost is not None else "-")
-                cols[1].metric("PV saving vs same solar, no battery", f"${pv_save:,.0f}" if pv_save is not None else "-")
-                cols[2].metric("Battery IRR", f"{irr:.1f}%" if irr is not None else "-")
-                cols[3].metric("Confidence", conf)
+                recommended_setup_text = best_plan
+                if best_solar is not None and best_solar > 0.0:
+                    recommended_setup_text += f" + {float(best_solar):.1f} kW solar"
+                if best_size is not None and best_size > 0.0:
+                    recommended_setup_text += f" + {float(best_size):.1f} kWh battery"
+                if best_load_shift_label != "Off":
+                    recommended_setup_text += f" + {best_load_shift_label.lower()} load shifting"
+                st.markdown(f"**Recommended setup:** {recommended_setup_text}")
 
-                if is_attractive:
-                    st.success("Battery looks **financially attractive** under your assumptions (NPV > 0 and IRR > discount rate).")
+                decision_tone = "warning"
+                decision_title = "Treat this as a comparison, not a buy signal yet."
+                if household_savings is not None and household_savings > 0.0:
+                    if (best_size is None) or (best_size <= 0.0):
+                        if package_capex > 0.0:
+                            decision_tone = "info"
+                            decision_title = "Retailer and solar changes look stronger than adding a battery."
+                        else:
+                            decision_tone = "success"
+                            decision_title = "A retailer change looks worthwhile without new hardware."
+                    elif is_attractive:
+                        decision_tone = "success"
+                        decision_title = "This setup looks worth shortlisting."
+                    elif batt_npv is not None and batt_npv <= 0.0 and (solar_capex > 0.0 or load_shift_capex > 0.0):
+                        decision_tone = "info"
+                        decision_title = "The package lowers bills, but the battery is the weakest part."
+                    else:
+                        decision_tone = "warning"
+                        decision_title = "Bills fall, but the investment case is still marginal."
                 else:
-                    st.warning(
-                        "Battery doesn't look like a good value with these settings right now. "
-                        "This is usually because there isn't enough spare solar export at the times the battery can charge and discharge. "
-                        "Check your export amount and timing, then try changing battery cost, battery life, or discount rate assumptions."
+                    if best_size is not None and best_size > 0.0:
+                        decision_title = "Battery economics do not clear the bar under these settings."
+                    else:
+                        decision_title = "The optimiser does not see a strong financial reason to change yet."
+
+                decision_body_parts: list[str] = []
+                if current_bill is not None and recommended_bill is not None and household_savings is not None:
+                    decision_body_parts.append(
+                        f"On the uploaded data, the annual bill moves from ${float(current_bill):,.0f}/yr "
+                        f"to ${float(recommended_bill):,.0f}/yr, about ${float(household_savings):,.0f}/yr lower."
                     )
-                if ann is not None:
-                    st.caption(f"Estimated year-1 savings under the recommended setup: ${float(ann):,.0f}/yr (annualised from your uploaded data).")
+                elif recommended_bill is not None:
+                    decision_body_parts.append(
+                        f"On the uploaded data, the recommended setup lands at about ${float(recommended_bill):,.0f}/yr."
+                    )
+                if package_capex > 0.0:
+                    if package_payback is not None:
+                        decision_body_parts.append(
+                            f"Upfront package cost is about ${float(package_capex):,.0f}, with simple payback around {float(package_payback):.1f} years."
+                        )
+                    else:
+                        decision_body_parts.append(f"Upfront package cost is about ${float(package_capex):,.0f}.")
+                elif household_savings is not None and household_savings > 0.0:
+                    decision_body_parts.append("This result does not rely on extra hardware spend.")
+                if conf != "High":
+                    decision_body_parts.append(
+                        f"Confidence is {conf.lower()} because the optimiser is annualising about {float(days_cov):,.0f} days of data."
+                    )
+                decision_message = f"**{decision_title}** {' '.join(decision_body_parts).strip()}".strip()
+                if decision_tone == "success":
+                    st.success(decision_message)
+                elif decision_tone == "info":
+                    st.info(decision_message)
+                else:
+                    st.warning(decision_message)
+
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Current annual bill", (f"${float(current_bill):,.0f}/yr" if current_bill is not None else "-"))
+                s2.metric("Recommended bill", (f"${float(recommended_bill):,.0f}/yr" if recommended_bill is not None else "-"))
+                s3.metric("Year-1 household saving", (f"${float(household_savings):,.0f}/yr" if household_savings is not None else "-"))
+
+                package_payback_label = "-"
+                if package_capex <= 0.0 and household_savings is not None and household_savings > 0.0:
+                    package_payback_label = "Immediate"
+                elif package_payback is not None:
+                    package_payback_label = f"{float(package_payback):.1f} yrs"
+
+                s4, s5, s6 = st.columns(3)
+                s4.metric("Upfront package cost", (f"${float(package_capex):,.0f}" if package_capex > 0.0 else "$0"))
+                s5.metric("Simple payback", package_payback_label)
+                s6.metric("Confidence", conf)
+
+                detail_caption_parts: list[str] = []
+                if ann is not None and battery_cost > 0.0:
+                    batt_caption = (
+                        f"Battery-only saving versus the same solar setup is about ${float(ann):,.0f}/yr "
+                        f"on a battery cost of ${float(battery_cost):,.0f}"
+                    )
+                    if battery_payback is not None:
+                        batt_caption += f" (simple payback about {float(battery_payback):.1f} years)"
+                    if batt_npv is not None:
+                        batt_caption += f"; NPV under the current {_scenario_label.lower()} assumptions is ${float(batt_npv):,.0f}"
+                    detail_caption_parts.append(batt_caption + ".")
+                if pv_cost is not None:
+                    lifetime_caption = f"Lowest modelled lifetime cost for the winning setup is ${float(pv_cost):,.0f}"
+                    if pv_save is not None:
+                        lifetime_caption += (
+                            f", saving about ${float(pv_save):,.0f} in present-value terms versus the same solar setup without a battery"
+                        )
+                    detail_caption_parts.append(lifetime_caption + ".")
+                if best_load_shift_label != "Off":
+                    detail_caption_parts.append(f"Optimiser-selected load shift profile: {best_load_shift_label}.")
+                if detail_caption_parts:
+                    st.caption(" ".join(detail_caption_parts))
+
+                planning_df = _build_joint_finance_view_df(
+                    annual_savings=ann,
+                    battery_cost=battery_cost,
+                    battery_life_years=float(battery_life_years),
+                    degradation_rate=float(degradation_rate),
+                    cycle_aware=bool(cycle_aware),
+                    efc_per_year=float(_coerce_float(best.get("Cycles/yr (EFC)")) or 0.0),
+                    cycle_life_efc=float(cycle_life_efc),
+                    eol_capacity_frac=float(eol_capacity_frac),
+                    current_discount_rate=float(discount_rate),
+                    current_price_growth_rate=float(price_growth_rate),
+                    current_label=str(_scenario_label),
+                )
+                if isinstance(planning_df, pd.DataFrame) and not planning_df.empty:
+                    with st.expander("Battery planning view: conservative / expected / upside", expanded=False):
+                        _show_table(planning_df, use_container_width=True, hide_index=True)
+                        st.caption(
+                            "This view reuses the winning setup's battery-only year-1 savings and varies only price growth and discount rate. "
+                            "The household payback above still includes solar and load-shift capex where applicable."
+                        )
+                        st.caption("Blank discounted payback means the battery cashflows do not recover upfront cost within the modelled life.")
                 if best_cycle_stress:
                     st.warning(
                         "Cycle stress flag on recommended setup: implied cycle life is materially below assumed life. "
@@ -8175,9 +8475,9 @@ if show_battery_only:
                 st.caption("Sweeps battery sizes for each retailer and optionally solar sizes, then ranks combinations by lowest PV lifetime cost.")
                 st.caption(
                     "Quick battery comparison optimises battery for one fixed plan/solar profile. "
-                    "This joint optimizer re-optimises plan + solar + battery together."
+                    "This joint optimiser re-optimises plan + solar + battery together."
                 )
-                with st.expander("What this optimizer uses", expanded=False):
+                with st.expander("What this optimiser uses", expanded=False):
                     st.markdown(
                         "- **Inherited from Battery and Solar Simulator:** battery operation settings, battery cost inputs, "
                         "aging assumptions, battery life, degradation, discount rate, price growth, and any active global load-shifting model.\n"
@@ -8186,18 +8486,18 @@ if show_battery_only:
                         "- **Not used in this tab:** the single `Plan to simulate` dropdown and the manual discharge-threshold control."
                     )
                     st.caption(
-                        "The detailed table below shows all optimizer inputs used for a run, including shared session inputs "
+                        "The detailed table below shows all optimiser inputs used for a run, including shared session inputs "
                         "such as the uploaded NEM12 data, Global EV charging adjustments, and Plan Library selections."
                     )
                     optimizer_source_rows = [
                         {
                             "Input group": "Load intervals",
-                            "Source used by optimizer": "Uploaded NEM12 interval file (E1/E2/B1) after any active Global EV charging adjustments.",
+                            "Source used by optimiser": "Uploaded NEM12 interval file (E1/E2/B1) after any active Global EV charging adjustments.",
                             "Where to change it": "Upload a different NEM12 file or edit sidebar 'Global EV charging model'.",
                         },
                         {
                             "Input group": "Plan pricing and rules",
-                            "Source used by optimizer": (
+                            "Source used by optimiser": (
                                 "Included plans from Plan Library, then filtered by current meter type for this tab. "
                                 "Optional override can add back meter-ineligible battery-dependent plans for upgrade scenarios."
                             ),
@@ -8205,29 +8505,29 @@ if show_battery_only:
                         },
                         {
                             "Input group": "Flexible load shifting",
-                            "Source used by optimizer": "Optional global hot-water / pool timer model applied before retailer, solar, and battery optimisation.",
+                            "Source used by optimiser": "Optional global hot-water / pool timer model applied before retailer, solar, and battery optimisation.",
                             "Where to change it": "Sidebar > Global load shifting model (all tabs).",
                         },
                         {
                             "Input group": "Solar production profile",
-                            "Source used by optimizer": "Uploaded solar profile when provided, otherwise optional modelled solar profile in this tab.",
-                            "Where to change it": "Upload solar file at top or enable 'Use modelled solar profile' in this optimizer tab.",
+                            "Source used by optimiser": "Uploaded solar profile when provided, otherwise optional modelled solar profile in this tab.",
+                            "Where to change it": "Upload solar file at top or enable 'Use modelled solar profile' in this optimiser tab.",
                         },
                         {
                             "Input group": "Battery technical assumptions",
-                            "Source used by optimizer": "Battery assumptions preset (cycle life, EoL %, life years) plus dispatch controls in Battery Simulator.",
+                            "Source used by optimiser": "Battery assumptions preset (cycle life, EoL %, life years) plus dispatch controls in Battery Simulator.",
                             "Where to change it": "Battery and Solar Simulator > battery assumptions and operation settings.",
                         },
                         {
                             "Input group": "Financial assumptions",
-                            "Source used by optimizer": "Discount rate, price growth, battery/PV capex and sweep ranges currently selected in this tab.",
+                            "Source used by optimiser": "Discount rate, price growth, battery/PV capex and sweep ranges currently selected in this tab.",
                             "Where to change it": "Battery and Solar Simulator > Best overall retailer + solar + battery controls.",
                         },
                     ]
                     _show_table(pd.DataFrame(optimizer_source_rows), use_container_width=True, hide_index=True)
                     st.caption(
-                        "The optimizer only uses the current session settings shown in this table. "
-                        "If any input changes, prior optimizer outputs are invalidated and should be re-run."
+                        "The optimiser only uses the current session settings shown in this table. "
+                        "If any input changes, prior optimiser outputs are invalidated and should be re-run."
                     )
 
                 solar_uploaded_available = bool(
@@ -8318,7 +8618,7 @@ if show_battery_only:
                     "Assume no existing solar/export in baseline",
                     value=bool(st.session_state.get("joint_assume_no_existing_export", False)),
                     key="joint_assume_no_existing_export",
-                    help="Sets existing B1 export to zero for this joint optimizer run. Useful when testing new-solar decisions with a dataset that already includes export.",
+                    help="Sets existing B1 export to zero for this joint optimiser run. Useful when testing new-solar decisions with a dataset that already includes export.",
                 )
                 df_joint_base = df_int_ev
                 df_joint_stage_seed = df_int_ev
@@ -8332,7 +8632,7 @@ if show_battery_only:
                         df_joint_base = d0
                         d0_stage = d0.copy()
                         df_joint_stage_seed = d0_stage
-                        st.caption(f"Baseline export removed for optimizer: {removed_export_kwh:,.1f} kWh over dataset period.")
+                        st.caption(f"Baseline export removed for optimiser: {removed_export_kwh:,.1f} kWh over dataset period.")
                     except Exception:
                         df_joint_base = df_int_ev
                         df_joint_stage_seed = df_int_ev
@@ -8344,7 +8644,7 @@ if show_battery_only:
                     key="joint_enable_solar_sweep",
                     disabled=not solar_available_for_sweep,
                     help=(
-                        "When enabled, optimizer searches retailer + solar size + battery size together. "
+                        "When enabled, the optimiser searches retailer + solar size + battery size together. "
                         "With no upload, this uses the modelled solar profile."
                     ),
                 )
@@ -8445,7 +8745,7 @@ if show_battery_only:
                             value=float(st.session_state.get("joint_current_pv_kw", 0.0)),
                             step=0.1,
                             key="joint_current_pv_kw",
-                            help="With solar sweep off, optimizer keeps this modelled solar size fixed while optimising retailer + battery.",
+                            help="With solar sweep off, the optimiser keeps this modelled solar size fixed while optimising retailer + battery.",
                         )
                     else:
                         current_pv_kw = float(st.session_state.get("joint_current_pv_kw", 6.6))
@@ -8453,7 +8753,7 @@ if show_battery_only:
                     joint_pv_sizes = [float(current_pv_kw)] if solar_mode != "none" else [0.0]
                     if solar_mode in ("uploaded", "modelled"):
                         st.info(
-                            f"Solar sweep is OFF. Optimizer is using a fixed solar size of {float(current_pv_kw):.1f} kW "
+                            f"Solar sweep is OFF. The optimiser is using a fixed solar size of {float(current_pv_kw):.1f} kW "
                             "and only re-optimising retailer + battery."
                         )
                     if (solar_mode == "modelled") and (float(current_pv_kw) <= 0.0):
@@ -8528,15 +8828,28 @@ if show_battery_only:
                     checkpoint_completed_plans = int(joint_checkpoint_current.get("completed_plan_count", 0) or 0)
                     checkpoint_step_idx = int(joint_checkpoint_current.get("step_idx", 0) or 0)
                     checkpoint_updated_at = str(joint_checkpoint_current.get("updated_at", "") or "").strip()
+                    checkpoint_plan_state = (
+                        dict(joint_checkpoint_current.get("current_plan_state", {}))
+                        if isinstance(joint_checkpoint_current.get("current_plan_state", {}), dict)
+                        else {}
+                    )
+                    checkpoint_plan_name = str(checkpoint_plan_state.get("plan_name", "") or "").strip()
+                    checkpoint_plan_next_sim_idx = int(checkpoint_plan_state.get("next_sim_idx", 0) or 0)
+                    checkpoint_plan_total_sims = int(checkpoint_plan_state.get("total_sims", 0) or 0)
                     checkpoint_msg = (
                         f"Recoverable checkpoint found: {checkpoint_completed_plans}/{len(battery_optimizer_plans)} plans "
                         f"complete, {checkpoint_step_idx:,}/{run_count:,} simulations saved."
                     )
+                    if checkpoint_plan_name and checkpoint_plan_total_sims > 0:
+                        checkpoint_msg += (
+                            f" Current plan: {checkpoint_plan_name} "
+                            f"({min(checkpoint_plan_next_sim_idx, checkpoint_plan_total_sims):,}/{checkpoint_plan_total_sims:,} combinations saved)."
+                        )
                     if checkpoint_updated_at:
                         checkpoint_msg += f" Last saved {checkpoint_updated_at}."
-                    checkpoint_msg += " Press run to resume from the next unfinished plan."
+                    checkpoint_msg += " Press run to resume from the last saved point."
                     st.info(checkpoint_msg)
-                    if st.button("Clear recoverable optimizer checkpoint", key="btn_clear_joint_checkpoint"):
+                    if st.button("Clear recoverable optimiser checkpoint", key="btn_clear_joint_checkpoint"):
                         _clear_joint_optimizer_checkpoint(joint_checkpoint_path_current)
                         st.rerun()
 
@@ -8564,6 +8877,12 @@ if show_battery_only:
                         step_idx = 0
                         next_plan_idx = 0
                         elapsed_seconds_base = 0.0
+                        resume_plan_idx = -1
+                        resume_plan_name = ""
+                        resume_plan_next_sim_idx = 0
+                        resume_plan_total_sims = 0
+                        resume_plan_best_row: dict = {}
+                        current_plan_checkpoint_state: dict = {}
                         if resume_from_checkpoint:
                             run_id = str(
                                 joint_checkpoint_current.get("run_id", "") or f"joint-{run_requested_at.strftime('%Y%m%d-%H%M%S')}"
@@ -8604,6 +8923,24 @@ if show_battery_only:
                                 if isinstance(checkpoint_assumptions, dict)
                                 else {}
                             )
+                            checkpoint_plan_state = joint_checkpoint_current.get("current_plan_state", {})
+                            if isinstance(checkpoint_plan_state, dict):
+                                resume_plan_name = str(checkpoint_plan_state.get("plan_name", "") or "").strip()
+                                try:
+                                    resume_plan_idx = int(checkpoint_plan_state.get("plan_idx", -1) or -1)
+                                except Exception:
+                                    resume_plan_idx = -1
+                                try:
+                                    resume_plan_next_sim_idx = int(checkpoint_plan_state.get("next_sim_idx", 0) or 0)
+                                except Exception:
+                                    resume_plan_next_sim_idx = 0
+                                try:
+                                    resume_plan_total_sims = int(checkpoint_plan_state.get("total_sims", 0) or 0)
+                                except Exception:
+                                    resume_plan_total_sims = 0
+                                resume_plan_best_raw = checkpoint_plan_state.get("best_row", {})
+                                if isinstance(resume_plan_best_raw, dict):
+                                    resume_plan_best_row = dict(resume_plan_best_raw)
                             joint_assumptions.setdefault("run", {})
                             joint_assumptions["run"]["id"] = run_id
                             joint_assumptions["run"].setdefault("started_at", run_started_at_label)
@@ -8746,16 +9083,41 @@ if show_battery_only:
                             df_rows = _joint_sorted_df_from_rows(rows)
                             return df_rows.iloc[0].to_dict() if not df_rows.empty else {}
 
+                        def _joint_candidate_is_better(best_row: dict | None, cand_row: dict | None) -> bool:
+                            if not isinstance(cand_row, dict):
+                                return False
+                            if not isinstance(best_row, dict) or not best_row:
+                                return True
+                            best_cost = float(best_row.get("PV lifetime cost incl battery ($)", 0.0) or 0.0)
+                            cand_cost = float(cand_row.get("PV lifetime cost incl battery ($)", 0.0) or 0.0)
+                            best_pv = float(best_row.get("Optimal solar size (kW)") or 0.0)
+                            cand_pv = float(cand_row.get("Optimal solar size (kW)") or 0.0)
+                            best_b = float(best_row.get("Optimal battery (kWh)", 0.0) or 0.0)
+                            cand_b = float(cand_row.get("Optimal battery (kWh)", 0.0) or 0.0)
+                            return bool(
+                                (cand_cost < best_cost)
+                                or (
+                                    cand_cost == best_cost
+                                    and ((cand_pv < best_pv) or (cand_pv == best_pv and cand_b < best_b))
+                                )
+                            )
+
                         def _save_joint_checkpoint_state(
                             status_value: str,
                             joint_meta_value: dict,
                             stage_rows_value: list[dict] | None = None,
                             stage_meta_value: dict | None = None,
+                            current_plan_state_value: dict | None = None,
                         ) -> None:
                             stage_rows_safe = (
                                 [dict(r) for r in (stage_rows_value or []) if isinstance(r, dict)]
                                 if isinstance(stage_rows_value, list)
                                 else []
+                            )
+                            current_plan_state_safe = (
+                                copy.deepcopy(current_plan_state_value)
+                                if isinstance(current_plan_state_value, dict)
+                                else {}
                             )
                             payload = {
                                 "version": 1,
@@ -8779,6 +9141,7 @@ if show_battery_only:
                                 "joint_report_assumptions": copy.deepcopy(joint_assumptions),
                                 "stage_rows": stage_rows_safe,
                                 "stage_meta": dict(stage_meta_value) if isinstance(stage_meta_value, dict) else {},
+                                "current_plan_state": current_plan_state_safe,
                             }
                             _save_joint_optimizer_checkpoint(joint_checkpoint_path_current, payload)
 
@@ -8808,14 +9171,26 @@ if show_battery_only:
                             f"Plans completed: {next_plan_idx:,}/{len(battery_optimizer_plans):,}"
                         )
                         if resume_from_checkpoint:
-                            status.caption(
-                                f"Resuming from saved checkpoint for run {run_id} ({next_plan_idx:,}/{len(battery_optimizer_plans):,} plans complete)."
+                            resume_status = (
+                                f"Resuming from saved checkpoint for run {run_id} "
+                                f"({next_plan_idx:,}/{len(battery_optimizer_plans):,} plans complete)."
                             )
+                            if resume_plan_name and resume_plan_total_sims > 0:
+                                resume_status += (
+                                    f" Current plan: {resume_plan_name} "
+                                    f"({min(resume_plan_next_sim_idx, resume_plan_total_sims):,}/{resume_plan_total_sims:,} combinations saved)."
+                                )
+                            status.caption(resume_status)
 
                         progress_state = {
                             "last_step": int(step_idx),
                             "last_render_at": None,
                             "update_every": max(5, min(25, max(total_steps // 80, 10))),
+                        }
+                        checkpoint_save_state = {
+                            "last_step": int(step_idx),
+                            "last_saved_at": None,
+                            "update_every": max(5, min(20, max(total_steps // 120, 8))),
                         }
 
                         def _maybe_update_joint_progress(force: bool = False, status_text: str = "") -> None:
@@ -8850,6 +9225,55 @@ if show_battery_only:
                                 status.caption(status_text)
                             progress_state["last_step"] = int(step_idx)
                             progress_state["last_render_at"] = now
+
+                        def _maybe_save_joint_intra_plan_checkpoint(force: bool = False, status_text: str = "") -> None:
+                            if not isinstance(current_plan_checkpoint_state, dict) or not current_plan_checkpoint_state:
+                                return
+                            now = dt.datetime.now()
+                            last_saved_at = checkpoint_save_state.get("last_saved_at")
+                            last_saved_step = int(checkpoint_save_state.get("last_step", 0) or 0)
+                            update_every = int(checkpoint_save_state.get("update_every", 8) or 8)
+                            should_save = bool(force)
+                            if not should_save:
+                                if last_saved_at is None:
+                                    should_save = True
+                                elif (step_idx - last_saved_step) >= update_every:
+                                    should_save = True
+                                elif float((now - last_saved_at).total_seconds()) >= 8.0:
+                                    should_save = True
+                            if not should_save:
+                                return
+                            joint_assumptions.setdefault("simulation", {})
+                            joint_assumptions["simulation"]["executed_combinations"] = int(step_idx)
+                            joint_assumptions["simulation"]["completed_plan_count"] = int(len(completed_plan_names))
+                            current_plan_name_disp = str(current_plan_checkpoint_state.get("plan_name", "") or "").strip()
+                            current_plan_next = int(current_plan_checkpoint_state.get("next_sim_idx", 0) or 0)
+                            current_plan_total = int(current_plan_checkpoint_state.get("total_sims", 0) or 0)
+                            checkpoint_summary = (
+                                f"Recoverable checkpoint saved: {len(completed_plan_names):,}/{len(battery_optimizer_plans):,} plans complete; "
+                                f"{step_idx:,}/{total_steps:,} simulations complete."
+                            )
+                            if current_plan_name_disp and current_plan_total > 0:
+                                checkpoint_summary += (
+                                    f" Current plan {current_plan_name_disp}: "
+                                    f"{min(current_plan_next, current_plan_total):,}/{current_plan_total:,} combinations saved."
+                                )
+                            checkpoint_meta = {
+                                "run_id": run_id,
+                                "run_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                "summary": checkpoint_summary,
+                            }
+                            if status_text:
+                                checkpoint_meta["status_text"] = str(status_text)
+                            _save_joint_checkpoint_state(
+                                "in_progress",
+                                checkpoint_meta,
+                                stage_rows_value=[],
+                                stage_meta_value={"reason": "in_progress"},
+                                current_plan_state_value=current_plan_checkpoint_state,
+                            )
+                            checkpoint_save_state["last_step"] = int(step_idx)
+                            checkpoint_save_state["last_saved_at"] = now
 
                         pv_cases = []
                         for pv_kw in joint_pv_sizes:
@@ -8964,11 +9388,33 @@ if show_battery_only:
                             df_current_solar_case = df_joint_base
 
                         for plan_idx, p in enumerate(battery_optimizer_plans[next_plan_idx:], start=next_plan_idx + 1):
+                            plan_zero_idx = int(plan_idx - 1)
+                            plan_total_sims = int(len(scenario_cases) * len(joint_sizes))
+                            plan_resume_cursor = 0
                             plan_progress.progress(float(plan_idx - 1) / float(max(len(battery_optimizer_plans), 1)))
                             plan_progress_caption.caption(
                                 f"Plans completed: {plan_idx - 1:,}/{len(battery_optimizer_plans):,}"
                             )
                             best = None
+                            if (
+                                plan_zero_idx == int(resume_plan_idx)
+                                and resume_plan_name
+                                and str(p.name) == str(resume_plan_name)
+                            ):
+                                plan_resume_cursor = max(min(int(resume_plan_next_sim_idx), plan_total_sims), 0)
+                                if isinstance(resume_plan_best_row, dict) and resume_plan_best_row:
+                                    best = dict(resume_plan_best_row)
+                            current_plan_checkpoint_state = (
+                                {
+                                    "plan_idx": int(plan_zero_idx),
+                                    "plan_name": str(p.name),
+                                    "next_sim_idx": int(plan_resume_cursor),
+                                    "total_sims": int(plan_total_sims),
+                                    "best_row": (copy.deepcopy(best) if isinstance(best, dict) and best else {}),
+                                }
+                                if plan_total_sims > 0
+                                else {}
+                            )
                             baseline_current_solar = simulate_plan(
                                 df_current_solar_case,
                                 p,
@@ -8983,7 +9429,11 @@ if show_battery_only:
                                 else (base_current_total / 100.0)
                             )
 
-                            for scenario_case in scenario_cases:
+                            for scenario_case_idx, scenario_case in enumerate(scenario_cases):
+                                scenario_start_idx = int(scenario_case_idx * len(joint_sizes))
+                                scenario_end_idx = int(scenario_start_idx + len(joint_sizes))
+                                if plan_resume_cursor >= scenario_end_idx:
+                                    continue
                                 pv_kw = float(scenario_case.get("pv_kw", 0.0) or 0.0)
                                 pv_capex = float(scenario_case.get("pv_capex", 0.0) or 0.0)
                                 df_case = scenario_case.get("df_int")
@@ -9000,7 +9450,10 @@ if show_battery_only:
                                 days = float(baseline.get("days", 0.0) or 0.0)
                                 annual_base_bill = (base_total / 100.0) * (365.0 / days) if days > 0 else (base_total / 100.0)
 
-                                for size_idx, cap in enumerate(joint_sizes, start=1):
+                                for size_offset, cap in enumerate(joint_sizes):
+                                    if (scenario_start_idx + size_offset) < plan_resume_cursor:
+                                        continue
+                                    size_idx = int(size_offset + 1)
                                     if enable_solar_sweep:
                                         live_status = (
                                             f"Plan {plan_idx}/{len(battery_optimizer_plans)} ({p.name}) | "
@@ -9111,27 +9564,26 @@ if show_battery_only:
                                         "PV lifetime saving vs same solar, no battery ($)": system_saving_vs_no_batt,
                                     }
                                     all_results.append(cand.copy())
-                                    if best is None:
+                                    if _joint_candidate_is_better(best, cand):
                                         best = cand
-                                    else:
-                                        best_cost = float(best.get("PV lifetime cost incl battery ($)", 0.0))
-                                        cand_cost = float(cand.get("PV lifetime cost incl battery ($)", 0.0))
-                                        best_pv = float(best.get("Optimal solar size (kW)") or 0.0)
-                                        cand_pv = float(cand.get("Optimal solar size (kW)") or 0.0)
-                                        best_b = float(best.get("Optimal battery (kWh)", 0.0))
-                                        cand_b = float(cand.get("Optimal battery (kWh)", 0.0))
-                                        if (cand_cost < best_cost) or (
-                                            cand_cost == best_cost and (
-                                                (cand_pv < best_pv) or (cand_pv == best_pv and cand_b < best_b)
-                                            )
-                                        ):
-                                            best = cand
 
                                     step_idx += 1
                                     _maybe_update_joint_progress(force=False, status_text=live_status)
+                                    if plan_total_sims > 0:
+                                        current_plan_checkpoint_state = {
+                                            "plan_idx": int(plan_zero_idx),
+                                            "plan_name": str(p.name),
+                                            "next_sim_idx": int(min(scenario_start_idx + size_offset + 1, plan_total_sims)),
+                                            "total_sims": int(plan_total_sims),
+                                            "best_row": (copy.deepcopy(best) if isinstance(best, dict) and best else {}),
+                                            "scenario_case_idx": int(scenario_case_idx),
+                                            "battery_size_idx": int(size_offset),
+                                        }
+                                    _maybe_save_joint_intra_plan_checkpoint(force=False, status_text=live_status)
 
                             if best is not None:
                                 results.append(best)
+                            current_plan_checkpoint_state = {}
                             completed_plan_names.append(str(p.name))
                             plan_progress.progress(float(plan_idx) / float(max(len(battery_optimizer_plans), 1)))
                             plan_progress_caption.caption(
@@ -9154,6 +9606,13 @@ if show_battery_only:
                                 stage_rows_value=[],
                                 stage_meta_value={"reason": "in_progress"},
                             )
+                            checkpoint_save_state["last_step"] = int(step_idx)
+                            checkpoint_save_state["last_saved_at"] = dt.datetime.now()
+                            resume_plan_idx = -1
+                            resume_plan_name = ""
+                            resume_plan_next_sim_idx = 0
+                            resume_plan_total_sims = 0
+                            resume_plan_best_row = {}
 
                         plan_progress.progress(1.0)
                         plan_progress_caption.caption(f"Plans completed: {len(battery_optimizer_plans):,}/{len(battery_optimizer_plans):,}")
@@ -9184,7 +9643,7 @@ if show_battery_only:
                                 "run_id": run_id,
                                 "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "summary": (
-                                    "Joint optimizer completed with no valid plan combinations. "
+                                    "Joint optimiser completed with no valid plan combinations. "
                                     f"simulations={int(step_idx)}"
                                 ),
                             }
@@ -9224,7 +9683,7 @@ if show_battery_only:
                                 "run_id": run_id,
                                 "run_at": run_finished_at,
                                 "summary": (
-                                    f"Joint optimizer; scenario={_scenario_label}; "
+                                    f"Joint optimiser; scenario={_scenario_label}; "
                                     f"solar_source={solar_mode}; "
                                     f"baseline_export_override={'on' if assume_no_existing_export else 'off'}; "
                                     f"solar_sweep={'on' if enable_solar_sweep else 'off'}; "
@@ -9239,6 +9698,7 @@ if show_battery_only:
                             try:
                                 best_row = df_joint_run.iloc[0]
                                 best_plan_name = str(best_row.get("Plan", "") or "")
+                                best_load_shift_label = "Off"
                                 best_plan_obj = next((pp for pp in battery_optimizer_plans if str(pp.name) == best_plan_name), None)
                                 if best_plan_obj is not None:
                                     best_solar_raw = best_row.get("Optimal solar size (kW)")
@@ -9257,6 +9717,104 @@ if show_battery_only:
                                         off_load_shift_case,
                                     )
                                     best_load_shift_enabled = bool(best_load_shift_case.get("enabled", False))
+
+                                    def _simulate_stage_case(
+                                        scenario_label: str,
+                                        plan_obj_case: Plan,
+                                        plan_name_case: str,
+                                        stage_shift_label: str,
+                                        stage_shift_params: list[TimedLoadShiftParams] | None,
+                                        pv_kw_case: float,
+                                        batt_kwh_case: float,
+                                        batt_power_kw_case: float,
+                                        solar_capex_reference_kw: float,
+                                        include_incremental_capex: bool = True,
+                                        scenario_note_prefix: str = "",
+                                    ) -> dict:
+                                        note_parts: list[str] = []
+                                        if str(scenario_note_prefix).strip():
+                                            note_parts.append(str(scenario_note_prefix).strip())
+                                        df_stage_base, solar_case, solar_applied, solar_note = _apply_solar_case_to_intervals(
+                                            df_joint_stage_seed,
+                                            solar_mode,
+                                            float(pv_kw_case),
+                                            float(current_pv_kw),
+                                            solar_profile_for_battery,
+                                            modelled_solar_profile_1kw,
+                                        )
+                                        if solar_note:
+                                            note_parts.append(str(solar_note))
+                                        df_stage, stage_shift_summary = apply_timed_load_shifts_to_intervals(
+                                            df_stage_base,
+                                            stage_shift_params,
+                                        )
+
+                                        baseline_stage = simulate_plan(
+                                            df_stage,
+                                            plan_obj_case,
+                                            include_signup_credit=False,
+                                            battery_kwh_context=0.0,
+                                        )
+                                        days_stage = float(baseline_stage.get("days", 0.0) or 0.0)
+                                        total_base_stage = float(baseline_stage.get("total_cents", 0.0) or 0.0)
+                                        annual_stage_bill = (
+                                            (total_base_stage / 100.0) * (365.0 / days_stage)
+                                            if days_stage > 0
+                                            else (total_base_stage / 100.0)
+                                        )
+                                        if float(batt_kwh_case) > 0:
+                                            batt_stage = BatteryParams(
+                                                capacity_kwh=float(batt_kwh_case),
+                                                power_kw=float(batt_power_kw_case),
+                                                roundtrip_eff=float(roundtrip_eff),
+                                                reserve_frac=float(reserve_pct) / 100.0,
+                                                initial_soc_frac=float(init_soc_pct) / 100.0,
+                                                discharge_min_rate_cents=None,
+                                                charge_from_export_only=True,
+                                            )
+                                            sim_stage = simulate_plan_with_battery(
+                                                df_stage,
+                                                plan_obj_case,
+                                                batt_stage,
+                                                baseline=baseline_stage,
+                                                wide_base=_intervals_wide_from_long(df_stage),
+                                                solar_profile=solar_case,
+                                            )
+                                            total_stage = float(sim_stage.get("total_cents", total_base_stage) or 0.0)
+                                            annual_stage_bill = (
+                                                (total_stage / 100.0) * (365.0 / days_stage)
+                                                if days_stage > 0
+                                                else (total_stage / 100.0)
+                                            )
+
+                                        solar_capex_stage = 0.0
+                                        load_shift_capex_stage = 0.0
+                                        batt_capex_stage = 0.0
+                                        if include_incremental_capex:
+                                            solar_capex_stage = (
+                                                max(float(pv_kw_case) - float(solar_capex_reference_kw), 0.0) * float(pv_cost_per_kw)
+                                                if (solar_mode != "none" and solar_applied)
+                                                else 0.0
+                                            )
+                                            load_shift_capex_stage = _load_shift_capex_for_params(stage_shift_params)
+                                            batt_capex_stage = _battery_capex_for_size(float(batt_kwh_case))
+
+                                        return {
+                                            "Scenario": scenario_label,
+                                            "Plan": plan_name_case,
+                                            "Solar size (kW)": round(float(pv_kw_case), 2),
+                                            "Battery size (kWh)": round(float(batt_kwh_case), 2),
+                                            "Load shift": stage_shift_label,
+                                            "Shifted kWh": round(float(stage_shift_summary.get("shifted_kwh", 0.0) or 0.0), 1),
+                                            "Shift solar absorbed (kWh)": round(float(stage_shift_summary.get("solar_diverted_kwh", 0.0) or 0.0), 1),
+                                            "Shift grid top-up (kWh)": round(float(stage_shift_summary.get("grid_kwh", 0.0) or 0.0), 1),
+                                            "Estimated annual bill ($/yr)": round(float(annual_stage_bill), 0),
+                                            "Incremental solar capex ($)": round(float(solar_capex_stage), 0),
+                                            "Load shift capex ($)": round(float(load_shift_capex_stage), 0),
+                                            "Battery capex ($)": round(float(batt_capex_stage), 0),
+                                            "Total incremental capex ($)": round(float(solar_capex_stage + load_shift_capex_stage + batt_capex_stage), 0),
+                                            "Scenario notes": (" ".join(note_parts) if note_parts else "-"),
+                                        }
 
                                     if best_load_shift_enabled:
                                         stage_cases: list[tuple[str, str, float, float]] = [
@@ -9284,96 +9842,43 @@ if show_battery_only:
                                             stage_cases.append(("Plan + solar + battery", "Off", best_solar_kw, best_batt_kwh))
 
                                     for scenario_label, stage_shift_label, pv_kw_case, batt_kwh_case in stage_cases:
-                                        scenario_note = ""
                                         stage_shift_case = next(
                                             (rr for rr in joint_load_shift_scenarios if str(rr.get("label", "")) == stage_shift_label),
                                             off_load_shift_case,
                                         )
-                                        stage_shift_params = copy.deepcopy(stage_shift_case.get("params") or [])
-                                        df_stage_base, solar_case, solar_applied, scenario_note = _apply_solar_case_to_intervals(
-                                            df_joint_stage_seed,
-                                            solar_mode,
-                                            float(pv_kw_case),
-                                            float(current_pv_kw),
-                                            solar_profile_for_battery,
-                                            modelled_solar_profile_1kw,
-                                        )
-                                        df_stage, stage_shift_summary = apply_timed_load_shifts_to_intervals(
-                                            df_stage_base,
-                                            stage_shift_params,
-                                        )
-
-                                        baseline_stage = simulate_plan(
-                                            df_stage,
-                                            best_plan_obj,
-                                            include_signup_credit=False,
-                                            battery_kwh_context=0.0,
-                                        )
-                                        days_stage = float(baseline_stage.get("days", 0.0) or 0.0)
-                                        total_base_stage = float(baseline_stage.get("total_cents", 0.0) or 0.0)
-                                        annual_stage_bill = (
-                                            (total_base_stage / 100.0) * (365.0 / days_stage)
-                                            if days_stage > 0
-                                            else (total_base_stage / 100.0)
-                                        )
-                                        if float(batt_kwh_case) > 0:
-                                            batt_stage = BatteryParams(
-                                                capacity_kwh=float(batt_kwh_case),
-                                                power_kw=float(power_kw),
-                                                roundtrip_eff=float(roundtrip_eff),
-                                                reserve_frac=float(reserve_pct) / 100.0,
-                                                initial_soc_frac=float(init_soc_pct) / 100.0,
-                                                discharge_min_rate_cents=None,
-                                                charge_from_export_only=True,
-                                            )
-                                            sim_stage = simulate_plan_with_battery(
-                                                df_stage,
-                                                best_plan_obj,
-                                                batt_stage,
-                                                baseline=baseline_stage,
-                                                wide_base=_intervals_wide_from_long(df_stage),
-                                                solar_profile=solar_case,
-                                            )
-                                            total_stage = float(sim_stage.get("total_cents", total_base_stage) or 0.0)
-                                            annual_stage_bill = (
-                                                (total_stage / 100.0) * (365.0 / days_stage)
-                                                if days_stage > 0
-                                                else (total_stage / 100.0)
-                                        )
-
-                                        solar_capex_stage = (
-                                            max(float(pv_kw_case) - float(current_pv_kw), 0.0) * float(pv_cost_per_kw)
-                                            if (solar_mode != "none" and solar_applied)
-                                            else 0.0
-                                        )
-                                        load_shift_capex_stage = _load_shift_capex_for_params(stage_shift_params)
-                                        batt_capex_stage = _battery_capex_for_size(float(batt_kwh_case))
                                         stage_rows.append(
-                                            {
-                                                "Scenario": scenario_label,
-                                                "Plan": best_plan_name,
-                                                "Solar size (kW)": round(float(pv_kw_case), 2),
-                                                "Battery size (kWh)": round(float(batt_kwh_case), 2),
-                                                "Load shift": stage_shift_label,
-                                                "Shifted kWh": round(float(stage_shift_summary.get("shifted_kwh", 0.0) or 0.0), 1),
-                                                "Shift solar absorbed (kWh)": round(float(stage_shift_summary.get("solar_diverted_kwh", 0.0) or 0.0), 1),
-                                                "Shift grid top-up (kWh)": round(float(stage_shift_summary.get("grid_kwh", 0.0) or 0.0), 1),
-                                                "Estimated annual bill ($/yr)": round(float(annual_stage_bill), 0),
-                                                "Incremental solar capex ($)": round(float(solar_capex_stage), 0),
-                                                "Load shift capex ($)": round(float(load_shift_capex_stage), 0),
-                                                "Battery capex ($)": round(float(batt_capex_stage), 0),
-                                                "Total incremental capex ($)": round(float(solar_capex_stage + load_shift_capex_stage + batt_capex_stage), 0),
-                                                "Scenario notes": scenario_note or "-",
-                                            }
+                                            _simulate_stage_case(
+                                                scenario_label=scenario_label,
+                                                plan_obj_case=best_plan_obj,
+                                                plan_name_case=best_plan_name,
+                                                stage_shift_label=stage_shift_label,
+                                                stage_shift_params=copy.deepcopy(stage_shift_case.get("params") or []),
+                                                pv_kw_case=float(pv_kw_case),
+                                                batt_kwh_case=float(batt_kwh_case),
+                                                batt_power_kw_case=float(power_kw),
+                                                solar_capex_reference_kw=float(current_pv_kw),
+                                            )
                                         )
 
                                     if stage_rows:
-                                        plan_only_bill = float(stage_rows[0].get("Estimated annual bill ($/yr)", 0.0) or 0.0)
+                                        plan_only_bill = next(
+                                            (
+                                                float(rr.get("Estimated annual bill ($/yr)", 0.0) or 0.0)
+                                                for rr in stage_rows
+                                                if str(rr.get("Scenario", "") or "") == "Plan only"
+                                            ),
+                                            None,
+                                        )
                                         for rr in stage_rows:
-                                            rr["Savings vs Plan only ($/yr)"] = round(
-                                                plan_only_bill - float(rr.get("Estimated annual bill ($/yr)", 0.0) or 0.0),
-                                                0,
-                                            )
+                                            annual_bill_value = _coerce_float(rr.get("Estimated annual bill ($/yr)"))
+                                            if plan_only_bill is not None and annual_bill_value is not None:
+                                                rr["Savings vs Plan only ($/yr)"] = round(
+                                                    float(plan_only_bill) - float(annual_bill_value),
+                                                    0,
+                                                )
+                                            else:
+                                                rr["Savings vs Plan only ($/yr)"] = None
+
                                 st.session_state["joint_stage_df"] = pd.DataFrame(stage_rows)
                                 st.session_state["joint_stage_meta"] = {
                                     "plan": best_plan_name,
@@ -9404,6 +9909,27 @@ if show_battery_only:
                         st.caption(joint_meta["summary"])
 
                     best = df_joint.iloc[0]
+                    best_plan_name = str(best.get("Plan", "-") or "-")
+                    best_solar_kw = _coerce_float(best.get("Optimal solar size (kW)"))
+                    best_battery_kwh = _coerce_float(best.get("Optimal battery (kWh)"))
+                    best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
+                    current_bill_opt = _coerce_float(best.get("Current solar/no-battery annual bill ($/yr)"))
+                    recommended_bill_opt = _coerce_float(best.get("Estimated annual bill with battery ($/yr)"))
+                    total_savings_opt = _coerce_float(
+                        best.get("Total savings vs current solar, no battery ($/yr)", best.get("Annualised savings ($/yr)", 0.0))
+                    )
+                    package_capex_opt = (
+                        float(_coerce_float(best.get("Battery cost ($)")) or 0.0)
+                        + float(_coerce_float(best.get("Incremental solar capex ($)")) or 0.0)
+                        + float(_coerce_float(best.get("Load shift capex ($)")) or 0.0)
+                    )
+                    joint_days_opt = float(st.session_state.get("joint_days", 0.0) or 0.0)
+                    if joint_days_opt >= 330:
+                        optimizer_conf = "High"
+                    elif joint_days_opt >= 60:
+                        optimizer_conf = "Moderate"
+                    else:
+                        optimizer_conf = "Low"
                     payback = None
                     try:
                         sav = float(
@@ -9421,28 +9947,58 @@ if show_battery_only:
                     except Exception:
                         payback = None
 
-                    if "Optimal solar size (kW)" in df_joint.columns and df_joint["Optimal solar size (kW)"].notna().any():
-                        s1, s2, s3, s4, s5 = st.columns(5)
-                        s1.metric("Best plan", str(best.get("Plan", "-")))
-                        s2.metric("Best solar size", f"{float(best.get('Optimal solar size (kW)', 0.0)):.1f} kW")
-                        s3.metric("Best battery size", f"{float(best.get('Optimal battery (kWh)', 0.0)):.1f} kWh")
-                        s4.metric(
-                            "Year-1 total savings",
-                            f"${float(best.get('Total savings vs current solar, no battery ($/yr)', best.get('Annualised savings ($/yr)', 0.0))):.0f}/yr",
-                        )
-                        s5.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
-                    else:
-                        s1, s2, s3, s4 = st.columns(4)
-                        s1.metric("Best plan", str(best.get("Plan", "-")))
-                        s2.metric("Best battery size", f"{float(best.get('Optimal battery (kWh)', 0.0)):.1f} kWh")
-                        s3.metric(
-                            "Year-1 total savings",
-                            f"${float(best.get('Total savings vs current solar, no battery ($/yr)', best.get('Annualised savings ($/yr)', 0.0))):.0f}/yr",
-                        )
-                        s4.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
+                    optimizer_setup_text = best_plan_name
+                    if best_solar_kw is not None and best_solar_kw > 0.0:
+                        optimizer_setup_text += f" + {float(best_solar_kw):.1f} kW solar"
+                    if best_battery_kwh is not None and best_battery_kwh > 0.0:
+                        optimizer_setup_text += f" + {float(best_battery_kwh):.1f} kWh battery"
+                    if best_load_shift_label != "Off":
+                        optimizer_setup_text += f" + {best_load_shift_label.lower()} load shifting"
 
-                    best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
-                    st.caption(f"Optimized load shift: {best_load_shift_label}.")
+                    st.markdown("#### Optimiser recommendation")
+                    st.success(f"**Recommended setup:** {optimizer_setup_text}")
+
+                    optimizer_summary_parts: list[str] = []
+                    if current_bill_opt is not None and recommended_bill_opt is not None and total_savings_opt is not None:
+                        optimizer_summary_parts.append(
+                            f"Annual bill moves from ${float(current_bill_opt):,.0f}/yr to ${float(recommended_bill_opt):,.0f}/yr, "
+                            f"about ${float(total_savings_opt):,.0f}/yr lower."
+                        )
+                    elif recommended_bill_opt is not None:
+                        optimizer_summary_parts.append(
+                            f"Optimised annual bill is about ${float(recommended_bill_opt):,.0f}/yr."
+                        )
+                    if package_capex_opt > 0.0:
+                        if payback is not None:
+                            optimizer_summary_parts.append(
+                                f"Estimated upfront package cost is ${float(package_capex_opt):,.0f}, with simple payback around {float(payback):.1f} years."
+                            )
+                        else:
+                            optimizer_summary_parts.append(
+                                f"Estimated upfront package cost is ${float(package_capex_opt):,.0f}."
+                            )
+                    optimizer_summary_parts.append(
+                        f"Confidence is {optimizer_conf.lower()} based on about {float(joint_days_opt):,.0f} days of interval data."
+                    )
+                    st.caption(" ".join(optimizer_summary_parts))
+
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric("Best plan", best_plan_name)
+                    r2.metric(
+                        "Best solar size",
+                        (f"{float(best_solar_kw):.1f} kW" if best_solar_kw is not None and best_solar_kw > 0.0 else "-"),
+                    )
+                    r3.metric(
+                        "Best battery size",
+                        (f"{float(best_battery_kwh):.1f} kWh" if best_battery_kwh is not None and best_battery_kwh > 0.0 else "-"),
+                    )
+                    r4.metric("Load shift", best_load_shift_label)
+
+                    r5, r6, r7, r8 = st.columns(4)
+                    r5.metric("Current annual bill", (f"${float(current_bill_opt):,.0f}/yr" if current_bill_opt is not None else "-"))
+                    r6.metric("Optimised annual bill", (f"${float(recommended_bill_opt):,.0f}/yr" if recommended_bill_opt is not None else "-"))
+                    r7.metric("Year-1 total savings", (f"${float(total_savings_opt):,.0f}/yr" if total_savings_opt is not None else "-"))
+                    r8.metric("Payback (simple)", (f"{payback:.1f} yrs" if payback is not None else "-"))
 
                     best_self_cons = pd.to_numeric(
                         [best.get("Est. self-consumption (solar-only, %)", None)],
@@ -9479,16 +10035,16 @@ if show_battery_only:
                         )
                         if stage_load_shift_label != "Off":
                             stage_caption += (
-                                f" Optimizer-selected load shift profile: {stage_load_shift_label}. "
+                                f" Optimiser-selected load shift profile: {stage_load_shift_label}. "
                                 "For load shifting, 'Plan only' uses the same EV-adjusted baseline with load shifting turned off."
                             )
                         st.caption(stage_caption)
 
                     df_joint_full = st.session_state.get("joint_opt_full_df")
                     report_assumptions = st.session_state.get("joint_report_assumptions") or {}
-                    st.markdown("#### Optimizer report")
-                    st.caption("This report reflects the exact settings used for the last optimizer run.")
-                    with st.expander("Show optimizer report (visual + assumptions legend)", expanded=False):
+                    st.markdown("#### Detailed optimiser report")
+                    st.caption("This report reflects the exact settings used for the last optimiser run.")
+                    with st.expander("Show optimiser report (visual + assumptions legend)", expanded=False):
                         bill_val = pd.to_numeric(
                             [best.get("Estimated annual bill with battery ($/yr)", None)],
                             errors="coerce",
@@ -9561,18 +10117,18 @@ if show_battery_only:
                         ex1, ex2, ex3 = st.columns(3)
                         with ex1:
                             st.download_button(
-                                "Download optimizer report (.md)",
+                                "Download optimiser report (.md)",
                                 data=report_md,
-                                file_name=f"optimizer_report_{dt.date.today().isoformat()}.md",
+                                file_name=f"optimiser_report_{dt.date.today().isoformat()}.md",
                                 mime="text/markdown",
                                 key="btn_download_optimizer_report_md",
                             )
                         with ex2:
                             if report_pdf:
                                 st.download_button(
-                                    "Download optimizer report (.pdf)",
+                                    "Download optimiser report (.pdf)",
                                     data=report_pdf,
-                                    file_name=f"optimizer_report_{dt.date.today().isoformat()}.pdf",
+                                    file_name=f"optimiser_report_{dt.date.today().isoformat()}.pdf",
                                     mime="application/pdf",
                                     key="btn_download_optimizer_report_pdf",
                                 )
@@ -9582,7 +10138,7 @@ if show_battery_only:
                             st.download_button(
                                 "Download assumptions (.json)",
                                 data=manifest_json,
-                                file_name=f"optimizer_report_manifest_{dt.date.today().isoformat()}.json",
+                                file_name=f"optimiser_report_manifest_{dt.date.today().isoformat()}.json",
                                 mime="application/json",
                                 key="btn_download_optimizer_report_manifest",
                             )
@@ -9592,7 +10148,7 @@ if show_battery_only:
                             st.download_button(
                                 "Download best-per-plan table (.csv)",
                                 data=df_joint.to_csv(index=False).encode("utf-8"),
-                                file_name=f"optimizer_best_per_plan_{dt.date.today().isoformat()}.csv",
+                                file_name=f"optimiser_best_per_plan_{dt.date.today().isoformat()}.csv",
                                 mime="text/csv",
                                 key="btn_download_optimizer_best_csv",
                             )
@@ -9601,7 +10157,7 @@ if show_battery_only:
                                 st.download_button(
                                     "Download full sweep table (.csv)",
                                     data=df_joint_full.to_csv(index=False).encode("utf-8"),
-                                    file_name=f"optimizer_full_sweep_{dt.date.today().isoformat()}.csv",
+                                    file_name=f"optimiser_full_sweep_{dt.date.today().isoformat()}.csv",
                                     mime="text/csv",
                                     key="btn_download_optimizer_full_csv",
                                 )
@@ -9630,12 +10186,12 @@ if show_battery_only:
                         st.caption("Payback uses battery cost + incremental solar capex.")
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
-                    st.info("Run the joint optimizer in this tab to generate results.")
+                    st.info("Run the joint optimiser in this tab to generate results.")
             if battery_view == "What-if: current vs optimised":
                 st.markdown("**What-if: current vs optimised:**")
                 st.caption(
                     "Simple mode: compare your current setup against one what-if scenario, "
-                    "then benchmark against the optimizer recommendation."
+                    "then benchmark against the optimiser recommendation."
                 )
                 st.caption(
                     "EV timing/charger assumptions come from the sidebar Global EV charging model. "
@@ -11212,7 +11768,7 @@ with tab9:
         "Include this plan in app outputs",
         value=bool(getattr(p, "include_in_outputs", True)),
         key=_ek("include_in_outputs"),
-        help="If off, this plan is excluded from Comparison, Breakdowns, Forecast, and optimizer outputs until re-enabled.",
+        help="If off, this plan is excluded from Comparison, Breakdowns, Forecast, and optimiser outputs until re-enabled.",
     )
     meter_type_default = _norm_plan_meter_type(
         getattr(
@@ -11269,7 +11825,7 @@ with tab9:
         step=1.0,
         format="%.2f",
         key=_ek("signup_credit"),
-        help="One-off credit applied for plan-switch comparison only. Excluded from forecast and optimizer modelling. You can set an expiry date below.",
+        help="One-off credit applied for plan-switch comparison only. Excluded from forecast and optimiser modelling. You can set an expiry date below.",
     )
     connection_fee_dollars = st.number_input(
         "One-time connection fee ($)",
@@ -11278,7 +11834,7 @@ with tab9:
         step=1.0,
         format="%.2f",
         key=_ek("connection_fee"),
-        help="One-off plan establishment or connection fee applied in comparison only. Excluded from forecast and optimizer modelling.",
+        help="One-off plan establishment or connection fee applied in comparison only. Excluded from forecast and optimiser modelling.",
     )
     signup_credit_expiry_default = _parse_iso_date(getattr(p, "signup_credit_expiry", None))
     signup_credit_has_expiry = st.checkbox(
@@ -11428,7 +11984,7 @@ with tab9:
         format="%.3f",
         key=_ek("fit_unqualified_feed_in_flat"),
         disabled=not fit_requires_home_battery,
-        help="Applied when battery eligibility is not met in optimizer/battery modelling runs.",
+        help="Applied when battery eligibility is not met in optimiser/battery modelling runs.",
     )
 
     st.markdown("#### Controlled load")
