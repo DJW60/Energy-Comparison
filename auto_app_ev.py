@@ -1368,22 +1368,33 @@ def plot_average_24hr_profile_import_export(
     df = df.dropna(subset=["timestamp"])
     df["kwh"] = pd.to_numeric(df["kwh"], errors="coerce").fillna(0.0)
 
-    # Import (E registers)
-    imp = df[df["register"].astype(str).str.fullmatch(r"E\d+")]
-    imp = imp.groupby("timestamp", as_index=False)["kwh"].sum()
-    imp.rename(columns={"kwh": "import_kwh"}, inplace=True)
+    reg = df["register"].astype(str)
+
+    # General import: treat all import registers except E2 as general usage.
+    imp_general = df[reg.str.fullmatch(r"E\d+") & (reg != "E2")]
+    imp_general = imp_general.groupby("timestamp", as_index=False)["kwh"].sum()
+    imp_general.rename(columns={"kwh": "general_import_kwh"}, inplace=True)
+
+    # Controlled load: E2 only.
+    imp_controlled = df[reg == "E2"]
+    imp_controlled = imp_controlled.groupby("timestamp", as_index=False)["kwh"].sum()
+    imp_controlled.rename(columns={"kwh": "controlled_import_kwh"}, inplace=True)
 
     # Export (B registers)
-    exp = df[df["register"].astype(str).str.fullmatch(r"B\d+")]
+    exp = df[reg.str.fullmatch(r"B\d+")]
     exp = exp.groupby("timestamp", as_index=False)["kwh"].sum()
     exp.rename(columns={"kwh": "export_kwh"}, inplace=True)
 
-    merged = pd.merge(imp, exp, on="timestamp", how="outer").fillna(0.0)
+    merged = (
+        pd.merge(imp_general, imp_controlled, on="timestamp", how="outer")
+        .merge(exp, on="timestamp", how="outer")
+        .fillna(0.0)
+    )
     merged = merged.sort_values("timestamp")
 
     # Hourly totals first
     hourly_totals = (
-        merged.set_index("timestamp")[["import_kwh", "export_kwh"]]
+        merged.set_index("timestamp")[["general_import_kwh", "controlled_import_kwh", "export_kwh"]]
         .resample("1H")
         .sum()
         .reset_index()
@@ -1392,7 +1403,7 @@ def plot_average_24hr_profile_import_export(
     hourly_totals["hour"] = hourly_totals["timestamp"].dt.hour
 
     hourly = (
-        hourly_totals.groupby("hour", as_index=False)[["import_kwh", "export_kwh"]]
+        hourly_totals.groupby("hour", as_index=False)[["general_import_kwh", "controlled_import_kwh", "export_kwh"]]
         .mean()
         .sort_values("hour")
     )
@@ -1436,10 +1447,11 @@ def plot_average_24hr_profile_import_export(
 
         fig, ax = plt.subplots()
 
-        ax.plot(hourly["hour_1_24"], hourly["import_kwh"], marker="o")
-        ax.plot(hourly["hour_1_24"], hourly["export_kwh"], marker="o")
+        ax.plot(hourly["hour_1_24"], hourly["general_import_kwh"], marker="o", label="General import (E1)")
+        ax.plot(hourly["hour_1_24"], hourly["controlled_import_kwh"], marker="o", label="Controlled load (E2)")
+        ax.plot(hourly["hour_1_24"], hourly["export_kwh"], marker="o", label="Grid export (Solar feed)")
         if include_solar:
-            ax.plot(hourly["hour_1_24"], hourly["solar_kwh"], marker="o")
+            ax.plot(hourly["hour_1_24"], hourly["solar_kwh"], marker="o", label="Solar production")
             ax.fill_between(hourly["hour_1_24"], hourly["solar_kwh"], alpha=0.15)
 
         ax.set_xticks(range(1, 25))
@@ -1447,20 +1459,27 @@ def plot_average_24hr_profile_import_export(
         ax.set_xlabel("Hour of day (1-24)")
         ax.set_ylabel("Average kWh per hour")
         if include_solar:
-            ax.set_title("Average 24-hour profile (Import, Export, and Solar production)")
+            ax.set_title("Average 24-hour profile (General import, CL, Export, and Solar production)")
         else:
-            ax.set_title("Average 24-hour profile (Grid import & Grid export)")
+            ax.set_title("Average 24-hour profile (General import, CL, and Grid export)")
         ax.grid(True, alpha=0.3)
-        if include_solar:
-            ax.legend(["Grid import (Usage)", "Grid export (Solar feed)", "Solar production"], loc="upper left")
-        else:
-            ax.legend(["Grid import (Usage)", "Grid export (Solar feed)"], loc="upper left")
+        ax.legend(loc="upper left")
 
         st.pyplot(fig, clear_figure=True)
 
     except Exception:
-        chart_cols = ["import_kwh", "export_kwh"] + (["solar_kwh"] if include_solar else [])
-        chart_df = hourly.set_index("hour_1_24")[chart_cols]
+        chart_cols = ["general_import_kwh", "controlled_import_kwh", "export_kwh"] + (["solar_kwh"] if include_solar else [])
+        chart_df = (
+            hourly.set_index("hour_1_24")[chart_cols]
+            .rename(
+                columns={
+                    "general_import_kwh": "General import (E1)",
+                    "controlled_import_kwh": "Controlled load (E2)",
+                    "export_kwh": "Grid export (Solar feed)",
+                    "solar_kwh": "Solar production",
+                }
+            )
+        )
         st.line_chart(chart_df, height=320)
 
 def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
