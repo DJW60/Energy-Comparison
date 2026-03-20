@@ -29,7 +29,7 @@ import textwrap
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -367,6 +367,382 @@ def _markdown_to_pdf_bytes(markdown_text: str) -> bytes | None:
 
     buf.seek(0)
     return buf.getvalue()
+
+
+def _advisor_safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _advisor_money(value: float) -> str:
+    return f"${float(value):,.2f}"
+
+
+def _advisor_plain_money(value: float) -> str:
+    return f"{float(value):,.2f}"
+
+
+def _advisor_number(value: float, decimals: int = 2) -> str:
+    return f"{float(value):,.{decimals}f}"
+
+
+def _advisor_pct(value: float, decimals: int = 2) -> str:
+    return f"{float(value):,.{decimals}f}%"
+
+
+def _advisor_payback(capex: float, annual_saving: float) -> str:
+    if float(capex or 0.0) <= 0.0:
+        return "0.0 years"
+    if float(annual_saving or 0.0) <= 0.0:
+        return "n/a"
+    return f"{(float(capex) / float(annual_saving)):.1f} years"
+
+
+def _advisor_slugify(text: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(text or "").strip()).strip("_")
+    return cleaned or "advisor_bridge_report"
+
+
+def _advisor_build_data_basis(
+    report_assumptions: dict,
+    joint_days: float,
+) -> tuple[str, str]:
+    dataset = dict(report_assumptions.get("dataset") or {})
+    solar = dict(report_assumptions.get("solar") or {})
+
+    dataset_rows = int(_advisor_safe_float(dataset.get("rows"), 0))
+    ts_start = str(dataset.get("timestamp_start", "") or "")
+    ts_end = str(dataset.get("timestamp_end", "") or "")
+    solar_source = str(solar.get("source", "") or "").lower()
+    uploaded_available = bool(solar.get("uploaded_profile_available"))
+    solar_match_pct = _advisor_safe_float(dataset.get("solar_match_pct"))
+    alignment_quality_pct = _advisor_safe_float(dataset.get("solar_alignment_quality_pct"))
+    common_intervals = int(_advisor_safe_float(dataset.get("solar_common_intervals"), 0))
+    solar_intervals_total = int(_advisor_safe_float(dataset.get("solar_intervals_total"), 0))
+    nem_intervals_total = int(_advisor_safe_float(dataset.get("nem_intervals_total"), 0))
+
+    load_validated = dataset_rows > 0 and bool(ts_start) and bool(ts_end)
+    solar_uploaded = solar_source == "uploaded" and uploaded_available
+    solar_modelled = solar_source == "modelled"
+
+    if load_validated and solar_uploaded:
+        summary = (
+            "This result is based on supplied interval load data plus an uploaded solar interval profile. "
+            "The optimiser is using interval-by-interval simulation rather than annual averages."
+        )
+    elif load_validated and solar_modelled:
+        summary = (
+            "This result is based on supplied interval load data plus a modelled solar profile. "
+            "The load side is measured interval data, while the solar side is modelled rather than historical."
+        )
+    elif load_validated:
+        summary = (
+            "This result is based on supplied interval load data, but the saved run does not fully confirm the solar basis. "
+            "Treat the solar layer as only partially validated from metadata."
+        )
+    else:
+        summary = (
+            "The saved run metadata is incomplete, so the report cannot fully validate the data basis from the optimiser session alone."
+        )
+
+    bullets: list[str] = []
+    if load_validated:
+        bullets.append(
+            f"- Load data basis: supplied interval data from `{ts_start}` to `{ts_end}` across `{dataset_rows:,}` rows and `{_advisor_number(joint_days, 0)}` days."
+        )
+    else:
+        bullets.append("- Load data basis: unable to fully validate from saved run metadata.")
+
+    if solar_uploaded:
+        bullets.append("- Solar data basis: uploaded solar interval profile.")
+        if nem_intervals_total > 0 and solar_intervals_total > 0:
+            bullets.append(
+                f"- Solar interval alignment: `{_advisor_pct(solar_match_pct)}` of NEM intervals matched, alignment quality `{_advisor_pct(alignment_quality_pct)}`, common intervals `{common_intervals:,}` of `{nem_intervals_total:,}`."
+            )
+    elif solar_modelled:
+        bullets.append("- Solar data basis: modelled solar profile, not uploaded historical solar intervals.")
+    else:
+        bullets.append("- Solar data basis: not fully confirmed from saved run metadata.")
+
+    bullets.append("- Validation note: retailer billing, load shifting, solar self-consumption, and battery dispatch are all evaluated on interval data within the optimiser run.")
+    return summary, "\n".join(bullets)
+
+
+def _advisor_markdown_table_for_cashflows(rows: list[dict], discount_rate: float) -> str:
+    lines = [
+        "| Year | Cycle Mult | Saving ($) | PV at discount rate ($) |",
+        "|---|---:|---:|---:|",
+    ]
+    for idx, row in enumerate(rows, start=1):
+        year_label = str(row.get("year", idx))
+        saving = _advisor_safe_float(row.get("saving"))
+        pv = saving / ((1.0 + float(discount_rate or 0.0)) ** idx)
+        cycle_mult = _advisor_safe_float(row.get("cycle_mult"), 1.0)
+        lines.append(
+            f"| {year_label} | {_advisor_number(cycle_mult, 4)} | {_advisor_plain_money(saving)} | {_advisor_plain_money(pv)} |"
+        )
+    return "\n".join(lines)
+
+
+def _advisor_bridge_default_filename_local(row: dict) -> str:
+    plan = str(row.get("Plan", "advisor_bridge") or "advisor_bridge")
+    load_shift_scenario = str(row.get("Load shift scenario", "Off") or "Off")
+    solar_size_kw = _advisor_safe_float(row.get("Optimal solar size (kW)"))
+    battery_size_kwh = _advisor_safe_float(row.get("Optimal battery (kWh)"))
+    stem = _advisor_slugify(f"{plan}_{load_shift_scenario}_{solar_size_kw:.1f}kW_{battery_size_kwh:.1f}kWh")
+    return f"{stem}_advisor_bridge.md"
+
+
+def _build_advisor_bridge_report_markdown_local(
+    checkpoint_data: dict,
+    row: dict,
+    checkpoint_label: str = "live_optimizer_session",
+    title: str | None = None,
+    template_path: str | Path | None = None,
+) -> str:
+    del template_path
+    report_assumptions = dict(checkpoint_data.get("joint_report_assumptions") or {})
+    economics = dict(report_assumptions.get("economics") or {})
+    dispatch = dict(report_assumptions.get("battery_dispatch") or {})
+    days = _advisor_safe_float(checkpoint_data.get("joint_days"))
+    data_basis_summary, data_basis_bullets = _advisor_build_data_basis(report_assumptions, days)
+
+    plan = str(row.get("Plan", "Unknown plan"))
+    load_shift_scenario = str(row.get("Load shift scenario", "Off"))
+    solar_size_kw = _advisor_safe_float(row.get("Optimal solar size (kW)"))
+    battery_size_kwh = _advisor_safe_float(row.get("Optimal battery (kWh)"))
+    battery_npv = _advisor_safe_float(row.get("Battery NPV ($)"))
+    annual_savings = _advisor_safe_float(row.get("Annualised savings ($/yr)"))
+    with_battery_bill = _advisor_safe_float(row.get("Estimated annual bill with battery ($/yr)"))
+    current_bill = _advisor_safe_float(row.get("Current solar/no-battery annual bill ($/yr)"))
+    optimised_no_battery_bill = with_battery_bill + annual_savings
+    step1_saving = current_bill - optimised_no_battery_bill
+    step2_saving = annual_savings
+    total_saving = current_bill - with_battery_bill
+    solar_capex = _advisor_safe_float(row.get("Incremental solar capex ($)"))
+    load_shift_capex = _advisor_safe_float(row.get("Load shift capex ($)"))
+    battery_capex = _advisor_safe_float(row.get("Battery cost ($)"))
+    pre_battery_capex = solar_capex + load_shift_capex
+    full_capex = pre_battery_capex + battery_capex
+    pv_battery_savings = battery_npv + battery_capex
+
+    battery_life_years = _advisor_safe_float(economics.get("battery_life_years"))
+    degradation_rate = _advisor_safe_float(economics.get("degradation_rate"))
+    price_growth_rate = _advisor_safe_float(economics.get("price_growth_rate"))
+    discount_rate = _advisor_safe_float(economics.get("discount_rate"))
+    cycle_life_efc = _advisor_safe_float(economics.get("cycle_life_efc"))
+    eol_capacity_frac = _advisor_safe_float(economics.get("eol_capacity_frac"), 1.0)
+    cycle_aware = bool(economics.get("cycle_aware"))
+
+    cycles_equiv = _advisor_safe_float(row.get("Cycles equiv"))
+    efc_per_year = (cycles_equiv * (365.0 / days)) if days > 0 else _advisor_safe_float(row.get("Cycles/yr (EFC)"))
+    cf_model = _build_battery_cashflows(
+        annual_savings=annual_savings,
+        batt_cost=battery_capex,
+        battery_life_years=battery_life_years,
+        degradation_rate=degradation_rate,
+        price_growth_rate=price_growth_rate,
+        cycle_aware=cycle_aware,
+        efc_per_year=efc_per_year,
+        cycle_life_efc=cycle_life_efc,
+        eol_capacity_frac=eol_capacity_frac,
+    )
+
+    short_version = (
+        "This result shows value being created in layers: the retailer, load-shift, and solar step improves the bill first, and the battery then adds a second commercially attractive layer of savings."
+        if step1_saving > 0 and step2_saving > 0 and battery_npv > 0
+        else "This result needs careful explanation because at least one layer of the package is not clearly adding value on the current assumptions."
+    )
+    client_explanation = (
+        f"\"On this optimiser result, the household starts at about {_advisor_money(current_bill)} per year on the current solar / no-battery setup. "
+        f"Moving to the winning retailer, applying the `{load_shift_scenario}` load-shift profile, and increasing solar to `{_advisor_number(solar_size_kw, 1)} kW` brings the bill down to about {_advisor_money(optimised_no_battery_bill)} per year before any battery is added. "
+        f"Adding the `{_advisor_number(battery_size_kwh, 1)} kWh` battery then takes the bill down much further, to about {_advisor_money(with_battery_bill)} per year.\n\n"
+        f"That means the retailer + load-shift + solar step is doing about {_advisor_money(step1_saving)} per year of work, and the battery adds a further {_advisor_money(step2_saving)} per year on top of that. "
+        f"On the model assumptions used here, that gives the battery a {'positive' if battery_npv >= 0 else 'negative'} NPV of about {_advisor_money(battery_npv)}.\""
+    )
+    closing_comment = (
+        "On this example, the value is being built progressively. The retailer and daytime load-shifting improve the economics first, the larger solar system adds another layer of bill reduction, and the battery then captures remaining export and evening demand. That is why the battery economics look strong here: it is being added to an already well-optimised setup."
+        if battery_npv >= 0
+        else "On this example, the result should be treated as a scenario rather than a recommendation in isolation. The commercial case depends on whether the real usage pattern continues to resemble the historical data."
+    )
+    battery_package_note = (
+        f"The row also reports `PV lifetime saving vs same solar, no battery ($)` as `{_advisor_money(_advisor_safe_float(row.get('PV lifetime saving vs same solar, no battery ($)')))}`. "
+        "That broader package figure subtracts the battery and load-shift capex from the same-solar no-battery case, whereas `Battery NPV ($)` remains a battery-only measure."
+        if "PV lifetime saving vs same solar, no battery ($)" in row
+        else "This is why the battery can have a positive NPV even though the broader package still needs to be judged with the other capex layers included."
+    )
+    cashflow_table = _advisor_markdown_table_for_cashflows(list(cf_model.get("yearly_rows", [])), discount_rate)
+    report_title = str(title or f"{plan}: Advisor Bridge Report")
+
+    return f"""# {report_title}
+
+This report explains one specific optimiser result using the saved row from:
+
+- `{checkpoint_label}`
+
+## Case Used
+
+- Plan: `{plan}`
+- Load shift scenario: `{load_shift_scenario}`
+- Load shift: `{row.get("Load shift", "Off")}`
+- Shifted kWh: `{_advisor_number(_advisor_safe_float(row.get("Shifted kWh")), 1)}`
+- Shift solar absorbed: `{_advisor_number(_advisor_safe_float(row.get("Shift solar absorbed (kWh)")), 1)} kWh`
+- Shift grid top-up: `{_advisor_number(_advisor_safe_float(row.get("Shift grid top-up (kWh)")), 1)} kWh`
+- Optimal solar size: `{_advisor_number(solar_size_kw, 1)} kW`
+- Optimal battery size: `{_advisor_number(battery_size_kwh, 1)} kWh`
+- Battery NPV: `{_advisor_money(battery_npv)}`
+- IRR: `{_advisor_pct(_advisor_safe_float(row.get("IRR (%)")))}`
+- Annualised battery saving: `{_advisor_money(step2_saving)}/yr`
+- Total saving vs current solar / no battery: `{_advisor_money(total_saving)}/yr`
+- Estimated annual bill with battery: `{_advisor_money(with_battery_bill)}/yr`
+- Current solar / no battery annual bill: `{_advisor_money(current_bill)}/yr`
+- Incremental solar capex: `{_advisor_money(solar_capex)}`
+- Load shift capex: `{_advisor_money(load_shift_capex)}`
+- Battery cost: `{_advisor_money(battery_capex)}`
+
+## Assumptions Used
+
+- Scenario: `{report_assumptions.get("run", {}).get("mode_label", "Unknown")}`
+- Battery life: `{_advisor_number(battery_life_years, 0)} years`
+- Annual degradation: `{_advisor_pct(degradation_rate * 100.0 if degradation_rate <= 1 else degradation_rate)}`
+- Discount rate: `{_advisor_pct(discount_rate * 100.0 if discount_rate <= 1 else discount_rate)}`
+- Electricity price growth: `{_advisor_pct(price_growth_rate * 100.0 if price_growth_rate <= 1 else price_growth_rate)}`
+- Battery aging model: `{"Cycle-aware" if cycle_aware else "Simple"}`
+- Cycle life to end-of-life: `{_advisor_number(cycle_life_efc, 0)} EFC`
+- End-of-life usable capacity: `{_advisor_pct(eol_capacity_frac * 100.0)}`
+- Battery cost rate: `{_advisor_money(_advisor_safe_float(economics.get("effective_battery_cost_rate_per_kwh")))} /kWh`
+- Battery power: `{_advisor_number(_advisor_safe_float(dispatch.get("power_kw")), 1)} kW`
+- Reserve: `{_advisor_pct(_advisor_safe_float(dispatch.get("reserve_pct")))}`
+- Round-trip efficiency: `{_advisor_pct(_advisor_safe_float(dispatch.get("roundtrip_eff")) * 100.0)}`
+- Initial state of charge: `{_advisor_pct(_advisor_safe_float(dispatch.get("initial_soc_pct")))}`
+
+## Data Basis
+
+{data_basis_summary}
+
+{data_basis_bullets}
+
+## Bill Bridge
+
+```text
+Current solar / no battery baseline        {_advisor_money(current_bill)} /yr
+Optimised plan + load shift + {_advisor_number(solar_size_kw, 1)} kW PV   {_advisor_money(optimised_no_battery_bill)} /yr
+Optimised plan + load shift + PV + battery   {_advisor_money(with_battery_bill)} /yr
+```
+
+```text
+Step 1: Optimisation before battery
+= {_advisor_plain_money(current_bill)} - {_advisor_plain_money(optimised_no_battery_bill)}
+= {_advisor_money(step1_saving)} /yr
+
+Step 2: Battery added to that same optimised case
+= {_advisor_plain_money(optimised_no_battery_bill)} - {_advisor_plain_money(with_battery_bill)}
+= {_advisor_money(step2_saving)} /yr
+
+Total saving vs current solar / no battery
+= {_advisor_plain_money(current_bill)} - {_advisor_plain_money(with_battery_bill)}
+= {_advisor_money(total_saving)} /yr
+```
+
+The hidden no-battery optimised bill is:
+
+```text
+No-battery optimised annual bill
+= annual bill with battery + annual battery saving
+= {_advisor_plain_money(with_battery_bill)} + {_advisor_plain_money(step2_saving)}
+= {_advisor_money(optimised_no_battery_bill)} /yr
+```
+
+## Capex Bridge
+
+```text
+Current solar / no battery baseline
+Bill: {_advisor_money(current_bill)}/yr
+Capex: $0.00
+```
+
+```text
+Optimised plan + load shift + {_advisor_number(solar_size_kw, 1)} kW solar
+Bill: {_advisor_money(optimised_no_battery_bill)}/yr
+Annual saving vs baseline: {_advisor_money(step1_saving)}/yr
+Capex: {_advisor_money(pre_battery_capex)}
+  = {_advisor_money(solar_capex)} solar + {_advisor_money(load_shift_capex)} load shift
+Simple payback: {_advisor_payback(pre_battery_capex, step1_saving)}
+```
+
+```text
+Add {_advisor_number(battery_size_kwh, 1)} kWh battery to that same optimised case
+Bill: {_advisor_money(with_battery_bill)}/yr
+Incremental annual saving: {_advisor_money(step2_saving)}/yr
+Incremental capex: {_advisor_money(battery_capex)}
+Simple payback: {_advisor_payback(battery_capex, step2_saving)}
+```
+
+```text
+Full package vs current baseline
+Bill: {_advisor_money(with_battery_bill)}/yr
+Total annual saving: {_advisor_money(total_saving)}/yr
+Total capex: {_advisor_money(full_capex)}
+  = {_advisor_money(solar_capex)} solar + {_advisor_money(load_shift_capex)} load shift + {_advisor_money(battery_capex)} battery
+Blended simple payback: {_advisor_payback(full_capex, total_saving)}
+```
+
+## What The Battery NPV Measures
+
+`Battery NPV ($)` is a battery-only economics measure.
+
+It does not include:
+
+- solar capex
+- load shift capex
+
+For this row:
+
+```text
+PV of battery savings over life   {_advisor_money(pv_battery_savings)}
+Less battery capex               ({_advisor_money(battery_capex)})
+Battery NPV                       {_advisor_money(battery_npv)}
+```
+
+{battery_package_note}
+
+## Battery Cashflow View
+
+{cashflow_table}
+
+## Advisor-Style Interpretation
+
+### Short Version
+
+{short_version}
+
+### Recommended Client Explanation
+
+{client_explanation}
+
+### Practical Caveat
+
+This is still a modelled result, not a guarantee. In particular, the outcome is sensitive to:
+
+- how accurately the load-shift assumptions match reality
+- whether the flexible loads can actually be shifted as assumed
+- whether the solar production profile remains similar going forward
+- whether future retail tariffs and FiT structures remain similar
+
+## Example Closing Comment
+
+{closing_comment}
+"""
+
+
+if advisor_bridge_default_filename is None or build_advisor_bridge_report_markdown is None:
+    advisor_bridge_default_filename = _advisor_bridge_default_filename_local
+    build_advisor_bridge_report_markdown = _build_advisor_bridge_report_markdown_local
+    _advisor_bridge_import_error = None
 
 
 def _render_joint_optimizer_visuals(
@@ -10123,13 +10499,23 @@ if show_battery_only:
                         advisor_report_filename = None
                         advisor_report_error = None
                         advisor_report_pdf_error = None
-                        if callable(build_advisor_bridge_report_markdown):
+                        advisor_report_builder = (
+                            build_advisor_bridge_report_markdown
+                            if callable(build_advisor_bridge_report_markdown)
+                            else _build_advisor_bridge_report_markdown_local
+                        )
+                        advisor_filename_builder = (
+                            advisor_bridge_default_filename
+                            if callable(advisor_bridge_default_filename)
+                            else _advisor_bridge_default_filename_local
+                        )
+                        if callable(advisor_report_builder):
                             try:
                                 best_row_export = {
                                     str(k): (None if pd.isna(v) else v)
                                     for k, v in dict(best).items()
                                 }
-                                advisor_report_md = build_advisor_bridge_report_markdown(
+                                advisor_report_md = advisor_report_builder(
                                     checkpoint_data={
                                         "joint_report_assumptions": report_assumptions,
                                         "joint_days": float(joint_days_opt or 0.0),
@@ -10140,8 +10526,8 @@ if show_battery_only:
                                     template_path=Path(__file__).with_name("advisor_bridge_report_template.md"),
                                 )
                                 advisor_report_filename = (
-                                    advisor_bridge_default_filename(best_row_export)
-                                    if callable(advisor_bridge_default_filename)
+                                    advisor_filename_builder(best_row_export)
+                                    if callable(advisor_filename_builder)
                                     else f"advisor_bridge_{dt.date.today().isoformat()}.md"
                                 )
                             except Exception as exc:
@@ -10190,8 +10576,6 @@ if show_battery_only:
                                 )
                             elif advisor_report_error:
                                 st.caption(f"Advisor export unavailable: {advisor_report_error}")
-                            elif _advisor_bridge_import_error:
-                                st.caption(f"Advisor export unavailable: {_advisor_bridge_import_error}")
                             else:
                                 st.caption("Advisor export unavailable in this runtime.")
                         with ax2:
@@ -10206,8 +10590,6 @@ if show_battery_only:
                             elif advisor_report_pdf_error:
                                 st.caption(f"Advisor PDF export unavailable: {advisor_report_pdf_error}")
                             elif advisor_report_error:
-                                st.caption("Advisor PDF export unavailable.")
-                            elif _advisor_bridge_import_error:
                                 st.caption("Advisor PDF export unavailable.")
                             else:
                                 st.caption("Advisor PDF export unavailable in this runtime.")
