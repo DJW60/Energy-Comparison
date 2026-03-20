@@ -33,6 +33,15 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+try:
+    from generate_advisor_bridge_report import (
+        advisor_bridge_default_filename,
+        build_advisor_bridge_report_markdown,
+    )
+except Exception:
+    advisor_bridge_default_filename = None
+    build_advisor_bridge_report_markdown = None
+
 
 def _infer_interval_minutes_from_series(ts: pd.Series) -> float:
     """Infer the interval length (minutes) from a timestamp series."""
@@ -10088,6 +10097,33 @@ if show_battery_only:
                             df_full=df_joint_full if isinstance(df_joint_full, pd.DataFrame) else None,
                         )
                         report_pdf = _markdown_to_pdf_bytes(report_md)
+                        advisor_report_md = None
+                        advisor_report_pdf = None
+                        advisor_report_filename = None
+                        advisor_report_error = None
+                        if callable(build_advisor_bridge_report_markdown):
+                            try:
+                                best_row_export = {
+                                    str(k): (None if pd.isna(v) else v)
+                                    for k, v in dict(best).items()
+                                }
+                                advisor_report_md = build_advisor_bridge_report_markdown(
+                                    checkpoint_data={
+                                        "joint_report_assumptions": report_assumptions,
+                                        "joint_days": float(joint_days_opt or 0.0),
+                                    },
+                                    row=best_row_export,
+                                    checkpoint_label=str(joint_meta.get("run_id", "live_optimizer_session") or "live_optimizer_session"),
+                                    title=f"{best_plan_name}: Advisor Bridge Report",
+                                )
+                                advisor_report_pdf = _markdown_to_pdf_bytes(advisor_report_md)
+                                advisor_report_filename = (
+                                    advisor_bridge_default_filename(best_row_export)
+                                    if callable(advisor_bridge_default_filename)
+                                    else f"advisor_bridge_{dt.date.today().isoformat()}.md"
+                                )
+                            except Exception as exc:
+                                advisor_report_error = str(exc)
 
                         top_export = df_joint.head(25).copy()
                         top_export = top_export.where(pd.notna(top_export), None)
@@ -10113,6 +10149,35 @@ if show_battery_only:
                             ),
                         }
                         manifest_json = json.dumps(manifest_obj, indent=2, ensure_ascii=True, default=str)
+
+                        st.markdown("**Advisor-facing export (recommended row)**")
+                        ax1, ax2 = st.columns(2)
+                        with ax1:
+                            if advisor_report_md and advisor_report_filename:
+                                st.download_button(
+                                    "Download advisor bridge (.md)",
+                                    data=advisor_report_md,
+                                    file_name=advisor_report_filename,
+                                    mime="text/markdown",
+                                    key="btn_download_optimizer_advisor_md",
+                                )
+                            elif advisor_report_error:
+                                st.caption(f"Advisor export unavailable: {advisor_report_error}")
+                            else:
+                                st.caption("Advisor export unavailable in this runtime.")
+                        with ax2:
+                            if advisor_report_pdf and advisor_report_filename:
+                                st.download_button(
+                                    "Download advisor bridge (.pdf)",
+                                    data=advisor_report_pdf,
+                                    file_name=str(Path(advisor_report_filename).with_suffix(".pdf").name),
+                                    mime="application/pdf",
+                                    key="btn_download_optimizer_advisor_pdf",
+                                )
+                            elif advisor_report_error:
+                                st.caption("Advisor PDF export unavailable.")
+                            else:
+                                st.caption("Advisor PDF export unavailable in this runtime.")
 
                         ex1, ex2, ex3 = st.columns(3)
                         with ex1:
