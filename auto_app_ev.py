@@ -6426,11 +6426,27 @@ if "battery_assumptions_cfg" not in st.session_state:
 if "plan_addons_cfg" not in st.session_state:
     st.session_state["plan_addons_cfg"] = load_plan_addons_config()
 if "current_setup_meter_type" not in st.session_state:
-    st.session_state["current_setup_meter_type"] = "unknown"
+    st.session_state["current_setup_meter_type"] = "smart"
 else:
     st.session_state["current_setup_meter_type"] = _norm_current_meter_type(
-        st.session_state.get("current_setup_meter_type", "unknown")
+        st.session_state.get("current_setup_meter_type", "smart")
     )
+if "ev_annual_km" not in st.session_state:
+    st.session_state["ev_annual_km"] = 10000.0
+if "ev_charge_loss_pct" not in st.session_state:
+    st.session_state["ev_charge_loss_pct"] = 5.0
+if "ev_uploaded_inclusion_mode" not in st.session_state:
+    st.session_state["ev_uploaded_inclusion_mode"] = "Fully included in uploaded data"
+if "ev_strategy" not in st.session_state:
+    st.session_state["ev_strategy"] = "Solar First + Timer Backup"
+if "ev_timer_start" not in st.session_state:
+    st.session_state["ev_timer_start"] = dt.time(18, 0)
+if "ev_timer_end" not in st.session_state:
+    st.session_state["ev_timer_end"] = dt.time(7, 0)
+if "ev_solar_start" not in st.session_state:
+    st.session_state["ev_solar_start"] = dt.time(9, 0)
+if "ev_solar_end" not in st.session_state:
+    st.session_state["ev_solar_end"] = dt.time(16, 0)
 if "joint_modelled_postcode" not in st.session_state:
     st.session_state["joint_modelled_postcode"] = "4000"
 if "joint_modelled_tilt_deg" not in st.session_state:
@@ -6443,7 +6459,7 @@ if "joint_modelled_losses_pct" not in st.session_state:
 all_plans = st.session_state["plans_lib"]
 battery_assumptions_cfg = st.session_state["battery_assumptions_cfg"]
 plan_addons_cfg = st.session_state["plan_addons_cfg"]
-current_setup_meter_type = _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "unknown"))
+current_setup_meter_type = _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "smart"))
 
 # Back-compat alias (some sections refer to `plans_lib`)
 plans_lib = all_plans
@@ -6652,7 +6668,7 @@ if plan_names_sidebar:
     if "current_setup_ev_enabled" not in st.session_state:
         st.session_state["current_setup_ev_enabled"] = bool(st.session_state.get("ev_enabled", False))
     if "current_setup_ev_km_yr" not in st.session_state:
-        st.session_state["current_setup_ev_km_yr"] = float(st.session_state.get("ev_annual_km", 12000.0))
+        st.session_state["current_setup_ev_km_yr"] = float(st.session_state.get("ev_annual_km", 10000.0))
     if "current_setup_vpp_opt_in" not in st.session_state:
         st.session_state["current_setup_vpp_opt_in"] = True
 
@@ -6665,7 +6681,7 @@ if plan_names_sidebar:
             "Current meter type",
             options=["unknown", "basic", "smart", "all"],
             index=["unknown", "basic", "smart", "all"].index(
-                _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "unknown"))
+                _norm_current_meter_type(st.session_state.get("current_setup_meter_type", "smart"))
             ),
             format_func=_current_meter_type_label,
             key="current_setup_meter_type",
@@ -6717,7 +6733,7 @@ if plan_names_sidebar:
             "Current EV driving (km/yr)",
             min_value=0.0,
             max_value=100000.0,
-            value=float(st.session_state.get("current_setup_ev_km_yr", 12000.0)),
+            value=float(st.session_state.get("current_setup_ev_km_yr", 10000.0)),
             step=500.0,
             key="current_setup_ev_km_yr",
             disabled=not bool(st.session_state.get("current_setup_ev_enabled", False)),
@@ -6773,11 +6789,11 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         "Annual driving (km)",
         min_value=0.0,
         max_value=100000.0,
-        value=12000.0,
+        value=10000.0,
         step=500.0,
         key="ev_annual_km",
         disabled=not ev_enabled,
-        help="Enter your expected yearly driving distance. If unsure, 12,000 km/year is a common baseline.",
+        help="Enter your expected yearly driving distance. If unsure, 10,000 km/year is a practical baseline.",
     )
     ev_consumption = st.number_input(
         "EV consumption (kWh/100km)",
@@ -6793,11 +6809,11 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         "Charging losses (%)",
         min_value=0.0,
         max_value=30.0,
-        value=10.0,
+        value=5.0,
         step=1.0,
         key="ev_charge_loss_pct",
         disabled=not ev_enabled,
-        help="Charging/inverter losses between grid/solar and battery. If unsure, 8-12% is typical.",
+        help="Charging/inverter losses between grid/solar and battery. If unsure, 5-10% is a practical range.",
     )
     ev_charger_kw = st.number_input(
         "Charger power (kW)",
@@ -6828,7 +6844,7 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
     ev_uploaded_inclusion_label = st.selectbox(
         "EV already included in uploaded data",
         uploaded_ev_mode_options,
-        index=0,
+        index=uploaded_ev_mode_options.index("Fully included in uploaded data"),
         key="ev_uploaded_inclusion_mode",
         disabled=not uploaded_interval_data_available,
         help="Use this when the uploaded NEM12 already contains some or all EV charging. The app will estimate a no-EV base before applying the target EV behaviour.",
@@ -6932,14 +6948,14 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
 
     ev_timer_start_t = st.time_input(
         "Target timer start",
-        value=dt.time(0, 0),
+        value=dt.time(18, 0),
         key="ev_timer_start",
         disabled=not ev_enabled,
         help="Local clock time. This timer window can cross midnight.",
     )
     ev_timer_end_t = st.time_input(
         "Target timer end",
-        value=dt.time(6, 0),
+        value=dt.time(7, 0),
         key="ev_timer_end",
         disabled=not ev_enabled,
         help="Local clock time. This timer window can cross midnight.",
@@ -6948,21 +6964,21 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
     if solar_priority_ev_mode:
         ev_solar_start_t = st.time_input(
             "Target solar window start",
-            value=dt.time(10, 0),
+            value=dt.time(9, 0),
             key="ev_solar_start",
             disabled=not ev_enabled,
             help="Local clock time. EV charging can use exported solar only inside this window.",
         )
         ev_solar_end_t = st.time_input(
             "Target solar window end",
-            value=dt.time(15, 0),
+            value=dt.time(16, 0),
             key="ev_solar_end",
             disabled=not ev_enabled,
             help="Local clock time. EV charging can use exported solar only inside this window.",
         )
     else:
-        ev_solar_start_t = st.session_state.get("ev_solar_start", dt.time(10, 0))
-        ev_solar_end_t = st.session_state.get("ev_solar_end", dt.time(15, 0))
+        ev_solar_start_t = st.session_state.get("ev_solar_start", dt.time(9, 0))
+        ev_solar_end_t = st.session_state.get("ev_solar_end", dt.time(16, 0))
 
     if ev_strategy_label == "Solar First + Timer Backup":
         ev_backup_start_t = st.time_input(
@@ -7063,13 +7079,13 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
     with hw2:
         hot_water_shift_start_t = st.time_input(
             "Hot water start",
-            value=dt.time(10, 0),
+            value=dt.time(9, 0),
             key="hot_water_shift_start",
             disabled=not hot_water_shift_enabled,
         )
         hot_water_shift_end_t = st.time_input(
             "Hot water end",
-            value=dt.time(15, 0),
+            value=dt.time(16, 0),
             key="hot_water_shift_end",
             disabled=not hot_water_shift_enabled,
         )
@@ -7087,7 +7103,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Hot water shift capex ($)",
             min_value=0.0,
             max_value=50000.0,
-            value=float(st.session_state.get("hot_water_shift_capex", 0.0)),
+            value=float(st.session_state.get("hot_water_shift_capex", 1500.0)),
             step=50.0,
             key="hot_water_shift_capex",
             disabled=not hot_water_shift_enabled,
@@ -7137,7 +7153,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
     with pp2:
         pool_shift_start_t = st.time_input(
             "Pool start",
-            value=dt.time(10, 0),
+            value=dt.time(9, 0),
             key="pool_shift_start",
             disabled=not pool_shift_enabled,
         )
@@ -7161,7 +7177,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Pool shift capex ($)",
             min_value=0.0,
             max_value=50000.0,
-            value=float(st.session_state.get("pool_shift_capex", 0.0)),
+            value=float(st.session_state.get("pool_shift_capex", 300.0)),
             step=50.0,
             key="pool_shift_capex",
             disabled=not pool_shift_enabled,
