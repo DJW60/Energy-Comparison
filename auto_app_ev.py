@@ -11804,26 +11804,28 @@ if show_battery_only:
                             "ev_km": float(custom_ev_km),
                         }
 
-                    whatif_run_signature_current = {
+                    smart_charger_compare_available = bool(
+                        bool(current_ev_enabled_input)
+                        and bool(ev_enabled)
+                        and bool(embedded_ev_meta.get("enabled", False))
+                        and _ev_strategy_uses_solar_surplus(ev_strategy_code)
+                    )
+                    smart_charger_compare_help = (
+                        "Compares the uploaded current EV behaviour against the selected solar-priority EV mode "
+                        "using the same plan, solar, battery, and load-shift settings. "
+                        "Payback uses the overall annual bill delta between those two cases."
+                        if smart_charger_compare_available
+                        else "Available when the current case has EV enabled, the upload is marked as already containing EV charging, "
+                             "and the sidebar target EV mode is a solar-priority smart-charger mode."
+                    )
+
+                    whatif_run_signature_base = {
                         "current_plan": str(current_plan_input),
                         "current_solar_kw": round(float(current_solar_kw_input), 4),
                         "current_batt_kwh": round(float(current_batt_kwh_input), 4),
                         "current_batt_power_kw": round(float(current_batt_power_kw_input), 4),
                         "current_ev_enabled": bool(current_ev_enabled_input),
                         "current_ev_km": round(float(current_ev_km_input), 2),
-                        "whatif_choice": str(whatif_choice),
-                        "whatif_custom": (
-                            {
-                                "plan": str(custom_params.get("plan", "")),
-                                "solar_kw": round(float(custom_params.get("solar_kw", 0.0)), 4),
-                                "batt_kwh": round(float(custom_params.get("batt_kwh", 0.0)), 4),
-                                "batt_power_kw": round(float(custom_params.get("batt_power_kw", 0.0)), 4),
-                                "ev_enabled": bool(custom_params.get("ev_enabled", False)),
-                                "ev_km": round(float(custom_params.get("ev_km", 0.0)), 2),
-                            }
-                            if isinstance(custom_params, dict)
-                            else None
-                        ),
                         "global_ev_model": {
                             "enabled": bool(ev_enabled),
                             "annual_km": round(float(ev_annual_km), 2),
@@ -11885,6 +11887,20 @@ if show_battery_only:
                             else None
                         ),
                     }
+                    whatif_run_signature_current = dict(whatif_run_signature_base)
+                    whatif_run_signature_current["whatif_choice"] = str(whatif_choice)
+                    whatif_run_signature_current["whatif_custom"] = (
+                        {
+                            "plan": str(custom_params.get("plan", "")),
+                            "solar_kw": round(float(custom_params.get("solar_kw", 0.0)), 4),
+                            "batt_kwh": round(float(custom_params.get("batt_kwh", 0.0)), 4),
+                            "batt_power_kw": round(float(custom_params.get("batt_power_kw", 0.0)), 4),
+                            "ev_enabled": bool(custom_params.get("ev_enabled", False)),
+                            "ev_km": round(float(custom_params.get("ev_km", 0.0)), 2),
+                        }
+                        if isinstance(custom_params, dict)
+                        else None
+                    )
 
                     def _run_simple_case(
                         case_name: str,
@@ -11895,6 +11911,7 @@ if show_battery_only:
                         ev_enabled_case: bool,
                         ev_km_case: float,
                         use_load_shift_case: bool,
+                        ev_case_mode: str | None = None,
                     ) -> tuple[dict | None, str | None]:
                         plan_case = next((p for p in battery_optimizer_plans if p.name == plan_name), None)
                         if plan_case is None:
@@ -11920,16 +11937,27 @@ if show_battery_only:
                             smart_charger_capex=float(ev_smart_charger_capex),
                         )
                         embedded_ev_available_for_case = bool(embedded_ev_meta.get("enabled", False))
-                        current_case_uses_uploaded_baseline = (
-                            embedded_ev_available_for_case
+                        ev_case_mode_resolved = str(ev_case_mode or "").strip().lower()
+                        if ev_case_mode_resolved not in {"uploaded_baseline", "target"}:
+                            current_case_uses_uploaded_baseline = (
+                                embedded_ev_available_for_case
+                                and ev_enabled_flag
+                                and str(case_name).strip().lower().startswith("current")
+                            )
+                            ev_case_mode_resolved = ("uploaded_baseline" if current_case_uses_uploaded_baseline else "target")
+                        if (
+                            ev_case_mode_resolved == "uploaded_baseline"
+                            and embedded_ev_available_for_case
                             and ev_enabled_flag
-                            and str(case_name).strip().lower().startswith("current")
-                        )
-                        if current_case_uses_uploaded_baseline:
+                        ):
                             df_case_ev = df_int_base.copy()
                             _ev_case_summary = {
                                 "enabled": True,
                                 "strategy": "uploaded_current_baseline",
+                                "grid_kwh": float(embedded_ev_meta.get("restored_grid_kwh", 0.0) or 0.0),
+                                "solar_diverted_kwh": float(embedded_ev_meta.get("restored_solar_kwh", 0.0) or 0.0),
+                                "coverage_pct": float(embedded_ev_meta.get("coverage_pct", 100.0) or 100.0),
+                                "smart_charger_capex": 0.0,
                             }
                             note_parts_case.append(
                                 f"{case_name}: using uploaded dataset as the current EV baseline because EV is already embedded in the uploaded data."
@@ -12038,6 +12066,12 @@ if show_battery_only:
                         cashflows_case = list(cf_model_case.get("cashflows", [-float(batt_cost_case)]))
                         npv_case = _npv(cashflows_case, float(discount_rate))
                         irr_case = None if float(batt_kwh) <= 0.0 else _irr_bisection(cashflows_case)
+                        ev_strategy_case = str(_ev_case_summary.get("strategy", "timer_grid") or "timer_grid")
+                        ev_strategy_display = (
+                            "Uploaded current EV baseline"
+                            if ev_strategy_case == "uploaded_current_baseline"
+                            else _format_ev_strategy_label(ev_strategy_case)
+                        )
 
                         out = {
                             "Scenario": str(case_name),
@@ -12050,6 +12084,11 @@ if show_battery_only:
                             "Shift grid top-up (kWh)": round(float(load_shift_case_summary.get("grid_kwh", 0.0) or 0.0), 1),
                             "EV enabled": ("Yes" if ev_enabled_flag else "No"),
                             "EV km/yr": round(float(ev_km_display), 0),
+                            "EV charging strategy": ev_strategy_display,
+                            "EV grid import (kWh)": round(float(_ev_case_summary.get("grid_kwh", 0.0) or 0.0), 1),
+                            "EV solar diverted (kWh)": round(float(_ev_case_summary.get("solar_diverted_kwh", 0.0) or 0.0), 1),
+                            "EV target coverage (%)": round(float(_ev_case_summary.get("coverage_pct", 0.0) or 0.0), 1),
+                            "EV smart charger capex ($)": round(float(_ev_case_summary.get("smart_charger_capex", 0.0) or 0.0), 0),
                             "Annual bill with battery ($/yr)": round(float(annual_bill_with_batt_case), 0),
                             "Annualised savings ($/yr)": round(float(annual_savings_case), 0),
                             "NPV ($)": round(float(npv_case), 0),
@@ -12059,7 +12098,102 @@ if show_battery_only:
                         }
                         return out, note
 
-                    if st.button("Run simple comparison", type="primary", key="btn_run_whatif_simple"):
+                    def _append_optimizer_recommendation_row(rows_simple: list[dict]) -> None:
+                        best_opt = st.session_state.get("joint_best") or {}
+                        if isinstance(best_opt, dict) and best_opt:
+                            rows_simple.append(
+                                {
+                                    "Scenario": "Optimiser recommendation",
+                                    "Plan": str(best_opt.get("Plan", "-")),
+                                    "Solar size (kW)": best_opt.get("Optimal solar size (kW)"),
+                                    "Battery (kWh)": best_opt.get("Optimal battery (kWh)"),
+                                    "Load shift": best_opt.get("Load shift", best_opt.get("Load shift scenario")),
+                                    "Shifted kWh": best_opt.get("Shifted kWh"),
+                                    "Shift solar absorbed (kWh)": best_opt.get("Shift solar absorbed (kWh)"),
+                                    "Shift grid top-up (kWh)": best_opt.get("Shift grid top-up (kWh)"),
+                                    "EV enabled": None,
+                                    "EV km/yr": None,
+                                    "EV charging strategy": best_opt.get("EV charging strategy"),
+                                    "EV grid import (kWh)": None,
+                                    "EV solar diverted (kWh)": None,
+                                    "EV target coverage (%)": None,
+                                    "EV smart charger capex ($)": best_opt.get("EV smart charger capex ($)"),
+                                    "Annual bill with battery ($/yr)": best_opt.get("Estimated annual bill with battery ($/yr)"),
+                                    "Annualised savings ($/yr)": best_opt.get("Annualised savings ($/yr)"),
+                                    "NPV ($)": best_opt.get("Battery NPV ($)"),
+                                    "IRR (%)": best_opt.get("IRR (%)"),
+                                    "Cycles/yr (EFC)": best_opt.get("Cycles/yr (EFC)"),
+                                    "Cycle stress": best_opt.get("Cycle stress", ""),
+                                }
+                            )
+
+                    def _resolve_selected_whatif_case() -> tuple[str, dict | None, bool]:
+                        selected_label = "What-if"
+                        selected_use_load_shift = bool(load_shift_summary.get("enabled", False))
+                        selected_params = None
+                        if whatif_choice == "Current setup only":
+                            selected_params = None
+                        elif whatif_choice == "Higher EV driving (+25%)":
+                            selected_params = {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": float(current_batt_kwh_input),
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input) * 1.25,
+                            }
+                        elif whatif_choice == "Bigger battery (+5 kWh)":
+                            selected_params = {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": float(current_batt_kwh_input) + 5.0,
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input),
+                            }
+                        elif whatif_choice == "No battery":
+                            selected_params = {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": 0.0,
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input),
+                            }
+                        elif whatif_choice == "Load shift impact (on vs off)":
+                            selected_label = "Load shift applied"
+                            selected_use_load_shift = True
+                            selected_params = {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": float(current_batt_kwh_input),
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input),
+                            }
+                        else:
+                            selected_label = "What-if"
+                            selected_params = custom_params or {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": float(current_batt_kwh_input),
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input),
+                            }
+                        return selected_label, selected_params, selected_use_load_shift
+
+                    action_col_1, action_col_2 = st.columns(2)
+                    run_simple_clicked = action_col_1.button("Run simple comparison", type="primary", key="btn_run_whatif_simple")
+                    run_smart_upgrade_clicked = action_col_2.button(
+                        "Compare smart charger upgrade",
+                        key="btn_run_whatif_smart_charger",
+                        disabled=not smart_charger_compare_available,
+                        help=smart_charger_compare_help,
+                    )
+                    st.caption(smart_charger_compare_help)
+
+                    if run_simple_clicked:
                         notes: list[str] = []
 
                         current_case_label = "Current setup"
@@ -12085,53 +12219,8 @@ if show_battery_only:
                         if current_row is not None:
                             rows_simple.append(current_row)
 
-                        if whatif_choice != "Current setup only":
-                            if whatif_choice == "Higher EV driving (+25%)":
-                                whatif_params = {
-                                    "plan": str(current_plan_input),
-                                    "solar_kw": float(current_solar_kw_input),
-                                    "batt_kwh": float(current_batt_kwh_input),
-                                    "batt_power_kw": float(current_batt_power_kw_input),
-                                    "ev_enabled": bool(current_ev_enabled_input),
-                                    "ev_km": float(current_ev_km_input) * 1.25,
-                                }
-                            elif whatif_choice == "Bigger battery (+5 kWh)":
-                                whatif_params = {
-                                    "plan": str(current_plan_input),
-                                    "solar_kw": float(current_solar_kw_input),
-                                    "batt_kwh": float(current_batt_kwh_input) + 5.0,
-                                    "batt_power_kw": float(current_batt_power_kw_input),
-                                    "ev_enabled": bool(current_ev_enabled_input),
-                                    "ev_km": float(current_ev_km_input),
-                                }
-                            elif whatif_choice == "No battery":
-                                whatif_params = {
-                                    "plan": str(current_plan_input),
-                                    "solar_kw": float(current_solar_kw_input),
-                                    "batt_kwh": 0.0,
-                                    "batt_power_kw": float(current_batt_power_kw_input),
-                                    "ev_enabled": bool(current_ev_enabled_input),
-                                    "ev_km": float(current_ev_km_input),
-                                }
-                            elif whatif_choice == "Load shift impact (on vs off)":
-                                whatif_params = {
-                                    "plan": str(current_plan_input),
-                                    "solar_kw": float(current_solar_kw_input),
-                                    "batt_kwh": float(current_batt_kwh_input),
-                                    "batt_power_kw": float(current_batt_power_kw_input),
-                                    "ev_enabled": bool(current_ev_enabled_input),
-                                    "ev_km": float(current_ev_km_input),
-                                }
-                            else:
-                                whatif_params = custom_params or {
-                                    "plan": str(current_plan_input),
-                                    "solar_kw": float(current_solar_kw_input),
-                                    "batt_kwh": float(current_batt_kwh_input),
-                                    "batt_power_kw": float(current_batt_power_kw_input),
-                                    "ev_enabled": bool(current_ev_enabled_input),
-                                    "ev_km": float(current_ev_km_input),
-                                }
-
+                        _selected_label, whatif_params, whatif_use_load_shift = _resolve_selected_whatif_case()
+                        if whatif_params is not None:
                             whatif_row, whatif_note = _run_simple_case(
                                 case_name=whatif_case_label,
                                 plan_name=str(whatif_params["plan"]),
@@ -12140,31 +12229,14 @@ if show_battery_only:
                                 batt_power_kw=float(whatif_params["batt_power_kw"]),
                                 ev_enabled_case=bool(whatif_params["ev_enabled"]),
                                 ev_km_case=float(whatif_params["ev_km"]),
-                                use_load_shift_case=(True if whatif_choice == "Load shift impact (on vs off)" else bool(load_shift_summary.get("enabled", False))),
+                                use_load_shift_case=bool(whatif_use_load_shift),
                             )
                             if whatif_note:
                                 notes.append(whatif_note)
                             if whatif_row is not None:
                                 rows_simple.append(whatif_row)
 
-                        best_opt = st.session_state.get("joint_best") or {}
-                        if isinstance(best_opt, dict) and best_opt:
-                            rows_simple.append(
-                                {
-                                    "Scenario": "Optimiser recommendation",
-                                    "Plan": str(best_opt.get("Plan", "-")),
-                                    "Solar size (kW)": best_opt.get("Optimal solar size (kW)"),
-                                    "Battery (kWh)": best_opt.get("Optimal battery (kWh)"),
-                                    "EV enabled": None,
-                                    "EV km/yr": None,
-                                    "Annual bill with battery ($/yr)": best_opt.get("Estimated annual bill with battery ($/yr)"),
-                                    "Annualised savings ($/yr)": best_opt.get("Annualised savings ($/yr)"),
-                                    "NPV ($)": best_opt.get("Battery NPV ($)"),
-                                    "IRR (%)": best_opt.get("IRR (%)"),
-                                    "Cycles/yr (EFC)": best_opt.get("Cycles/yr (EFC)"),
-                                    "Cycle stress": best_opt.get("Cycle stress", ""),
-                                }
-                            )
+                        _append_optimizer_recommendation_row(rows_simple)
 
                         if not rows_simple:
                             st.warning("Could not calculate any scenarios. Check your inputs.")
@@ -12177,13 +12249,109 @@ if show_battery_only:
                             }
                             if notes:
                                 st.warning("Notes: " + " | ".join(notes))
+                    elif run_smart_upgrade_clicked:
+                        notes = []
+                        current_case_label = "Current setup"
+                        selected_case_label, selected_params, selected_use_load_shift = _resolve_selected_whatif_case()
+                        base_case_label = selected_case_label if selected_params is not None else None
+                        smart_case_label = (
+                            (f"{selected_case_label} + smart charger" if selected_case_label else "Smart charger upgrade")
+                            if selected_params is not None
+                            else "Smart charger upgrade"
+                        )
+
+                        current_row, current_note = _run_simple_case(
+                            case_name=current_case_label,
+                            plan_name=str(current_plan_input),
+                            solar_kw=float(current_solar_kw_input),
+                            batt_kwh=float(current_batt_kwh_input),
+                            batt_power_kw=float(current_batt_power_kw_input),
+                            ev_enabled_case=bool(current_ev_enabled_input),
+                            ev_km_case=float(current_ev_km_input),
+                            use_load_shift_case=bool(load_shift_summary.get("enabled", False)),
+                            ev_case_mode="uploaded_baseline",
+                        )
+                        if current_note:
+                            notes.append(current_note)
+
+                        rows_simple = []
+                        if current_row is not None:
+                            rows_simple.append(current_row)
+
+                        if selected_params is None:
+                            selected_params = {
+                                "plan": str(current_plan_input),
+                                "solar_kw": float(current_solar_kw_input),
+                                "batt_kwh": float(current_batt_kwh_input),
+                                "batt_power_kw": float(current_batt_power_kw_input),
+                                "ev_enabled": bool(current_ev_enabled_input),
+                                "ev_km": float(current_ev_km_input),
+                            }
+                            selected_use_load_shift = bool(load_shift_summary.get("enabled", False))
+                        else:
+                            base_row, base_note = _run_simple_case(
+                                case_name=str(base_case_label),
+                                plan_name=str(selected_params["plan"]),
+                                solar_kw=float(selected_params["solar_kw"]),
+                                batt_kwh=float(selected_params["batt_kwh"]),
+                                batt_power_kw=float(selected_params["batt_power_kw"]),
+                                ev_enabled_case=bool(selected_params["ev_enabled"]),
+                                ev_km_case=float(selected_params["ev_km"]),
+                                use_load_shift_case=bool(selected_use_load_shift),
+                                ev_case_mode="uploaded_baseline",
+                            )
+                            if base_note:
+                                notes.append(base_note)
+                            if base_row is not None:
+                                rows_simple.append(base_row)
+
+                        upgrade_row, upgrade_note = _run_simple_case(
+                            case_name=smart_case_label,
+                            plan_name=str(selected_params["plan"]),
+                            solar_kw=float(selected_params["solar_kw"]),
+                            batt_kwh=float(selected_params["batt_kwh"]),
+                            batt_power_kw=float(selected_params["batt_power_kw"]),
+                            ev_enabled_case=bool(selected_params["ev_enabled"]),
+                            ev_km_case=float(selected_params["ev_km"]),
+                            use_load_shift_case=bool(selected_use_load_shift),
+                            ev_case_mode="target",
+                        )
+                        if upgrade_note:
+                            notes.append(upgrade_note)
+                        if upgrade_row is not None:
+                            rows_simple.append(upgrade_row)
+
+                        _append_optimizer_recommendation_row(rows_simple)
+
+                        if not rows_simple:
+                            st.warning("Could not calculate the smart charger comparison. Check your inputs.")
+                        else:
+                            smart_upgrade_signature = dict(whatif_run_signature_current)
+                            smart_upgrade_signature["scenario_mode"] = "smart_charger_upgrade"
+                            smart_upgrade_signature["smart_charger_capex"] = round(float(ev_smart_charger_capex_active), 2)
+                            st.session_state["whatif_simple_df"] = pd.DataFrame(rows_simple)
+                            st.session_state["whatif_simple_meta"] = {
+                                "run_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "choice": "Smart charger upgrade",
+                                "signature": smart_upgrade_signature,
+                                "smart_upgrade_current_label": str(current_case_label),
+                                "smart_upgrade_base_label": (str(base_case_label) if base_case_label else None),
+                                "smart_upgrade_target_label": str(smart_case_label),
+                            }
+                            if notes:
+                                st.warning("Notes: " + " | ".join(notes))
 
                     df_simple = st.session_state.get("whatif_simple_df")
                     meta_simple = st.session_state.get("whatif_simple_meta") or {}
                     show_simple_results = isinstance(df_simple, pd.DataFrame) and not df_simple.empty
                     if show_simple_results:
                         saved_signature = meta_simple.get("signature")
-                        if (not isinstance(saved_signature, dict)) or (saved_signature != whatif_run_signature_current):
+                        expected_signature = whatif_run_signature_current
+                        if str(meta_simple.get("choice", "")) == "Smart charger upgrade":
+                            expected_signature = dict(whatif_run_signature_current)
+                            expected_signature["scenario_mode"] = "smart_charger_upgrade"
+                            expected_signature["smart_charger_capex"] = round(float(ev_smart_charger_capex_active), 2)
+                        if (not isinstance(saved_signature, dict)) or (saved_signature != expected_signature):
                             if meta_simple.get("run_at"):
                                 st.caption(f"Last run: {meta_simple['run_at']}")
                             st.warning(
@@ -12205,9 +12373,19 @@ if show_battery_only:
                         df_disp = df_simple.copy()
                         current_case_label = "Current setup"
                         whatif_case_label = "What-if"
+                        current_bill_label = "Current annual bill"
+                        whatif_bill_label = "What-if annual bill"
                         if meta_simple.get("choice") == "Load shift impact (on vs off)":
                             current_case_label = "No load shift"
                             whatif_case_label = "Load shift applied"
+                            current_bill_label = "No-shift annual bill"
+                            whatif_bill_label = "Load-shift annual bill"
+                        elif meta_simple.get("choice") == "Smart charger upgrade":
+                            current_case_label = str(meta_simple.get("smart_upgrade_current_label") or "Current setup")
+                            base_case_label = meta_simple.get("smart_upgrade_base_label")
+                            whatif_case_label = str(meta_simple.get("smart_upgrade_target_label") or "Smart charger upgrade")
+                            current_bill_label = "Current annual bill"
+                            whatif_bill_label = f"{whatif_case_label} annual bill"
 
                         cur_match = df_disp[df_disp["Scenario"].astype(str) == current_case_label]
                         if not cur_match.empty:
@@ -12223,42 +12401,59 @@ if show_battery_only:
                         _show_dataframe_with_frozen_column(df_disp, freeze_col="Scenario")
 
                         cur_row = df_disp[df_disp["Scenario"].astype(str) == current_case_label].head(1)
+                        base_row = pd.DataFrame()
+                        if meta_simple.get("choice") == "Smart charger upgrade" and meta_simple.get("smart_upgrade_base_label"):
+                            base_row = df_disp[df_disp["Scenario"].astype(str) == str(meta_simple.get("smart_upgrade_base_label"))].head(1)
                         whatif_row = df_disp[df_disp["Scenario"].astype(str) == whatif_case_label].head(1)
                         opt_row = df_disp[df_disp["Scenario"].astype(str) == "Optimiser recommendation"].head(1)
 
-                        m1, m2, m3 = st.columns(3)
-                        current_bill_label = "Current annual bill"
-                        whatif_bill_label = "What-if annual bill"
-                        if meta_simple.get("choice") == "Load shift impact (on vs off)":
-                            current_bill_label = "No-shift annual bill"
-                            whatif_bill_label = "Load-shift annual bill"
+                        if meta_simple.get("choice") == "Smart charger upgrade" and not base_row.empty:
+                            m1, m2, m3, m4 = st.columns(4)
+                        else:
+                            m1, m2, m3 = st.columns(3)
+                            m4 = None
                         if not cur_row.empty:
                             cur_bill_v = pd.to_numeric(cur_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
                             m1.metric(current_bill_label, f"${float(cur_bill_v):,.0f}/yr" if pd.notna(cur_bill_v) else "-")
                         else:
                             m1.metric(current_bill_label, "-")
 
+                        if m4 is not None and not base_row.empty:
+                            base_bill_v = pd.to_numeric(base_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
+                            base_delta_v = pd.to_numeric(base_row.get("Bill delta vs current ($/yr)"), errors="coerce").iloc[0]
+                            base_label_metric = f"{str(meta_simple.get('smart_upgrade_base_label'))} annual bill"
+                            m2.metric(
+                                base_label_metric,
+                                f"${float(base_bill_v):,.0f}/yr" if pd.notna(base_bill_v) else "-",
+                                (f"${float(base_delta_v):,.0f}/yr" if pd.notna(base_delta_v) else None),
+                            )
+                            smart_metric_col = m3
+                            optimizer_metric_col = m4
+                        else:
+                            smart_metric_col = m2
+                            optimizer_metric_col = m3
+
                         if not whatif_row.empty:
                             w_bill = pd.to_numeric(whatif_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
                             w_delta = pd.to_numeric(whatif_row.get("Bill delta vs current ($/yr)"), errors="coerce").iloc[0]
-                            m2.metric(
+                            smart_metric_col.metric(
                                 whatif_bill_label,
                                 f"${float(w_bill):,.0f}/yr" if pd.notna(w_bill) else "-",
                                 (f"${float(w_delta):,.0f}/yr" if pd.notna(w_delta) else None),
                             )
                         else:
-                            m2.metric(whatif_bill_label, "-")
+                            smart_metric_col.metric(whatif_bill_label, "-")
 
                         if not opt_row.empty:
                             o_bill = pd.to_numeric(opt_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
                             o_delta = pd.to_numeric(opt_row.get("Bill delta vs current ($/yr)"), errors="coerce").iloc[0]
-                            m3.metric(
+                            optimizer_metric_col.metric(
                                 "Optimiser annual bill",
                                 f"${float(o_bill):,.0f}/yr" if pd.notna(o_bill) else "-",
                                 (f"${float(o_delta):,.0f}/yr" if pd.notna(o_delta) else None),
                             )
                         else:
-                            m3.metric("Optimiser annual bill", "Run subtab 3")
+                            optimizer_metric_col.metric("Optimiser annual bill", "Run subtab 3")
 
                         if meta_simple.get("choice") == "Load shift impact (on vs off)" and not whatif_row.empty:
                             ls1, ls2, ls3, ls4 = st.columns(4)
@@ -12273,6 +12468,82 @@ if show_battery_only:
                                 "Bill impact vs no shift",
                                 (f"${float(ls_bill_delta):,.0f}/yr" if pd.notna(ls_bill_delta) else "-"),
                             )
+                        if meta_simple.get("choice") == "Smart charger upgrade" and not cur_row.empty and not whatif_row.empty:
+                            cur_bill_sc = pd.to_numeric(cur_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
+                            smart_bill_sc = pd.to_numeric(whatif_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
+                            charger_capex_sc = pd.to_numeric(whatif_row.get("EV smart charger capex ($)"), errors="coerce").iloc[0]
+                            cur_grid_sc = pd.to_numeric(cur_row.get("EV grid import (kWh)"), errors="coerce").iloc[0]
+                            smart_grid_sc = pd.to_numeric(whatif_row.get("EV grid import (kWh)"), errors="coerce").iloc[0]
+                            cur_solar_sc = pd.to_numeric(cur_row.get("EV solar diverted (kWh)"), errors="coerce").iloc[0]
+                            smart_solar_sc = pd.to_numeric(whatif_row.get("EV solar diverted (kWh)"), errors="coerce").iloc[0]
+                            base_bill_sc = None
+                            base_grid_sc = None
+                            base_solar_sc = None
+                            if not base_row.empty:
+                                _base_bill_sc = pd.to_numeric(base_row["Annual bill with battery ($/yr)"], errors="coerce").iloc[0]
+                                _base_grid_sc = pd.to_numeric(base_row.get("EV grid import (kWh)"), errors="coerce").iloc[0]
+                                _base_solar_sc = pd.to_numeric(base_row.get("EV solar diverted (kWh)"), errors="coerce").iloc[0]
+                                base_bill_sc = float(_base_bill_sc) if pd.notna(_base_bill_sc) else None
+                                base_grid_sc = float(_base_grid_sc) if pd.notna(_base_grid_sc) else None
+                                base_solar_sc = float(_base_solar_sc) if pd.notna(_base_solar_sc) else None
+                            bill_improvement_sc = (
+                                float(cur_bill_sc) - float(smart_bill_sc)
+                                if pd.notna(cur_bill_sc) and pd.notna(smart_bill_sc)
+                                else None
+                            )
+                            incremental_bill_improvement_sc = (
+                                float(base_bill_sc) - float(smart_bill_sc)
+                                if (base_bill_sc is not None and pd.notna(smart_bill_sc))
+                                else bill_improvement_sc
+                            )
+                            grid_avoided_sc = (
+                                float(base_grid_sc) - float(smart_grid_sc)
+                                if (base_grid_sc is not None and pd.notna(smart_grid_sc))
+                                else (float(cur_grid_sc) - float(smart_grid_sc) if pd.notna(cur_grid_sc) and pd.notna(smart_grid_sc) else None)
+                            )
+                            solar_shift_gain_sc = (
+                                float(smart_solar_sc) - float(base_solar_sc)
+                                if (base_solar_sc is not None and pd.notna(smart_solar_sc))
+                                else (float(smart_solar_sc) - float(cur_solar_sc) if pd.notna(cur_solar_sc) and pd.notna(smart_solar_sc) else None)
+                            )
+                            payback_sc = _simple_payback_years(
+                                float(charger_capex_sc) if pd.notna(charger_capex_sc) else 0.0,
+                                float(incremental_bill_improvement_sc) if incremental_bill_improvement_sc is not None else None,
+                            )
+                            st.markdown("#### Smart Charger Upgrade Summary")
+                            st.caption(
+                                "These figures keep the selected What-if settings in place. "
+                                "Overall bill improvement is cumulative versus the current case. "
+                                "Simple payback uses the extra annual bill improvement from adding the smart charger on top of the selected What-if case."
+                            )
+                            sc1, sc2, sc3, sc4 = st.columns(4)
+                            sc1.metric(
+                                "Incremental charger capex",
+                                f"${float(charger_capex_sc):,.0f}" if pd.notna(charger_capex_sc) else "-",
+                            )
+                            sc2.metric(
+                                "Overall bill improvement",
+                                f"${float(bill_improvement_sc):,.0f}/yr" if bill_improvement_sc is not None else "-",
+                            )
+                            sc3.metric(
+                                "Extra benefit vs What-if",
+                                f"${float(incremental_bill_improvement_sc):,.0f}/yr" if incremental_bill_improvement_sc is not None else "-",
+                            )
+                            sc4.metric(
+                                "Simple payback",
+                                (f"{float(payback_sc):.1f} yrs" if payback_sc is not None else "No payback yet"),
+                            )
+                            if grid_avoided_sc is not None or solar_shift_gain_sc is not None:
+                                diag_parts = []
+                                if grid_avoided_sc is not None:
+                                    diag_parts.append(f"EV grid import changes by {float(grid_avoided_sc):,.1f} kWh")
+                                if solar_shift_gain_sc is not None:
+                                    diag_parts.append(f"EV solar diversion changes by {float(solar_shift_gain_sc):,.1f} kWh")
+                                st.caption(
+                                    "Approx "
+                                    + " and ".join(diag_parts)
+                                    + " over the dataset period under the selected smart-charger mode."
+                                )
                     else:
                         st.info("Set your current details, choose one what-if scenario, then click 'Run simple comparison'.")
 
