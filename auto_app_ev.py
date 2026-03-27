@@ -6438,7 +6438,7 @@ if "ev_charge_loss_pct" not in st.session_state:
 if "ev_uploaded_inclusion_mode" not in st.session_state:
     st.session_state["ev_uploaded_inclusion_mode"] = "Fully included in uploaded data"
 if "ev_strategy" not in st.session_state:
-    st.session_state["ev_strategy"] = "Solar First + Timer Backup"
+    st.session_state["ev_strategy"] = "Solar Surplus Only (smart charger, no grid import)"
 if "ev_timer_start" not in st.session_state:
     st.session_state["ev_timer_start"] = dt.time(18, 0)
 if "ev_timer_end" not in st.session_state:
@@ -6447,6 +6447,14 @@ if "ev_solar_start" not in st.session_state:
     st.session_state["ev_solar_start"] = dt.time(9, 0)
 if "ev_solar_end" not in st.session_state:
     st.session_state["ev_solar_end"] = dt.time(16, 0)
+if "ev_current_timer_start" not in st.session_state:
+    st.session_state["ev_current_timer_start"] = dt.time(18, 0)
+if "ev_current_timer_end" not in st.session_state:
+    st.session_state["ev_current_timer_end"] = dt.time(7, 0)
+if "ev_current_solar_start" not in st.session_state:
+    st.session_state["ev_current_solar_start"] = dt.time(9, 0)
+if "ev_current_solar_end" not in st.session_state:
+    st.session_state["ev_current_solar_end"] = dt.time(16, 0)
 if "joint_modelled_postcode" not in st.session_state:
     st.session_state["joint_modelled_postcode"] = "4000"
 if "joint_modelled_tilt_deg" not in st.session_state:
@@ -6891,26 +6899,26 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         with cev1:
             ev_current_timer_start_t = st.time_input(
                 "Current grid window start",
-                value=dt.time(0, 0),
+                value=dt.time(18, 0),
                 key="ev_current_timer_start",
                 disabled=not uploaded_interval_data_available,
             )
             ev_current_timer_end_t = st.time_input(
                 "Current grid window end",
-                value=dt.time(6, 0),
+                value=dt.time(7, 0),
                 key="ev_current_timer_end",
                 disabled=not uploaded_interval_data_available,
             )
         with cev2:
             ev_current_solar_start_t = st.time_input(
                 "Current solar window start",
-                value=dt.time(10, 0),
+                value=dt.time(9, 0),
                 key="ev_current_solar_start",
                 disabled=not uploaded_interval_data_available,
             )
             ev_current_solar_end_t = st.time_input(
                 "Current solar window end",
-                value=dt.time(15, 0),
+                value=dt.time(16, 0),
                 key="ev_current_solar_end",
                 disabled=not uploaded_interval_data_available,
             )
@@ -6920,10 +6928,10 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         )
     else:
         ev_current_solar_share_pct = float(st.session_state.get("ev_current_solar_share_pct", 23.0))
-        ev_current_timer_start_t = st.session_state.get("ev_current_timer_start", dt.time(0, 0))
-        ev_current_timer_end_t = st.session_state.get("ev_current_timer_end", dt.time(6, 0))
-        ev_current_solar_start_t = st.session_state.get("ev_current_solar_start", dt.time(10, 0))
-        ev_current_solar_end_t = st.session_state.get("ev_current_solar_end", dt.time(15, 0))
+        ev_current_timer_start_t = st.session_state.get("ev_current_timer_start", dt.time(18, 0))
+        ev_current_timer_end_t = st.session_state.get("ev_current_timer_end", dt.time(7, 0))
+        ev_current_solar_start_t = st.session_state.get("ev_current_solar_start", dt.time(9, 0))
+        ev_current_solar_end_t = st.session_state.get("ev_current_solar_end", dt.time(16, 0))
     if st.session_state.get("ev_strategy") == "Solar-first + timer backup":
         st.session_state["ev_strategy"] = "Solar First + Timer Backup"
     ev_strategy_options = [
@@ -6932,11 +6940,11 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         "Solar First + Timer Backup",
     ]
     if st.session_state.get("ev_strategy") not in (None, *ev_strategy_options):
-        st.session_state["ev_strategy"] = "Solar First + Timer Backup"
+        st.session_state["ev_strategy"] = "Solar Surplus Only (smart charger, no grid import)"
     ev_strategy_label = st.selectbox(
         "Target charging strategy",
         ev_strategy_options,
-        index=2,
+        index=1,
         key="ev_strategy",
         disabled=not ev_enabled,
         help="Timer uses configured time windows from grid. Solar-priority modes serve household demand first, then use leftover export for EV charging inside the solar window.",
