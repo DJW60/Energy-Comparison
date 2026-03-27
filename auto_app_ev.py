@@ -413,6 +413,7 @@ def _advisor_build_data_basis(
 ) -> tuple[str, str]:
     dataset = dict(report_assumptions.get("dataset") or {})
     solar = dict(report_assumptions.get("solar") or {})
+    hybrid_backfill = dict(solar.get("hybrid_backfill") or {})
 
     dataset_rows = int(_advisor_safe_float(dataset.get("rows"), 0))
     ts_start = str(dataset.get("timestamp_start", "") or "")
@@ -424,12 +425,22 @@ def _advisor_build_data_basis(
     common_intervals = int(_advisor_safe_float(dataset.get("solar_common_intervals"), 0))
     solar_intervals_total = int(_advisor_safe_float(dataset.get("solar_intervals_total"), 0))
     nem_intervals_total = int(_advisor_safe_float(dataset.get("nem_intervals_total"), 0))
+    hybrid_backfill_used = bool(hybrid_backfill.get("used"))
+    hybrid_backfill_pct = _advisor_safe_float(hybrid_backfill.get("backfilled_pct"))
+    hybrid_backfill_kwh = _advisor_safe_float(hybrid_backfill.get("backfilled_kwh"))
+    hybrid_calibration_source = str(hybrid_backfill.get("calibration_source", "") or "")
 
     load_validated = dataset_rows > 0 and bool(ts_start) and bool(ts_end)
     solar_uploaded = solar_source == "uploaded" and uploaded_available
     solar_modelled = solar_source == "modelled"
 
-    if load_validated and solar_uploaded:
+    if load_validated and solar_uploaded and hybrid_backfill_used:
+        summary = (
+            "This result is based on supplied interval load data plus an uploaded solar interval profile, "
+            "with missing solar intervals backfilled from a calibrated modelled profile. "
+            "The optimiser is using interval-by-interval simulation rather than annual averages."
+        )
+    elif load_validated and solar_uploaded:
         summary = (
             "This result is based on supplied interval load data plus an uploaded solar interval profile. "
             "The optimiser is using interval-by-interval simulation rather than annual averages."
@@ -458,10 +469,17 @@ def _advisor_build_data_basis(
         bullets.append("- Load data basis: unable to fully validate from saved run metadata.")
 
     if solar_uploaded:
-        bullets.append("- Solar data basis: uploaded solar interval profile.")
+        if hybrid_backfill_used:
+            bullets.append("- Solar data basis: uploaded solar interval profile with calibrated modelled backfill for missing intervals.")
+        else:
+            bullets.append("- Solar data basis: uploaded solar interval profile.")
         if nem_intervals_total > 0 and solar_intervals_total > 0:
             bullets.append(
                 f"- Solar interval alignment: `{_advisor_pct(solar_match_pct)}` of NEM intervals matched, alignment quality `{_advisor_pct(alignment_quality_pct)}`, common intervals `{common_intervals:,}` of `{nem_intervals_total:,}`."
+            )
+        if hybrid_backfill_used:
+            bullets.append(
+                f"- Solar backfill: modelled profile supplied about `{_advisor_pct(hybrid_backfill_pct)}` of NEM intervals and `{_advisor_number(hybrid_backfill_kwh, 1)} kWh`, calibrated via `{hybrid_calibration_source or 'overlap ratio'}`."
             )
     elif solar_modelled:
         bullets.append("- Solar data basis: modelled solar profile, not uploaded historical solar intervals.")
@@ -525,10 +543,24 @@ def _build_advisor_bridge_report_markdown_local(
     total_saving = current_bill - with_battery_bill
     solar_capex = _advisor_safe_float(row.get("Incremental solar capex ($)"))
     load_shift_capex = _advisor_safe_float(row.get("Load shift capex ($)"))
+    ev_smart_charger_capex = _advisor_safe_float(row.get("EV smart charger capex ($)"))
     battery_capex = _advisor_safe_float(row.get("Battery cost ($)"))
-    pre_battery_capex = solar_capex + load_shift_capex
+    pre_battery_capex = solar_capex + load_shift_capex + ev_smart_charger_capex
     full_capex = pre_battery_capex + battery_capex
     pv_battery_savings = battery_npv + battery_capex
+    ev_model = dict(report_assumptions.get("ev_model") or {})
+    ev_strategy_label = _format_ev_strategy_label(ev_model.get("strategy", "")) if bool(ev_model.get("enabled")) else "Off"
+    pre_battery_capex_breakdown_parts = [
+        f"{_advisor_money(solar_capex)} solar",
+        f"{_advisor_money(load_shift_capex)} load shift",
+    ]
+    full_capex_breakdown_parts = list(pre_battery_capex_breakdown_parts)
+    if ev_smart_charger_capex > 0:
+        pre_battery_capex_breakdown_parts.append(f"{_advisor_money(ev_smart_charger_capex)} EV smart charger")
+        full_capex_breakdown_parts.append(f"{_advisor_money(ev_smart_charger_capex)} EV smart charger")
+    full_capex_breakdown_parts.append(f"{_advisor_money(battery_capex)} battery")
+    pre_battery_capex_breakdown = " + ".join(pre_battery_capex_breakdown_parts)
+    full_capex_breakdown = " + ".join(full_capex_breakdown_parts)
 
     battery_life_years = _advisor_safe_float(economics.get("battery_life_years"))
     degradation_rate = _advisor_safe_float(economics.get("degradation_rate"))
@@ -571,7 +603,7 @@ def _build_advisor_bridge_report_markdown_local(
     )
     battery_package_note = (
         f"The row also reports `PV lifetime saving vs same solar, no battery ($)` as `{_advisor_money(_advisor_safe_float(row.get('PV lifetime saving vs same solar, no battery ($)')))}`. "
-        "That broader package figure subtracts the battery and load-shift capex from the same-solar no-battery case, whereas `Battery NPV ($)` remains a battery-only measure."
+        "That broader package figure subtracts the battery, load-shift, and EV smart charger capex from the same-solar no-battery case, whereas `Battery NPV ($)` remains a battery-only measure."
         if "PV lifetime saving vs same solar, no battery ($)" in row
         else "This is why the battery can have a positive NPV even though the broader package still needs to be judged with the other capex layers included."
     )
@@ -592,6 +624,7 @@ This report explains one specific optimiser result using the saved row from:
 - Shifted kWh: `{_advisor_number(_advisor_safe_float(row.get("Shifted kWh")), 1)}`
 - Shift solar absorbed: `{_advisor_number(_advisor_safe_float(row.get("Shift solar absorbed (kWh)")), 1)} kWh`
 - Shift grid top-up: `{_advisor_number(_advisor_safe_float(row.get("Shift grid top-up (kWh)")), 1)} kWh`
+- EV charging strategy: `{ev_strategy_label}`
 - Optimal solar size: `{_advisor_number(solar_size_kw, 1)} kW`
 - Optimal battery size: `{_advisor_number(battery_size_kwh, 1)} kWh`
 - Battery NPV: `{_advisor_money(battery_npv)}`
@@ -602,6 +635,7 @@ This report explains one specific optimiser result using the saved row from:
 - Current solar / no battery annual bill: `{_advisor_money(current_bill)}/yr`
 - Incremental solar capex: `{_advisor_money(solar_capex)}`
 - Load shift capex: `{_advisor_money(load_shift_capex)}`
+- EV smart charger capex: `{_advisor_money(ev_smart_charger_capex)}`
 - Battery cost: `{_advisor_money(battery_capex)}`
 
 ## Assumptions Used
@@ -670,7 +704,7 @@ Optimised plan + load shift + {_advisor_number(solar_size_kw, 1)} kW solar
 Bill: {_advisor_money(optimised_no_battery_bill)}/yr
 Annual saving vs baseline: {_advisor_money(step1_saving)}/yr
 Capex: {_advisor_money(pre_battery_capex)}
-  = {_advisor_money(solar_capex)} solar + {_advisor_money(load_shift_capex)} load shift
+  = {pre_battery_capex_breakdown}
 Simple payback: {_advisor_payback(pre_battery_capex, step1_saving)}
 ```
 
@@ -687,7 +721,7 @@ Full package vs current baseline
 Bill: {_advisor_money(with_battery_bill)}/yr
 Total annual saving: {_advisor_money(total_saving)}/yr
 Total capex: {_advisor_money(full_capex)}
-  = {_advisor_money(solar_capex)} solar + {_advisor_money(load_shift_capex)} load shift + {_advisor_money(battery_capex)} battery
+  = {full_capex_breakdown}
 Blended simple payback: {_advisor_payback(full_capex, total_saving)}
 ```
 
@@ -1148,7 +1182,8 @@ def _build_joint_optimizer_report_markdown(
         battery_cost = _coerce_float(best.get("Battery cost ($)")) or 0.0
         solar_capex = _coerce_float(best.get("Incremental solar capex ($)")) or 0.0
         load_shift_capex = _coerce_float(best.get("Load shift capex ($)")) or 0.0
-        package_capex = float(battery_cost + solar_capex + load_shift_capex)
+        ev_smart_charger_capex = _coerce_float(best.get("EV smart charger capex ($)")) or 0.0
+        package_capex = float(battery_cost + solar_capex + load_shift_capex + ev_smart_charger_capex)
         package_payback = _simple_payback_years(package_capex, household_savings)
         battery_payback = _simple_payback_years(battery_cost, battery_savings)
 
@@ -1160,6 +1195,7 @@ def _build_joint_optimizer_report_markdown(
                 f"- Best battery size: {_format_report_value(best.get('Optimal battery (kWh)'))} kWh",
                 f"- Optimised load shift: {best.get('Load shift scenario', 'Off')}",
                 f"- Load-shift capex: ${float(pd.to_numeric([best.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}",
+                f"- EV smart charger capex: ${float(pd.to_numeric([best.get('EV smart charger capex ($)')], errors='coerce')[0] or 0.0):,.0f}",
                 f"- Annual bill with battery: ${float(pd.to_numeric([best.get('Estimated annual bill with battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
                 f"- Total savings vs current solar/no battery: ${float(pd.to_numeric([best.get('Total savings vs current solar, no battery ($/yr)')], errors='coerce')[0] or 0.0):,.0f}/yr",
                 f"- Battery NPV: ${float(pd.to_numeric([best.get('Battery NPV ($)')], errors='coerce')[0] or 0.0):,.0f}",
@@ -1230,7 +1266,8 @@ def _build_joint_optimizer_report_markdown(
                 f"solar {_format_report_value(rr.get('Optimal solar size (kW)'))} kW; "
                 f"battery {_format_report_value(rr.get('Optimal battery (kWh)'))} kWh; "
                 f"load shift {rr.get('Load shift scenario', 'Off')}; "
-                f"load-shift capex ${float(pd.to_numeric([rr.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}."
+                f"load-shift capex ${float(pd.to_numeric([rr.get('Load shift capex ($)')], errors='coerce')[0] or 0.0):,.0f}; "
+                f"EV smart charger capex ${float(pd.to_numeric([rr.get('EV smart charger capex ($)')], errors='coerce')[0] or 0.0):,.0f}."
             )
         lines.append("")
 
@@ -2081,6 +2118,170 @@ def align_solar_to_intervals(df_solar: pd.DataFrame, df_int: pd.DataFrame) -> tu
     matched = float(m["pv_kwh"].notna().mean() * 100.0) if len(m) > 0 else 0.0
     m["pv_kwh"] = m["pv_kwh"].fillna(0.0).clip(lower=0.0)
     return m, matched
+
+
+def build_hybrid_solar_profile(
+    df_solar: pd.DataFrame,
+    df_int: pd.DataFrame,
+    postcode_or_location: str,
+    roof_tilt_deg: float,
+    roof_azimuth_deg: float,
+    system_losses_pct: float,
+    current_system_kw: float | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Blend uploaded solar with calibrated modelled solar for missing NEM intervals."""
+    meta = {
+        "applied": False,
+        "used_backfill": False,
+        "reason": "",
+        "solar_common_intervals": 0,
+        "solar_intervals_total": 0,
+        "nem_intervals_total": 0,
+        "solar_match_pct": 0.0,
+        "solar_alignment_quality_pct": 0.0,
+        "missing_intervals": 0,
+        "missing_pct": 0.0,
+        "backfilled_intervals": 0,
+        "backfilled_pct": 0.0,
+        "actual_kwh": 0.0,
+        "backfilled_kwh": 0.0,
+        "hybrid_total_kwh": 0.0,
+        "calibration_factor": 0.0,
+        "calibration_source": "",
+        "modelled_profile_available": False,
+        "modelled_profile_meta": {},
+    }
+    if (
+        df_solar is None
+        or df_solar.empty
+        or df_int is None
+        or df_int.empty
+        or "timestamp" not in df_int.columns
+        or "timestamp" not in df_solar.columns
+        or "pv_kwh" not in df_solar.columns
+    ):
+        meta["reason"] = "Missing uploaded solar or interval timestamps."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    base_ts = pd.DataFrame({"timestamp": pd.to_datetime(df_int["timestamp"], errors="coerce").dropna().drop_duplicates()})
+    base_ts = base_ts.sort_values("timestamp").reset_index(drop=True)
+    if base_ts.empty:
+        meta["reason"] = "No valid interval timestamps."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    s = df_solar.copy()
+    s["timestamp"] = pd.to_datetime(s["timestamp"], errors="coerce")
+    s["pv_kwh"] = pd.to_numeric(s["pv_kwh"], errors="coerce")
+    s = s.dropna(subset=["timestamp", "pv_kwh"]).groupby("timestamp", as_index=False)["pv_kwh"].sum()
+    s["pv_kwh"] = pd.to_numeric(s["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float)
+
+    meta["nem_intervals_total"] = int(len(base_ts))
+    meta["solar_intervals_total"] = int(len(s))
+    if s.empty:
+        meta["reason"] = "Solar file has no valid timestamp/value pairs."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    merged = base_ts.merge(s.rename(columns={"pv_kwh": "pv_actual_kwh"}), on="timestamp", how="left")
+    merged["actual_present"] = merged["pv_actual_kwh"].notna()
+    merged["pv_actual_kwh"] = pd.to_numeric(merged["pv_actual_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    actual_common_intervals = int(merged["actual_present"].sum())
+    missing_intervals = int(max(len(merged) - actual_common_intervals, 0))
+    meta["solar_common_intervals"] = actual_common_intervals
+    meta["solar_match_pct"] = (
+        float(actual_common_intervals) / float(len(merged)) * 100.0
+        if len(merged) > 0
+        else 0.0
+    )
+    meta["solar_alignment_quality_pct"] = (
+        float(actual_common_intervals) / float(len(s)) * 100.0
+        if len(s) > 0
+        else 0.0
+    )
+    meta["missing_intervals"] = int(missing_intervals)
+    meta["missing_pct"] = (
+        float(missing_intervals) / float(len(merged)) * 100.0
+        if len(merged) > 0
+        else 0.0
+    )
+    meta["actual_kwh"] = float(merged.loc[merged["actual_present"], "pv_actual_kwh"].sum())
+
+    if actual_common_intervals <= 0:
+        meta["reason"] = "Solar production file could not be aligned to NEM12 timestamps."
+        return pd.DataFrame(columns=["timestamp", "pv_kwh"]), meta
+
+    modelled_profile_1kw, modelled_meta = build_modelled_solar_profile_1kw(
+        df_int,
+        postcode_or_location,
+        float(roof_tilt_deg),
+        float(roof_azimuth_deg),
+        float(system_losses_pct),
+    )
+    meta["modelled_profile_meta"] = dict(modelled_meta or {})
+    meta["modelled_profile_available"] = bool(
+        isinstance(modelled_profile_1kw, pd.DataFrame)
+        and not modelled_profile_1kw.empty
+        and {"timestamp", "pv_kwh"}.issubset(modelled_profile_1kw.columns)
+    )
+
+    if not meta["modelled_profile_available"]:
+        out = merged[["timestamp", "pv_actual_kwh"]].rename(columns={"pv_actual_kwh": "pv_kwh"}).copy()
+        out["pv_kwh"] = pd.to_numeric(out["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        meta["applied"] = True
+        meta["hybrid_total_kwh"] = float(out["pv_kwh"].sum())
+        meta["reason"] = "Uploaded solar aligned, but modelled backfill profile was unavailable."
+        return out, meta
+
+    m = modelled_profile_1kw[["timestamp", "pv_kwh"]].copy()
+    m["timestamp"] = pd.to_datetime(m["timestamp"], errors="coerce")
+    m["pv_kwh"] = pd.to_numeric(m["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float)
+    m = m.dropna(subset=["timestamp"]).groupby("timestamp", as_index=False)["pv_kwh"].sum()
+    merged = merged.merge(m.rename(columns={"pv_kwh": "pv_model_1kw"}), on="timestamp", how="left")
+    merged["pv_model_1kw"] = pd.to_numeric(merged["pv_model_1kw"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    overlap_actual_total = float(merged.loc[merged["actual_present"], "pv_actual_kwh"].sum())
+    overlap_model_total = float(merged.loc[merged["actual_present"], "pv_model_1kw"].sum())
+    calibration_factor = 0.0
+    calibration_source = ""
+    if overlap_model_total > 0.0:
+        calibration_factor = max(overlap_actual_total / overlap_model_total, 0.0)
+        calibration_source = "overlap_kwh_ratio"
+    elif float(current_system_kw or 0.0) > 0.0:
+        calibration_factor = max(float(current_system_kw or 0.0), 0.0)
+        calibration_source = "current_setup_solar_kw_fallback"
+    else:
+        calibration_factor = 1.0
+        calibration_source = "unscaled_1kw_fallback"
+
+    merged["pv_model_scaled_kwh"] = merged["pv_model_1kw"] * float(calibration_factor)
+    merged["pv_kwh"] = np.where(
+        merged["actual_present"],
+        merged["pv_actual_kwh"],
+        merged["pv_model_scaled_kwh"],
+    )
+    merged["pv_kwh"] = pd.to_numeric(merged["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    backfilled_mask = ~merged["actual_present"]
+    meta["applied"] = True
+    meta["used_backfill"] = bool(backfilled_mask.any())
+    meta["backfilled_intervals"] = int(backfilled_mask.sum())
+    meta["backfilled_pct"] = (
+        float(meta["backfilled_intervals"]) / float(len(merged)) * 100.0
+        if len(merged) > 0
+        else 0.0
+    )
+    meta["backfilled_kwh"] = float(merged.loc[backfilled_mask, "pv_kwh"].sum())
+    meta["hybrid_total_kwh"] = float(merged["pv_kwh"].sum())
+    meta["calibration_factor"] = float(calibration_factor)
+    meta["calibration_source"] = str(calibration_source)
+    if meta["used_backfill"]:
+        meta["reason"] = "Uploaded solar intervals preserved; missing intervals backfilled from calibrated modelled solar."
+    else:
+        meta["reason"] = "Uploaded solar fully covered the NEM timestamps; modelled backfill not needed."
+
+    out = merged[["timestamp", "pv_kwh"]].copy().sort_values("timestamp").reset_index(drop=True)
+    out["pv_kwh"] = pd.to_numeric(out["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    return out, meta
 
 
 # ---------------------------
@@ -4597,13 +4798,50 @@ class EVParams:
     charging_loss_frac: float = 0.10
     charger_power_kw: float = 7.0
     charge_days: str = "all"  # all | wkday | wkend
-    strategy: str = "timer_grid"  # timer_grid | solar_first_backup
+    strategy: str = "timer_grid"  # timer_grid | solar_first_backup | solar_surplus_only
     timer_start: str = "00:00"
     timer_end: str = "06:00"
     solar_start: str = "10:00"
     solar_end: str = "15:00"
     backup_start: str = "00:00"
     backup_end: str = "06:00"
+    smart_charger_capex: float = 0.0
+
+
+@dataclass
+class EmbeddedEVBaseline:
+    """How much EV charging is already embedded in the uploaded interval data."""
+
+    inclusion_mode: str = "none"  # none | partial | full
+    included_share_frac: float = 0.0
+    current_solar_share_frac: float = 0.0
+    current_timer_start: str = "00:00"
+    current_timer_end: str = "06:00"
+    current_solar_start: str = "10:00"
+    current_solar_end: str = "15:00"
+
+
+def _ev_strategy_uses_solar_surplus(strategy: str) -> bool:
+    mode = str(strategy or "").strip().lower()
+    return mode in {"solar_first_backup", "solar_surplus_only"}
+
+
+def _ev_smart_charger_capex_for_strategy(enabled: bool, strategy: str, smart_charger_capex: float) -> float:
+    if not bool(enabled) or not _ev_strategy_uses_solar_surplus(strategy):
+        return 0.0
+    try:
+        return max(float(smart_charger_capex or 0.0), 0.0)
+    except Exception:
+        return 0.0
+
+
+def _format_ev_strategy_label(strategy: str) -> str:
+    mode = str(strategy or "").strip().lower()
+    if mode == "solar_surplus_only":
+        return "Solar surplus only (no grid import)"
+    if mode == "solar_first_backup":
+        return "Solar-first + timer backup"
+    return "Timer (grid)"
 
 
 def _infer_interval_minutes_from_timestamps(ts: pd.Series) -> float:
@@ -4649,13 +4887,22 @@ def _ev_day_filter_mask(ts: pd.Series, charge_days: str) -> pd.Series:
 
 def apply_ev_profile_to_intervals(df_int: pd.DataFrame, ev: EVParams) -> tuple[pd.DataFrame, dict]:
     """Apply EV charging to intervals and return (adjusted_df, summary)."""
+    strategy_code = str(getattr(ev, "strategy", "timer_grid") or "timer_grid").strip().lower()
+    smart_charger_mode = bool(getattr(ev, "enabled", False)) and _ev_strategy_uses_solar_surplus(strategy_code)
+    smart_charger_capex = _ev_smart_charger_capex_for_strategy(
+        bool(getattr(ev, "enabled", False)),
+        strategy_code,
+        float(getattr(ev, "smart_charger_capex", 0.0) or 0.0),
+    )
     summary = {
         "enabled": bool(getattr(ev, "enabled", False)),
-        "strategy": str(getattr(ev, "strategy", "timer_grid")),
+        "strategy": str(strategy_code),
         "annual_km": float(getattr(ev, "annual_km", 0.0) or 0.0),
         "consumption_kwh_per_100km": float(getattr(ev, "consumption_kwh_per_100km", 0.0) or 0.0),
         "charging_loss_frac": float(getattr(ev, "charging_loss_frac", 0.0) or 0.0),
         "charger_power_kw": float(getattr(ev, "charger_power_kw", 0.0) or 0.0),
+        "smart_charger_active": bool(smart_charger_mode),
+        "smart_charger_capex": float(smart_charger_capex),
         "interval_minutes": 5.0,
         "target_daily_kwh": 0.0,
         "requested_kwh": 0.0,
@@ -4753,7 +5000,7 @@ def apply_ev_profile_to_intervals(df_int: pd.DataFrame, ev: EVParams) -> tuple[p
         remaining = float(daily_target_kwh)
         requested_total += float(daily_target_kwh)
 
-        if str(ev.strategy) == "solar_first_backup":
+        if _ev_strategy_uses_solar_surplus(strategy_code):
             solar_mask = _ev_time_window_mask(day_ts, ev.solar_start, ev.solar_end).tolist()
             solar_pos = [p for p, keep in zip(pos, solar_mask) if keep]
             for p in solar_pos:
@@ -4765,9 +5012,10 @@ def apply_ev_profile_to_intervals(df_int: pd.DataFrame, ev: EVParams) -> tuple[p
                     solar_divert[p] += divert
                     remaining -= divert
 
-            backup_mask = _ev_time_window_mask(day_ts, ev.backup_start, ev.backup_end).tolist()
-            backup_pos = [p for p, keep in zip(pos, backup_mask) if keep]
-            remaining = _alloc_grid(backup_pos, remaining)
+            if strategy_code == "solar_first_backup":
+                backup_mask = _ev_time_window_mask(day_ts, ev.backup_start, ev.backup_end).tolist()
+                backup_pos = [p for p, keep in zip(pos, backup_mask) if keep]
+                remaining = _alloc_grid(backup_pos, remaining)
         else:
             timer_mask = _ev_time_window_mask(day_ts, ev.timer_start, ev.timer_end).tolist()
             timer_pos = [p for p, keep in zip(pos, timer_mask) if keep]
@@ -4803,6 +5051,9 @@ def apply_ev_profile_to_intervals(df_int: pd.DataFrame, ev: EVParams) -> tuple[p
     delivered_total = float(grid_total + solar_total)
     unmet_total = max(float(requested_total) - delivered_total, 0.0)
     coverage = (delivered_total / float(requested_total) * 100.0) if requested_total > 0 else 100.0
+    notes = ""
+    if strategy_code == "solar_surplus_only" and unmet_total > 1e-6:
+        notes = "Solar-surplus-only mode leaves remaining EV charging unmet when export is insufficient."
 
     summary.update(
         {
@@ -4813,10 +5064,190 @@ def apply_ev_profile_to_intervals(df_int: pd.DataFrame, ev: EVParams) -> tuple[p
             "unmet_kwh": float(unmet_total),
             "coverage_pct": float(coverage),
             "days_with_charging": int(days_with_charging),
-            "notes": "",
+            "notes": notes,
         }
     )
     return out, summary
+
+
+def remove_embedded_ev_from_intervals(
+    df_int: pd.DataFrame,
+    ev: EVParams,
+    embedded: EmbeddedEVBaseline | None,
+) -> tuple[pd.DataFrame, dict]:
+    """Estimate a no-EV baseline by unwinding embedded EV charging from uploaded intervals."""
+
+    meta = {
+        "enabled": False,
+        "inclusion_mode": str(getattr(embedded, "inclusion_mode", "none") or "none"),
+        "included_share_frac": float(getattr(embedded, "included_share_frac", 0.0) or 0.0),
+        "included_share_pct": 0.0,
+        "current_solar_share_frac": float(getattr(embedded, "current_solar_share_frac", 0.0) or 0.0),
+        "current_solar_share_pct": 0.0,
+        "requested_embedded_kwh": 0.0,
+        "restored_grid_kwh": 0.0,
+        "restored_solar_kwh": 0.0,
+        "restored_total_kwh": 0.0,
+        "unresolved_kwh": 0.0,
+        "coverage_pct": 100.0,
+        "notes": "",
+    }
+
+    if df_int is None or not isinstance(df_int, pd.DataFrame) or df_int.empty:
+        meta["notes"] = "No interval data available."
+        return pd.DataFrame(columns=["register", "timestamp", "kwh"]), meta
+
+    inclusion_mode = str(getattr(embedded, "inclusion_mode", "none") or "none").strip().lower()
+    included_share_frac = min(max(float(getattr(embedded, "included_share_frac", 0.0) or 0.0), 0.0), 1.0)
+    current_solar_share_frac = min(max(float(getattr(embedded, "current_solar_share_frac", 0.0) or 0.0), 0.0), 1.0)
+    meta["included_share_frac"] = float(included_share_frac)
+    meta["included_share_pct"] = float(included_share_frac * 100.0)
+    meta["current_solar_share_frac"] = float(current_solar_share_frac)
+    meta["current_solar_share_pct"] = float(current_solar_share_frac * 100.0)
+    if inclusion_mode not in {"partial", "full"} or included_share_frac <= 0.0:
+        meta["notes"] = "No embedded EV unwinding requested."
+        return df_int.copy(), meta
+
+    base = df_int.copy()
+    wide = _intervals_wide_from_long(base)
+    if wide.empty:
+        meta["notes"] = "Could not build mapped interval profile (E1/E2/B1)."
+        return base, meta
+
+    wide = wide.sort_values("timestamp").reset_index(drop=True)
+    wide["timestamp"] = pd.to_datetime(wide["timestamp"], errors="coerce")
+    wide = wide.dropna(subset=["timestamp"]).reset_index(drop=True)
+    if wide.empty:
+        meta["notes"] = "No valid timestamps after parsing."
+        return base, meta
+
+    for c in ("general_kwh", "export_kwh"):
+        if c not in wide.columns:
+            wide[c] = 0.0
+        wide[c] = pd.to_numeric(wide[c], errors="coerce").fillna(0.0).astype(float)
+    wide["general_kwh"] = wide["general_kwh"].clip(lower=0.0)
+    wide["export_kwh"] = wide["export_kwh"].clip(lower=0.0)
+
+    ts = pd.to_datetime(wide["timestamp"], errors="coerce")
+    interval_minutes = _infer_interval_minutes_from_timestamps(ts)
+    annual_drive_kwh = max(float(ev.annual_km), 0.0) * max(float(ev.consumption_kwh_per_100km), 0.0) / 100.0
+    loss = min(max(float(ev.charging_loss_frac), 0.0), 0.60)
+    annual_wall_kwh = annual_drive_kwh / max(1e-9, (1.0 - loss))
+    embedded_annual_wall_kwh = annual_wall_kwh * included_share_frac
+    daily_target_kwh = embedded_annual_wall_kwh / 365.25 if embedded_annual_wall_kwh > 0 else 0.0
+    meta["requested_embedded_kwh"] = float(embedded_annual_wall_kwh)
+    if daily_target_kwh <= 0.0:
+        meta["notes"] = "Embedded EV target is zero."
+        return base, meta
+
+    charge_day_mask = _ev_day_filter_mask(ts, ev.charge_days)
+    date_vals = ts.dt.normalize()
+    active_dates = sorted(pd.to_datetime(date_vals[charge_day_mask]).dropna().unique().tolist())
+    if not active_dates:
+        meta["notes"] = "No active charging days in dataset for embedded EV unwinding."
+        return base, meta
+
+    max_interval_kwh = max(float(ev.charger_power_kw), 0.0) * (float(interval_minutes) / 60.0)
+    if max_interval_kwh <= 0:
+        meta["notes"] = "Charger power must be greater than zero."
+        return base, meta
+
+    day_positions: dict[pd.Timestamp, list[int]] = {}
+    for i, d in enumerate(date_vals):
+        if pd.isna(d):
+            continue
+        day_positions.setdefault(pd.Timestamp(d), []).append(i)
+
+    general_vals = wide["general_kwh"].tolist()
+    export_vals = wide["export_kwh"].tolist()
+    restored_grid = [0.0] * len(wide)
+    restored_solar = [0.0] * len(wide)
+    requested_total = 0.0
+
+    for day in active_dates:
+        pos = day_positions.get(pd.Timestamp(day), [])
+        if not pos:
+            continue
+        requested_day = float(daily_target_kwh)
+        requested_total += requested_day
+        solar_requested_day = requested_day * current_solar_share_frac
+        grid_requested_day = max(requested_day - solar_requested_day, 0.0)
+        day_ts = ts.iloc[pos]
+
+        solar_mask = _ev_time_window_mask(
+            day_ts,
+            str(getattr(embedded, "current_solar_start", "10:00")),
+            str(getattr(embedded, "current_solar_end", "15:00")),
+        ).tolist()
+        solar_pos = [p for p, keep in zip(pos, solar_mask) if keep]
+        solar_remaining = float(solar_requested_day)
+        for p in solar_pos:
+            if solar_remaining <= 1e-9:
+                break
+            restore = min(max_interval_kwh, solar_remaining)
+            if restore > 0:
+                export_vals[p] = max(float(export_vals[p]) + restore, 0.0)
+                restored_solar[p] += restore
+                solar_remaining -= restore
+
+        grid_remaining = float(grid_requested_day + solar_remaining)
+        timer_mask = _ev_time_window_mask(
+            day_ts,
+            str(getattr(embedded, "current_timer_start", "00:00")),
+            str(getattr(embedded, "current_timer_end", "06:00")),
+        ).tolist()
+        timer_pos = [p for p, keep in zip(pos, timer_mask) if keep]
+        for p in timer_pos:
+            if grid_remaining <= 1e-9:
+                break
+            removable = min(float(general_vals[p]), max_interval_kwh, grid_remaining)
+            if removable > 0:
+                general_vals[p] = max(float(general_vals[p]) - removable, 0.0)
+                restored_grid[p] += removable
+                grid_remaining -= removable
+
+    wide["general_kwh"] = pd.Series(general_vals).clip(lower=0.0)
+    wide["export_kwh"] = pd.Series(export_vals).clip(lower=0.0)
+
+    mapped_regs = set(GENERAL_REGS + CONTROLLED_REGS + EXPORT_REGS)
+    other_regs = base[~base["register"].astype(str).isin(mapped_regs)].copy()
+    adj_mapped = _intervals_long_from_wide(wide)
+    existing_mapped = set(base["register"].astype(str)).intersection(mapped_regs)
+    if sum(restored_solar) > 0 and EXPORT_REGS:
+        existing_mapped.add(EXPORT_REGS[0])
+    if existing_mapped:
+        adj_mapped = adj_mapped[adj_mapped["register"].astype(str).isin(existing_mapped)].copy()
+
+    out = pd.concat([other_regs, adj_mapped], ignore_index=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    out["kwh"] = pd.to_numeric(out["kwh"], errors="coerce").fillna(0.0).astype(float)
+    out = out.dropna(subset=["timestamp"]).sort_values(["timestamp", "register"]).reset_index(drop=True)
+
+    restored_grid_total = float(sum(restored_grid))
+    restored_solar_total = float(sum(restored_solar))
+    restored_total = float(restored_grid_total + restored_solar_total)
+    unresolved_kwh = max(float(requested_total) - restored_total, 0.0)
+    coverage_pct = (restored_total / float(requested_total) * 100.0) if requested_total > 0 else 100.0
+    notes = ""
+    if unresolved_kwh > 1e-6:
+        notes = (
+            "Could not fully unwind the estimated embedded EV profile from uploaded general import within the current grid window. "
+            "Current-to-target EV deltas may be conservative."
+        )
+
+    meta.update(
+        {
+            "enabled": True,
+            "requested_embedded_kwh": float(requested_total),
+            "restored_grid_kwh": float(restored_grid_total),
+            "restored_solar_kwh": float(restored_solar_total),
+            "restored_total_kwh": float(restored_total),
+            "unresolved_kwh": float(unresolved_kwh),
+            "coverage_pct": float(coverage_pct),
+            "notes": notes,
+        }
+    )
+    return out, meta
 
 
 @dataclass
@@ -6000,6 +6431,14 @@ else:
     st.session_state["current_setup_meter_type"] = _norm_current_meter_type(
         st.session_state.get("current_setup_meter_type", "unknown")
     )
+if "joint_modelled_postcode" not in st.session_state:
+    st.session_state["joint_modelled_postcode"] = "4000"
+if "joint_modelled_tilt_deg" not in st.session_state:
+    st.session_state["joint_modelled_tilt_deg"] = 20.0
+if "joint_modelled_azimuth_deg" not in st.session_state:
+    st.session_state["joint_modelled_azimuth_deg"] = 0.0
+if "joint_modelled_losses_pct" not in st.session_state:
+    st.session_state["joint_modelled_losses_pct"] = 14.0
 
 all_plans = st.session_state["plans_lib"]
 battery_assumptions_cfg = st.session_state["battery_assumptions_cfg"]
@@ -6321,14 +6760,14 @@ else:
 
 with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
     st.caption(
-        "This modifies interval load/export across the app. "
+        "Use this to model EV charging behaviour changes across the app. "
         "It is separate from the Current Setup EV fields used for What-if defaults and add-on eligibility."
     )
     ev_enabled = st.checkbox(
-        "Include EV charging",
+        "Apply target EV charging model",
         value=False,
         key="ev_enabled",
-        help="Adds EV charging demand to your interval profile so plan and battery outputs include EV impact.",
+        help="If uploaded data already contains EV charging, the app can estimate a no-EV base first and then apply the target EV behaviour you choose below.",
     )
     ev_annual_km = st.number_input(
         "Annual driving (km)",
@@ -6378,71 +6817,200 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
         disabled=not ev_enabled,
         help="Select which days EV charging is allowed in the simulation.",
     )
+    uploaded_ev_mode_options = [
+        "No EV already in uploaded data",
+        "Partly included in uploaded data",
+        "Fully included in uploaded data",
+    ]
+    if st.session_state.get("ev_uploaded_inclusion_mode") not in (None, *uploaded_ev_mode_options):
+        st.session_state["ev_uploaded_inclusion_mode"] = uploaded_ev_mode_options[0]
+    uploaded_interval_data_available = bool(df_int_base is not None and not df_int_base.empty)
+    ev_uploaded_inclusion_label = st.selectbox(
+        "EV already included in uploaded data",
+        uploaded_ev_mode_options,
+        index=0,
+        key="ev_uploaded_inclusion_mode",
+        disabled=not uploaded_interval_data_available,
+        help="Use this when the uploaded NEM12 already contains some or all EV charging. The app will estimate a no-EV base before applying the target EV behaviour.",
+    )
+    ev_uploaded_inclusion_mode_map = {
+        "No EV already in uploaded data": "none",
+        "Partly included in uploaded data": "partial",
+        "Fully included in uploaded data": "full",
+    }
+    ev_uploaded_inclusion_mode = ev_uploaded_inclusion_mode_map.get(ev_uploaded_inclusion_label, "none")
+    if ev_uploaded_inclusion_mode == "partial":
+        ev_uploaded_inclusion_pct = st.number_input(
+            "Share of total EV charging already in uploaded data (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.get("ev_uploaded_inclusion_pct", 30.0)),
+            step=5.0,
+            key="ev_uploaded_inclusion_pct",
+            disabled=not uploaded_interval_data_available,
+            help="Example: 30 means the uploaded interval data is estimated to already contain 30% of the annual EV charging load.",
+        )
+    elif ev_uploaded_inclusion_mode == "full":
+        ev_uploaded_inclusion_pct = 100.0
+        st.caption("Uploaded data is treated as containing the full EV charging load already.")
+    else:
+        ev_uploaded_inclusion_pct = 0.0
+
+    if ev_uploaded_inclusion_mode in ("partial", "full"):
+        ev_current_solar_share_pct = st.number_input(
+            "Current daytime solar EV share in uploaded data (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.get("ev_current_solar_share_pct", 23.0)),
+            step=1.0,
+            key="ev_current_solar_share_pct",
+            disabled=not uploaded_interval_data_available,
+            help="Estimate how much of the EV charging already in the uploaded data is served from daytime solar rather than overnight/grid charging.",
+        )
+        st.caption(
+            f"Current uploaded EV mix assumption: {max(0.0, 100.0 - float(ev_current_solar_share_pct)):.0f}% timer/grid and "
+            f"{float(ev_current_solar_share_pct):.0f}% daytime solar."
+        )
+        cev1, cev2 = st.columns(2)
+        with cev1:
+            ev_current_timer_start_t = st.time_input(
+                "Current grid window start",
+                value=dt.time(0, 0),
+                key="ev_current_timer_start",
+                disabled=not uploaded_interval_data_available,
+            )
+            ev_current_timer_end_t = st.time_input(
+                "Current grid window end",
+                value=dt.time(6, 0),
+                key="ev_current_timer_end",
+                disabled=not uploaded_interval_data_available,
+            )
+        with cev2:
+            ev_current_solar_start_t = st.time_input(
+                "Current solar window start",
+                value=dt.time(10, 0),
+                key="ev_current_solar_start",
+                disabled=not uploaded_interval_data_available,
+            )
+            ev_current_solar_end_t = st.time_input(
+                "Current solar window end",
+                value=dt.time(15, 0),
+                key="ev_current_solar_end",
+                disabled=not uploaded_interval_data_available,
+            )
+        st.caption(
+            "These settings describe the EV behaviour already embedded in the uploaded data. "
+            "When the target EV model is on, the app first estimates a no-EV base from these assumptions."
+        )
+    else:
+        ev_current_solar_share_pct = float(st.session_state.get("ev_current_solar_share_pct", 23.0))
+        ev_current_timer_start_t = st.session_state.get("ev_current_timer_start", dt.time(0, 0))
+        ev_current_timer_end_t = st.session_state.get("ev_current_timer_end", dt.time(6, 0))
+        ev_current_solar_start_t = st.session_state.get("ev_current_solar_start", dt.time(10, 0))
+        ev_current_solar_end_t = st.session_state.get("ev_current_solar_end", dt.time(15, 0))
     if st.session_state.get("ev_strategy") == "Solar-first + timer backup":
         st.session_state["ev_strategy"] = "Solar First + Timer Backup"
+    ev_strategy_options = [
+        "Timer (grid charging)",
+        "Solar Surplus Only (smart charger, no grid import)",
+        "Solar First + Timer Backup",
+    ]
+    if st.session_state.get("ev_strategy") not in (None, *ev_strategy_options):
+        st.session_state["ev_strategy"] = "Solar First + Timer Backup"
     ev_strategy_label = st.selectbox(
-        "Charging strategy",
-        ["Timer (grid charging)", "Solar First + Timer Backup"],
-        index=1,
+        "Target charging strategy",
+        ev_strategy_options,
+        index=2,
         key="ev_strategy",
         disabled=not ev_enabled,
-        help="Timer uses configured time windows from grid. Solar First diverts export first, then uses backup timer if needed.",
+        help="Timer uses configured time windows from grid. Solar-priority modes serve household demand first, then use leftover export for EV charging inside the solar window.",
+    )
+    solar_priority_ev_mode = ev_strategy_label in (
+        "Solar Surplus Only (smart charger, no grid import)",
+        "Solar First + Timer Backup",
     )
 
     ev_timer_start_t = st.time_input(
-        "Timer start",
+        "Target timer start",
         value=dt.time(0, 0),
         key="ev_timer_start",
         disabled=not ev_enabled,
         help="Local clock time. This timer window can cross midnight.",
     )
     ev_timer_end_t = st.time_input(
-        "Timer end",
+        "Target timer end",
         value=dt.time(6, 0),
         key="ev_timer_end",
         disabled=not ev_enabled,
         help="Local clock time. This timer window can cross midnight.",
     )
 
-    if ev_strategy_label == "Solar First + Timer Backup":
+    if solar_priority_ev_mode:
         ev_solar_start_t = st.time_input(
-            "Solar window start",
+            "Target solar window start",
             value=dt.time(10, 0),
             key="ev_solar_start",
             disabled=not ev_enabled,
             help="Local clock time. EV charging can use exported solar only inside this window.",
         )
         ev_solar_end_t = st.time_input(
-            "Solar window end",
+            "Target solar window end",
             value=dt.time(15, 0),
             key="ev_solar_end",
             disabled=not ev_enabled,
             help="Local clock time. EV charging can use exported solar only inside this window.",
         )
+    else:
+        ev_solar_start_t = st.session_state.get("ev_solar_start", dt.time(10, 0))
+        ev_solar_end_t = st.session_state.get("ev_solar_end", dt.time(15, 0))
+
+    if ev_strategy_label == "Solar First + Timer Backup":
         ev_backup_start_t = st.time_input(
-            "Backup window start",
+            "Target backup window start",
             value=dt.time(0, 0),
             key="ev_backup_start",
             disabled=not ev_enabled,
             help="If solar is not enough, grid charging is allowed in this backup window.",
         )
         ev_backup_end_t = st.time_input(
-            "Backup window end",
+            "Target backup window end",
             value=dt.time(6, 0),
             key="ev_backup_end",
             disabled=not ev_enabled,
             help="If solar is not enough, grid charging is allowed in this backup window.",
         )
     else:
-        ev_solar_start_t = st.session_state.get("ev_solar_start", dt.time(10, 0))
-        ev_solar_end_t = st.session_state.get("ev_solar_end", dt.time(15, 0))
         ev_backup_start_t = st.session_state.get("ev_backup_start", dt.time(0, 0))
         ev_backup_end_t = st.session_state.get("ev_backup_end", dt.time(6, 0))
+
+    if solar_priority_ev_mode:
+        ev_smart_charger_capex = st.number_input(
+            "Smart EV charger capex ($)",
+            min_value=0.0,
+            max_value=50000.0,
+            value=float(st.session_state.get("ev_smart_charger_capex", 1800.0)),
+            step=50.0,
+            key="ev_smart_charger_capex",
+            disabled=not ev_enabled,
+            help="One-off installed cost for the solar-priority charger/inverter control. Included in optimiser package capex when this EV mode is active.",
+        )
+        st.caption(
+            "Solar-priority EV modes use only post-household export inside the solar window. "
+            "The surplus-only mode blocks grid import; the backup mode can still top up from grid in its backup window."
+        )
+        st.caption(
+            "To measure the smart charger uplift itself, rerun once with the current EV behaviour represented in the upload and once with a solar-priority target mode. "
+            "The optimiser uses the currently selected target EV mode across the whole run."
+        )
+    else:
+        ev_smart_charger_capex = float(st.session_state.get("ev_smart_charger_capex", 1800.0))
 
     if ev_enabled:
         drive_kwh_yr = float(ev_annual_km) * float(ev_consumption) / 100.0
         wall_kwh_yr = drive_kwh_yr / max(1e-9, (1.0 - float(ev_loss_pct) / 100.0))
         st.caption(f"Estimated EV charging demand: {wall_kwh_yr:,.0f} kWh/yr (~{wall_kwh_yr/365.25:.1f} kWh/day).")
+        if ev_strategy_label == "Solar Surplus Only (smart charger, no grid import)":
+            st.caption("If solar export is insufficient in the selected window, some EV charging remains unmet rather than importing from the grid.")
 
 load_shift_days_map = {"All days": "all", "Weekdays only": "wkday", "Weekends only": "wkend"}
 load_shift_source_map = {"Controlled load (E2)": "controlled", "General load (E1)": "general"}
@@ -6643,7 +7211,12 @@ elif bool(st.session_state.get("_last_has_home_battery_for_profile")) != bool(ha
     st.session_state["_last_has_home_battery_for_profile"] = bool(has_home_battery)
 
 ev_days_map = {"All days": "all", "Weekdays only": "wkday", "Weekends only": "wkend"}
-ev_strategy_code = "solar_first_backup" if ev_strategy_label in ("Solar First + Timer Backup", "Solar-first + timer backup") else "timer_grid"
+if ev_strategy_label == "Solar Surplus Only (smart charger, no grid import)":
+    ev_strategy_code = "solar_surplus_only"
+elif ev_strategy_label in ("Solar First + Timer Backup", "Solar-first + timer backup"):
+    ev_strategy_code = "solar_first_backup"
+else:
+    ev_strategy_code = "timer_grid"
 ev_params = EVParams(
     enabled=bool(ev_enabled),
     annual_km=float(ev_annual_km),
@@ -6658,10 +7231,56 @@ ev_params = EVParams(
     solar_end=ev_solar_end_t.strftime("%H:%M"),
     backup_start=ev_backup_start_t.strftime("%H:%M"),
     backup_end=ev_backup_end_t.strftime("%H:%M"),
+    smart_charger_capex=float(ev_smart_charger_capex),
 )
-
-df_int_ev, ev_summary = apply_ev_profile_to_intervals(df_int_base, ev_params)
+ev_embedded_baseline = EmbeddedEVBaseline(
+    inclusion_mode=str(ev_uploaded_inclusion_mode),
+    included_share_frac=min(max(float(ev_uploaded_inclusion_pct) / 100.0, 0.0), 1.0),
+    current_solar_share_frac=min(max(float(ev_current_solar_share_pct) / 100.0, 0.0), 1.0),
+    current_timer_start=ev_current_timer_start_t.strftime("%H:%M"),
+    current_timer_end=ev_current_timer_end_t.strftime("%H:%M"),
+    current_solar_start=ev_current_solar_start_t.strftime("%H:%M"),
+    current_solar_end=ev_current_solar_end_t.strftime("%H:%M"),
+)
+df_int_no_ev_base = df_int_base.copy()
+embedded_ev_meta = {
+    "enabled": False,
+    "inclusion_mode": str(ev_uploaded_inclusion_mode),
+    "included_share_frac": float(ev_embedded_baseline.included_share_frac),
+    "included_share_pct": float(ev_embedded_baseline.included_share_frac * 100.0),
+    "current_solar_share_frac": float(ev_embedded_baseline.current_solar_share_frac),
+    "current_solar_share_pct": float(ev_embedded_baseline.current_solar_share_frac * 100.0),
+    "requested_embedded_kwh": 0.0,
+    "restored_grid_kwh": 0.0,
+    "restored_solar_kwh": 0.0,
+    "restored_total_kwh": 0.0,
+    "unresolved_kwh": 0.0,
+    "coverage_pct": 100.0,
+    "notes": "",
+}
+if str(ev_uploaded_inclusion_mode) in ("partial", "full") and float(ev_uploaded_inclusion_pct) > 0.0:
+    df_int_no_ev_base, embedded_ev_meta = remove_embedded_ev_from_intervals(
+        df_int_base,
+        ev_params,
+        ev_embedded_baseline,
+    )
+ev_target_seed = (
+    df_int_no_ev_base
+    if (bool(ev_enabled) and str(ev_uploaded_inclusion_mode) in ("partial", "full") and float(ev_uploaded_inclusion_pct) > 0.0)
+    else df_int_base
+)
+df_int_ev, ev_summary = apply_ev_profile_to_intervals(ev_target_seed, ev_params)
+ev_summary["uploaded_ev_inclusion_mode"] = str(ev_uploaded_inclusion_mode)
+ev_summary["uploaded_ev_inclusion_pct"] = float(ev_uploaded_inclusion_pct)
+ev_summary["embedded_baseline_used"] = bool(
+    bool(ev_enabled) and str(ev_uploaded_inclusion_mode) in ("partial", "full") and float(ev_uploaded_inclusion_pct) > 0.0
+)
+ev_summary["embedded_current_solar_share_pct"] = float(ev_current_solar_share_pct)
+ev_summary["uploaded_ev_restored_kwh"] = float(embedded_ev_meta.get("restored_total_kwh", 0.0) or 0.0)
+ev_summary["uploaded_ev_restored_grid_kwh"] = float(embedded_ev_meta.get("restored_grid_kwh", 0.0) or 0.0)
+ev_summary["uploaded_ev_restored_solar_kwh"] = float(embedded_ev_meta.get("restored_solar_kwh", 0.0) or 0.0)
 df_int, load_shift_summary = apply_timed_load_shifts_to_intervals(df_int_ev, load_shift_params)
+ev_smart_charger_capex_active = float(ev_summary.get("smart_charger_capex", 0.0) or 0.0)
 load_shift_signature = {
     "enabled": bool(load_shift_summary.get("enabled", False)),
     "settings": [
@@ -6692,6 +7311,14 @@ load_shift_signature = {
     ],
 }
 dataset_sig = _dataset_signature(df_int)
+if bool(embedded_ev_meta.get("enabled", False)):
+    st.sidebar.caption(
+        f"Uploaded EV baseline: approx {float(embedded_ev_meta.get('included_share_pct', 0.0) or 0.0):.0f}% of EV charging is assumed to already sit in the upload. "
+        f"Estimated no-EV base recovery: {float(embedded_ev_meta.get('restored_total_kwh', 0.0) or 0.0):,.1f} kWh "
+        f"({float(embedded_ev_meta.get('coverage_pct', 100.0) or 100.0):.1f}% coverage)."
+    )
+    if embedded_ev_meta.get("notes"):
+        st.sidebar.caption(str(embedded_ev_meta.get("notes")))
 if load_shift_summary.get("enabled"):
     shifted_kwh_disp = float(load_shift_summary.get("shifted_kwh", 0.0) or 0.0)
     solar_divert_disp = float(load_shift_summary.get("solar_diverted_kwh", 0.0) or 0.0)
@@ -6704,6 +7331,7 @@ if load_shift_summary.get("enabled"):
         st.sidebar.caption(str(load_shift_summary.get("notes")))
 
 solar_profile_for_battery = None
+solar_hybrid_meta: dict = {}
 solar_match_pct = 0.0
 solar_alignment_quality_pct = 0.0
 solar_common_intervals = 0
@@ -6719,28 +7347,26 @@ if uploaded_solar is not None:
     if solar_raw.empty:
         st.warning("Solar file was loaded but no valid interval rows were detected.")
     else:
-        solar_aligned, _solar_match_from_align = align_solar_to_intervals(solar_raw, df_int)
-        if solar_aligned.empty:
+        solar_hybrid, solar_hybrid_meta = build_hybrid_solar_profile(
+            solar_raw,
+            df_int,
+            str(st.session_state.get("joint_modelled_postcode", "4000")),
+            float(st.session_state.get("joint_modelled_tilt_deg", 20.0) or 20.0),
+            float(st.session_state.get("joint_modelled_azimuth_deg", 0.0) or 0.0),
+            float(st.session_state.get("joint_modelled_losses_pct", 14.0) or 14.0),
+            current_system_kw=float(st.session_state.get("current_setup_solar_kw", 0.0) or 0.0),
+        )
+        if solar_hybrid.empty:
             st.warning("Solar production file could not be aligned to your NEM12 timestamps.")
         else:
-            nem_ts = set(pd.to_datetime(df_int["timestamp"], errors="coerce").dropna().drop_duplicates().tolist())
-            solar_ts = set(pd.to_datetime(solar_raw["timestamp"], errors="coerce").dropna().drop_duplicates().tolist())
-            solar_common_intervals = int(len(nem_ts & solar_ts))
-            solar_intervals_total = int(len(solar_ts))
-            nem_intervals_total = int(len(nem_ts))
-            solar_alignment_quality_pct = (
-                float(solar_common_intervals) / float(solar_intervals_total) * 100.0
-                if solar_intervals_total > 0
-                else 0.0
-            )
-            solar_match_pct = (
-                float(solar_common_intervals) / float(nem_intervals_total) * 100.0
-                if nem_intervals_total > 0
-                else 0.0
-            )
+            solar_common_intervals = int(solar_hybrid_meta.get("solar_common_intervals", 0) or 0)
+            solar_intervals_total = int(solar_hybrid_meta.get("solar_intervals_total", 0) or 0)
+            nem_intervals_total = int(solar_hybrid_meta.get("nem_intervals_total", 0) or 0)
+            solar_alignment_quality_pct = float(solar_hybrid_meta.get("solar_alignment_quality_pct", 0.0) or 0.0)
+            solar_match_pct = float(solar_hybrid_meta.get("solar_match_pct", 0.0) or 0.0)
 
-            solar_profile_for_battery = solar_aligned
-            solar_metrics = estimate_solar_self_consumption_metrics(df_int, solar_aligned)
+            solar_profile_for_battery = solar_hybrid
+            solar_metrics = estimate_solar_self_consumption_metrics(df_int, solar_hybrid)
             total_pv_kwh = float(solar_metrics.get("pv_generated_kwh", 0.0) or 0.0)
             self_cons_pct = float(solar_metrics.get("self_consumption_pct", 0.0) or 0.0)
             solar_cov_pct = float(solar_metrics.get("solar_coverage_pct", 0.0) or 0.0)
@@ -6758,6 +7384,17 @@ if uploaded_solar is not None:
                     "Alignment quality = share of uploaded solar production rows that match a NEM timestamp. "
                     "NEM coverage = share of NEM intervals that have a solar row."
                 )
+                if bool(solar_hybrid_meta.get("used_backfill", False)):
+                    st.caption(
+                        f"Hybrid backfill active: modelled solar supplied {float(solar_hybrid_meta.get('backfilled_pct', 0.0) or 0.0):.1f}% "
+                        f"of NEM intervals ({int(solar_hybrid_meta.get('backfilled_intervals', 0) or 0):,} intervals, "
+                        f"{float(solar_hybrid_meta.get('backfilled_kwh', 0.0) or 0.0):,.1f} kWh) using "
+                        f"{str(solar_hybrid_meta.get('calibration_source', 'overlap_kwh_ratio') or 'overlap_kwh_ratio')}."
+                    )
+                elif int(solar_hybrid_meta.get("missing_intervals", 0) or 0) > 0:
+                    st.caption(
+                        "Hybrid backfill was not applied, so missing solar intervals remain at zero in this session."
+                    )
                 s1, s2, s3 = st.columns(3)
                 s1.metric("PV generated", f"{total_pv_kwh:,.1f} kWh")
                 s2.metric("Est. self-consumption", f"{self_cons_pct:.1f}%")
@@ -6794,13 +7431,22 @@ def _mark_current_plan(name: str) -> str:
     return f"* {name}" if cur and name == cur else name
 
 if ev_summary.get("enabled") and show_overview_only:
-    ev_mode = "Solar-first + backup" if ev_summary.get("strategy") == "solar_first_backup" else "Timer (grid)"
+    ev_mode = _format_ev_strategy_label(ev_summary.get("strategy", "timer_grid"))
     st.info(f"EV scenario active: **{ev_mode}** charging profile included in this run.")
+    if bool(ev_summary.get("embedded_baseline_used", False)):
+        st.caption(
+            f"Uploaded data was treated as the current EV baseline ({float(ev_summary.get('uploaded_ev_inclusion_pct', 0.0) or 0.0):.0f}% embedded). "
+            f"The app estimated a no-EV base by restoring {float(ev_summary.get('uploaded_ev_restored_kwh', 0.0) or 0.0):,.1f} kWh before applying the target EV mode."
+        )
     ev_c1, ev_c2, ev_c3, ev_c4 = st.columns(4)
     ev_c1.metric("EV energy requested", f"{float(ev_summary.get('requested_kwh', 0.0)):.1f} kWh")
     ev_c2.metric("Added grid import", f"{float(ev_summary.get('grid_kwh', 0.0)):.1f} kWh")
     ev_c3.metric("Solar diverted to EV", f"{float(ev_summary.get('solar_diverted_kwh', 0.0)):.1f} kWh")
     ev_c4.metric("Target coverage", f"{float(ev_summary.get('coverage_pct', 0.0)):.1f}%")
+    if float(ev_summary.get("smart_charger_capex", 0.0) or 0.0) > 0.0:
+        st.caption(
+            f"Optimiser package capex includes EV smart charger cost: ${float(ev_summary.get('smart_charger_capex', 0.0) or 0.0):,.0f}."
+        )
     if float(ev_summary.get("coverage_pct", 100.0)) < 95.0:
         st.warning(
             "Configured EV windows/charger power could not deliver the full EV target in this dataset period. "
@@ -7042,12 +7688,27 @@ else:
     load_shift_adjustment_active = bool(load_shift_summary.get("enabled", False))
     comparison_adjustments_active = ev_adjustment_active or load_shift_adjustment_active
     comparison_source_basis = "Uploaded NEM12 dataset (raw intervals)"
+    ev_embedded_in_uploaded = bool(embedded_ev_meta.get("enabled", False))
     if ev_adjustment_active and load_shift_adjustment_active:
-        comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions, then timer-based load shifting."
-        comparison_path = "Uploaded raw -> EV-adjusted -> load-shift-adjusted"
+        if ev_embedded_in_uploaded:
+            comparison_basis = (
+                "Uploaded NEM12 dataset with embedded EV estimate converted to a no-EV base, "
+                "then adjusted by the target EV charging assumptions, then timer-based load shifting."
+            )
+            comparison_path = "Uploaded raw -> estimated no-EV base -> target EV-adjusted -> load-shift-adjusted"
+        else:
+            comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions, then timer-based load shifting."
+            comparison_path = "Uploaded raw -> EV-adjusted -> load-shift-adjusted"
     elif ev_adjustment_active:
-        comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions."
-        comparison_path = "Uploaded raw -> EV-adjusted"
+        if ev_embedded_in_uploaded:
+            comparison_basis = (
+                "Uploaded NEM12 dataset with embedded EV estimate converted to a no-EV base, "
+                "then adjusted by the target EV charging assumptions."
+            )
+            comparison_path = "Uploaded raw -> estimated no-EV base -> target EV-adjusted"
+        else:
+            comparison_basis = "Uploaded NEM12 dataset adjusted by EV charging assumptions."
+            comparison_path = "Uploaded raw -> EV-adjusted"
     elif load_shift_adjustment_active:
         comparison_basis = "Uploaded NEM12 dataset adjusted by timer-based load shifting."
         comparison_path = "Uploaded raw -> load-shift-adjusted"
@@ -7058,6 +7719,16 @@ else:
         st.caption(f"Source interval basis: {comparison_source_basis}.")
         st.caption(f"Current comparison basis: {comparison_basis}")
         if ev_adjustment_active:
+            if ev_embedded_in_uploaded:
+                st.caption(
+                    f"Embedded EV baseline: uploaded data is assumed to already contain {float(embedded_ev_meta.get('included_share_pct', 0.0) or 0.0):.0f}% of total EV charging, "
+                    f"with current EV mix assumed at {max(0.0, 100.0 - float(embedded_ev_meta.get('current_solar_share_pct', 0.0) or 0.0)):.0f}% timer/grid and "
+                    f"{float(embedded_ev_meta.get('current_solar_share_pct', 0.0) or 0.0):.0f}% daytime solar."
+                )
+                st.caption(
+                    f"Estimated no-EV base recovery before applying the target EV mode: restored {float(embedded_ev_meta.get('restored_total_kwh', 0.0) or 0.0):,.1f} kWh "
+                    f"({float(embedded_ev_meta.get('coverage_pct', 100.0) or 100.0):.1f}% coverage)."
+                )
             st.caption(
                 f"EV adjustment summary: requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
                 f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
@@ -7089,6 +7760,8 @@ else:
     net_total_col = "Net Total including add-ons and one off plan adjustments ($)"
     uploaded_totals_by_plan = {}
     ev_only_totals_by_plan = {}
+    ev_lost_export_credit_by_plan = {}
+    ev_added_grid_import_cost_by_plan = {}
     comparison_battery_context_kwh = (
         float(st.session_state.get("current_setup_battery_kwh", 0.0) or 0.0)
         if bool(has_home_battery)
@@ -7119,12 +7792,20 @@ else:
         addon_ev_wall_kwh_annual = addon_ev_drive_kwh / max(1e-9, (1.0 - max(addon_ev_loss_pct, 0.0) / 100.0))
     addon_profile["ev_annual_kwh"] = float(max(addon_ev_wall_kwh_annual, 0.0))
     comparison_signature_payload = {
+        "adjustment_breakdown_version": 2,
         "dataset_sig": dict(dataset_sig),
         "dataset_base_sig": _dataset_signature(df_int_base),
         "plans_sig": _plan_list_signature(comparison_plans),
         "plan_addons_sig": _stable_json_digest(plan_addons_cfg),
         "battery_context_kwh": round(float(comparison_battery_context_kwh), 4),
         "ev_enabled": bool(ev_summary.get("enabled", False)),
+        "ev_uploaded_inclusion_mode": str(ev_uploaded_inclusion_mode),
+        "ev_uploaded_inclusion_pct": round(float(ev_uploaded_inclusion_pct), 4),
+        "ev_current_solar_share_pct": round(float(ev_current_solar_share_pct), 4),
+        "ev_current_timer_start": ev_current_timer_start_t.strftime("%H:%M"),
+        "ev_current_timer_end": ev_current_timer_end_t.strftime("%H:%M"),
+        "ev_current_solar_start": ev_current_solar_start_t.strftime("%H:%M"),
+        "ev_current_solar_end": ev_current_solar_end_t.strftime("%H:%M"),
         "addon_profile": {
             "has_home_battery": bool(addon_profile.get("has_home_battery", False)),
             "battery_kwh": round(float(addon_profile.get("battery_kwh", 0.0) or 0.0), 4),
@@ -7168,6 +7849,24 @@ else:
                 except Exception:
                     continue
             ev_only_totals_by_plan = safe_ev_totals
+        cached_lost_export = comparison_cache.get("ev_lost_export_credit_by_plan", {})
+        if isinstance(cached_lost_export, dict):
+            safe_lost_export: dict[str, float] = {}
+            for k, v in cached_lost_export.items():
+                try:
+                    safe_lost_export[str(k)] = float(v)
+                except Exception:
+                    continue
+            ev_lost_export_credit_by_plan = safe_lost_export
+        cached_added_import = comparison_cache.get("ev_added_grid_import_cost_by_plan", {})
+        if isinstance(cached_added_import, dict):
+            safe_added_import: dict[str, float] = {}
+            for k, v in cached_added_import.items():
+                try:
+                    safe_added_import[str(k)] = float(v)
+                except Exception:
+                    continue
+            ev_added_grid_import_cost_by_plan = safe_added_import
     else:
         for p in comparison_plans:
             sim = simulate_plan(
@@ -7200,6 +7899,22 @@ else:
                 ev_connection_fee_cents = float(sim_ev_only.get("connection_fee_cents_applied", 0.0))
                 ev_only_totals_by_plan[p.name] = (
                     ev_total_cents + ev_signup_credit_cents - ev_connection_fee_cents
+                ) / 100.0
+                uploaded_export_credit_cents = float(sim_uploaded.get("export_credit_cents", 0.0) or 0.0)
+                ev_export_credit_cents = float(sim_ev_only.get("export_credit_cents", 0.0) or 0.0)
+                uploaded_import_side_cents = (
+                    float(sim_uploaded.get("import_cents", 0.0) or 0.0)
+                    + float(sim_uploaded.get("demand_cents", 0.0) or 0.0)
+                )
+                ev_import_side_cents = (
+                    float(sim_ev_only.get("import_cents", 0.0) or 0.0)
+                    + float(sim_ev_only.get("demand_cents", 0.0) or 0.0)
+                )
+                ev_lost_export_credit_by_plan[p.name] = (
+                    uploaded_export_credit_cents - ev_export_credit_cents
+                ) / 100.0
+                ev_added_grid_import_cost_by_plan[p.name] = (
+                    ev_import_side_cents - uploaded_import_side_cents
                 ) / 100.0
     
             general_kwh = float(sim["general_kwh"])
@@ -7307,6 +8022,8 @@ else:
             "rows": rows,
             "uploaded_totals_by_plan": uploaded_totals_by_plan,
             "ev_only_totals_by_plan": ev_only_totals_by_plan,
+            "ev_lost_export_credit_by_plan": ev_lost_export_credit_by_plan,
+            "ev_added_grid_import_cost_by_plan": ev_added_grid_import_cost_by_plan,
         }
     
     res = pd.DataFrame(rows)
@@ -7451,13 +8168,24 @@ else:
             "Positive impacts mean the adjusted interval dataset increased the bill for that plan. "
             "These deltas use base plan totals only (before add-on ranking adjustments)."
         )
+        if ev_adjustment_active and ev_embedded_in_uploaded:
+            st.caption(
+                "Because the uploaded dataset is being treated as the current EV baseline, these EV deltas represent the estimated bill change from current charging behaviour to the selected target EV mode."
+            )
+        if ev_adjustment_active:
+            st.caption(
+                "`Lost export credit ($)` is FiT value given up when EV charging absorbs solar that would otherwise export. "
+                "`Added grid import cost ($)` captures extra import-usage and demand charges from EV charging, so in solar-surplus-only mode it should usually stay near zero."
+            )
         adjustment_delta = pd.DataFrame({"Plan": res["Plan"].astype(str)})
         adjustment_delta["Total uploaded data ($)"] = adjustment_delta["Plan"].map(uploaded_totals_by_plan)
         if ev_adjustment_active:
             adjustment_delta["Total with EV only ($)"] = adjustment_delta["Plan"].map(ev_only_totals_by_plan)
-            adjustment_delta["EV impact ($)"] = (
+            adjustment_delta["EV bill impact ($)"] = (
                 adjustment_delta["Total with EV only ($)"] - adjustment_delta["Total uploaded data ($)"]
             ).round(2)
+            adjustment_delta["Lost export credit ($)"] = adjustment_delta["Plan"].map(ev_lost_export_credit_by_plan).round(2)
+            adjustment_delta["Added grid import cost ($)"] = adjustment_delta["Plan"].map(ev_added_grid_import_cost_by_plan).round(2)
         current_total_label = (
             "Total with EV + load shift ($)"
             if (ev_adjustment_active and load_shift_adjustment_active)
@@ -7532,7 +8260,11 @@ else:
 
         solar_source_report = "None"
         if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
-            solar_source_report = "Uploaded profile"
+            solar_source_report = (
+                "Uploaded profile + modelled backfill"
+                if bool(solar_hybrid_meta.get("used_backfill", False))
+                else "Uploaded profile"
+            )
         elif bool(st.session_state.get("joint_use_modelled_solar", False)):
             solar_source_report = "Modelled profile (optimiser/what-if workflows)"
 
@@ -7701,9 +8433,19 @@ else:
             "",
             "## Dataset adjustments",
             (
-                f"- EV adjustment: requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
-                f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
-                f"solar diverted {float(ev_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh."
+                (
+                    f"- EV adjustment: uploaded data already assumed to contain {float(embedded_ev_meta.get('included_share_pct', 0.0) or 0.0):.0f}% of EV charging; "
+                    f"estimated no-EV base restored {float(embedded_ev_meta.get('restored_total_kwh', 0.0) or 0.0):,.1f} kWh; "
+                    f"target EV requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
+                    f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
+                    f"solar diverted {float(ev_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh."
+                )
+                if (ev_adjustment_active and ev_embedded_in_uploaded)
+                else (
+                    f"- EV adjustment: requested {float(ev_summary.get('requested_kwh', 0.0) or 0.0):,.1f} kWh; "
+                    f"grid added {float(ev_summary.get('grid_kwh', 0.0) or 0.0):,.1f} kWh; "
+                    f"solar diverted {float(ev_summary.get('solar_diverted_kwh', 0.0) or 0.0):,.1f} kWh."
+                )
                 if ev_adjustment_active
                 else "- EV adjustment: not applied."
             ),
@@ -7839,10 +8581,17 @@ if show_battery_only:
                     })
                 _show_table(pd.DataFrame(optimizer_meter_rows), use_container_width=True)
     if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty:
-        st.info(
-            f"Using uploaded solar production file in dispatch calculations "
-            f"(alignment quality: {solar_alignment_quality_pct:.1f}%, NEM coverage: {solar_match_pct:.1f}%)."
-        )
+        if bool(solar_hybrid_meta.get("used_backfill", False)):
+            st.info(
+                f"Using uploaded solar production with calibrated modelled backfill in dispatch calculations "
+                f"(alignment quality: {solar_alignment_quality_pct:.1f}%, NEM coverage: {solar_match_pct:.1f}%, "
+                f"backfilled: {float(solar_hybrid_meta.get('backfilled_pct', 0.0) or 0.0):.1f}% of NEM intervals)."
+            )
+        else:
+            st.info(
+                f"Using uploaded solar production file in dispatch calculations "
+                f"(alignment quality: {solar_alignment_quality_pct:.1f}%, NEM coverage: {solar_match_pct:.1f}%)."
+            )
 
     if df_int is None or df_int.empty:
         st.info("Upload a dataset to enable Battery and Solar Simulator.")
@@ -8271,6 +9020,17 @@ if show_battery_only:
                 "dataset_sig": dict(dataset_sig),
                 "ev_enabled": bool(ev_summary.get("enabled", False)),
                 "ev_strategy": str(ev_summary.get("strategy", "off")),
+                "ev_smart_charger_active": bool(ev_summary.get("smart_charger_active", False)),
+                "ev_smart_charger_capex": round(float(ev_summary.get("smart_charger_capex", 0.0) or 0.0), 2),
+                "ev_uploaded_inclusion_mode": str(ev_uploaded_inclusion_mode),
+                "ev_uploaded_inclusion_pct": round(float(ev_uploaded_inclusion_pct), 4),
+                "ev_current_solar_share_pct": round(float(ev_current_solar_share_pct), 4),
+                "ev_current_timer_start": ev_current_timer_start_t.strftime("%H:%M"),
+                "ev_current_timer_end": ev_current_timer_end_t.strftime("%H:%M"),
+                "ev_current_solar_start": ev_current_solar_start_t.strftime("%H:%M"),
+                "ev_current_solar_end": ev_current_solar_end_t.strftime("%H:%M"),
+                "ev_embedded_restored_kwh": round(float(embedded_ev_meta.get("restored_total_kwh", 0.0) or 0.0), 4),
+                "ev_embedded_recovery_pct": round(float(embedded_ev_meta.get("coverage_pct", 100.0) or 100.0), 4),
                 "load_shift_model": dict(load_shift_signature),
                 "solar_loaded": bool(isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty),
                 "solar_match_pct": round(float(solar_match_pct or 0.0), 2),
@@ -8278,6 +9038,12 @@ if show_battery_only:
                 "solar_common_intervals": int(solar_common_intervals or 0),
                 "solar_intervals_total": int(solar_intervals_total or 0),
                 "nem_intervals_total": int(nem_intervals_total or 0),
+                "solar_backfill_used": bool(solar_hybrid_meta.get("used_backfill", False)),
+                "solar_backfilled_intervals": int(solar_hybrid_meta.get("backfilled_intervals", 0) or 0),
+                "solar_backfilled_pct": round(float(solar_hybrid_meta.get("backfilled_pct", 0.0) or 0.0), 2),
+                "solar_backfilled_kwh": round(float(solar_hybrid_meta.get("backfilled_kwh", 0.0) or 0.0), 3),
+                "solar_backfill_calibration_factor": round(float(solar_hybrid_meta.get("calibration_factor", 0.0) or 0.0), 6),
+                "solar_backfill_calibration_source": str(solar_hybrid_meta.get("calibration_source", "") or ""),
                 "solar_total_kwh": (
                     round(float(pd.to_numeric(solar_profile_for_battery["pv_kwh"], errors="coerce").fillna(0.0).sum()), 3)
                     if isinstance(solar_profile_for_battery, pd.DataFrame) and not solar_profile_for_battery.empty and "pv_kwh" in solar_profile_for_battery.columns
@@ -8396,7 +9162,8 @@ if show_battery_only:
                 battery_cost = float(_coerce_float(best.get("Battery cost ($)")) or 0.0)
                 solar_capex = float(_coerce_float(best.get("Incremental solar capex ($)")) or 0.0)
                 load_shift_capex = float(_coerce_float(best.get("Load shift capex ($)")) or 0.0)
-                package_capex = float(battery_cost + solar_capex + load_shift_capex)
+                ev_smart_charger_capex = float(_coerce_float(best.get("EV smart charger capex ($)")) or 0.0)
+                package_capex = float(battery_cost + solar_capex + load_shift_capex + ev_smart_charger_capex)
                 package_payback = _simple_payback_years(package_capex, household_savings)
                 battery_payback = _simple_payback_years(battery_cost, ann)
                 best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
@@ -8431,6 +9198,10 @@ if show_battery_only:
                 if best_load_shift_label != "Off":
                     recommended_setup_text += f" + {best_load_shift_label.lower()} load shifting"
                 st.markdown(f"**Recommended setup:** {recommended_setup_text}")
+                if ev_smart_charger_capex > 0.0:
+                    st.caption(
+                        f"Selected EV mode includes smart charger capex of ${ev_smart_charger_capex:,.0f} in package-cost and payback calculations."
+                    )
 
                 decision_tone = "warning"
                 decision_title = "Treat this as a comparison, not a buy signal yet."
@@ -8445,7 +9216,7 @@ if show_battery_only:
                     elif is_attractive:
                         decision_tone = "success"
                         decision_title = "This setup looks worth shortlisting."
-                    elif batt_npv is not None and batt_npv <= 0.0 and (solar_capex > 0.0 or load_shift_capex > 0.0):
+                    elif batt_npv is not None and batt_npv <= 0.0 and (solar_capex > 0.0 or load_shift_capex > 0.0 or ev_smart_charger_capex > 0.0):
                         decision_tone = "info"
                         decision_title = "The package lowers bills, but the battery is the weakest part."
                     else:
@@ -8934,8 +9705,14 @@ if show_battery_only:
                         },
                         {
                             "Input group": "Solar production profile",
-                            "Source used by optimiser": "Uploaded solar profile when provided, otherwise optional modelled solar profile in this tab.",
-                            "Where to change it": "Upload solar file at top or enable 'Use modelled solar profile' in this optimiser tab.",
+                            "Source used by optimiser": (
+                                "Uploaded solar profile when provided, with calibrated modelled backfill for missing "
+                                "NEM intervals; otherwise optional modelled solar profile in this tab."
+                            ),
+                            "Where to change it": (
+                                "Upload solar file at top, or adjust the modelled solar assumptions used for "
+                                "backfill / full modelling in this optimiser tab."
+                            ),
                         },
                         {
                             "Input group": "Battery technical assumptions",
@@ -8969,8 +9746,89 @@ if show_battery_only:
                 if "joint_use_modelled_solar" not in st.session_state:
                     st.session_state["joint_use_modelled_solar"] = False
 
+                def _render_joint_modelled_solar_inputs() -> tuple[str, float, float, float]:
+                    ms1, ms2 = st.columns(2)
+                    with ms1:
+                        _postcode = st.text_input(
+                            "Location / postcode",
+                            value=str(st.session_state.get("joint_modelled_postcode", "4000")),
+                            key="joint_modelled_postcode",
+                            help="Used for a broad latitude/region estimate in the first-pass solar model.",
+                        )
+                        _tilt = st.number_input(
+                            "Roof tilt (deg)",
+                            min_value=0.0,
+                            max_value=60.0,
+                            value=float(st.session_state.get("joint_modelled_tilt_deg", 20.0)),
+                            step=1.0,
+                            key="joint_modelled_tilt_deg",
+                            help="Panel tilt angle from horizontal.",
+                        )
+                    with ms2:
+                        _azimuth = st.number_input(
+                            "Roof azimuth (deg, 0 = North)",
+                            min_value=0.0,
+                            max_value=359.0,
+                            value=float(st.session_state.get("joint_modelled_azimuth_deg", 0.0)),
+                            step=5.0,
+                            key="joint_modelled_azimuth_deg",
+                            help="Panel orientation: 0=N, 90=E, 180=S, 270=W.",
+                        )
+                        _losses = st.number_input(
+                            "System losses + shading (%)",
+                            min_value=0.0,
+                            max_value=60.0,
+                            value=float(st.session_state.get("joint_modelled_losses_pct", 14.0)),
+                            step=1.0,
+                            key="joint_modelled_losses_pct",
+                            help="Combined wiring, inverter, temperature and shading losses.",
+                        )
+                    return str(_postcode), float(_tilt), float(_azimuth), float(_losses)
+
+                def _refresh_modelled_solar_preview(
+                    postcode_value: str,
+                    tilt_value: float,
+                    azimuth_value: float,
+                    losses_value: float,
+                ) -> tuple[Optional[pd.DataFrame], dict]:
+                    _profile, _meta = build_modelled_solar_profile_1kw(
+                        df_int,
+                        postcode_value,
+                        float(tilt_value),
+                        float(azimuth_value),
+                        float(losses_value),
+                    )
+                    if isinstance(_profile, pd.DataFrame) and not _profile.empty:
+                        avg_daily_1kw = float(_meta.get("avg_daily_kwh_per_kw", 0.0) or 0.0)
+                        annual_1kw = float(_meta.get("annual_kwh_per_kw", 0.0) or 0.0)
+                        lat_disp = float(_meta.get("latitude_deg", 0.0) or 0.0)
+                        st.caption(
+                            "Modelled solar (first pass): "
+                            f"~{avg_daily_1kw:.2f} kWh/day per 1 kW "
+                            f"(~{annual_1kw:.0f} kWh/yr/kW, est. lat {lat_disp:.2f} deg)."
+                        )
+                    return _profile, dict(_meta or {})
+
                 use_modelled_solar = False
-                if not solar_uploaded_available:
+                if solar_uploaded_available:
+                    with st.expander("Solar backfill assumptions", expanded=bool(solar_hybrid_meta.get("used_backfill", False))):
+                        st.caption(
+                            "Uploaded solar intervals are kept where present. Missing NEM intervals are backfilled "
+                            "from a calibrated modelled profile using these assumptions."
+                        )
+                        if bool(solar_hybrid_meta.get("used_backfill", False)):
+                            st.caption(
+                                f"Current run: {float(solar_hybrid_meta.get('backfilled_pct', 0.0) or 0.0):.1f}% of NEM intervals "
+                                f"backfilled with calibration `{str(solar_hybrid_meta.get('calibration_source', 'overlap_kwh_ratio') or 'overlap_kwh_ratio')}`."
+                            )
+                        modelled_postcode, modelled_tilt_deg, modelled_azimuth_deg, modelled_losses_pct = _render_joint_modelled_solar_inputs()
+                        modelled_solar_profile_1kw, modelled_solar_meta = _refresh_modelled_solar_preview(
+                            modelled_postcode,
+                            modelled_tilt_deg,
+                            modelled_azimuth_deg,
+                            modelled_losses_pct,
+                        )
+                else:
                     st.caption("No uploaded solar profile found. You can still model solar from site assumptions.")
                     use_modelled_solar = st.checkbox(
                         "Use modelled solar profile (no upload)",
@@ -8979,60 +9837,14 @@ if show_battery_only:
                         help="Builds a first-pass interval solar profile from postcode/location, roof orientation, and losses.",
                     )
                     if use_modelled_solar:
-                        ms1, ms2 = st.columns(2)
-                        with ms1:
-                            modelled_postcode = st.text_input(
-                                "Location / postcode",
-                                value=str(st.session_state.get("joint_modelled_postcode", "4000")),
-                                key="joint_modelled_postcode",
-                                help="Used for a broad latitude/region estimate in the first-pass solar model.",
-                            )
-                            modelled_tilt_deg = st.number_input(
-                                "Roof tilt (deg)",
-                                min_value=0.0,
-                                max_value=60.0,
-                                value=float(st.session_state.get("joint_modelled_tilt_deg", 20.0)),
-                                step=1.0,
-                                key="joint_modelled_tilt_deg",
-                                help="Panel tilt angle from horizontal.",
-                            )
-                        with ms2:
-                            modelled_azimuth_deg = st.number_input(
-                                "Roof azimuth (deg, 0 = North)",
-                                min_value=0.0,
-                                max_value=359.0,
-                                value=float(st.session_state.get("joint_modelled_azimuth_deg", 0.0)),
-                                step=5.0,
-                                key="joint_modelled_azimuth_deg",
-                                help="Panel orientation: 0=N, 90=E, 180=S, 270=W.",
-                            )
-                            modelled_losses_pct = st.number_input(
-                                "System losses + shading (%)",
-                                min_value=0.0,
-                                max_value=60.0,
-                                value=float(st.session_state.get("joint_modelled_losses_pct", 14.0)),
-                                step=1.0,
-                                key="joint_modelled_losses_pct",
-                                help="Combined wiring, inverter, temperature and shading losses.",
-                            )
-
-                        modelled_solar_profile_1kw, modelled_solar_meta = build_modelled_solar_profile_1kw(
-                            df_int,
+                        modelled_postcode, modelled_tilt_deg, modelled_azimuth_deg, modelled_losses_pct = _render_joint_modelled_solar_inputs()
+                        modelled_solar_profile_1kw, modelled_solar_meta = _refresh_modelled_solar_preview(
                             modelled_postcode,
-                            float(modelled_tilt_deg),
-                            float(modelled_azimuth_deg),
-                            float(modelled_losses_pct),
+                            modelled_tilt_deg,
+                            modelled_azimuth_deg,
+                            modelled_losses_pct,
                         )
-                        if isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty:
-                            avg_daily_1kw = float(modelled_solar_meta.get("avg_daily_kwh_per_kw", 0.0) or 0.0)
-                            annual_1kw = float(modelled_solar_meta.get("annual_kwh_per_kw", 0.0) or 0.0)
-                            lat_disp = float(modelled_solar_meta.get("latitude_deg", 0.0) or 0.0)
-                            st.caption(
-                                "Modelled solar (first pass): "
-                                f"~{avg_daily_1kw:.2f} kWh/day per 1 kW "
-                                f"(~{annual_1kw:.0f} kWh/yr/kW, est. lat {lat_disp:.2f} deg)."
-                            )
-                        else:
+                        if not (isinstance(modelled_solar_profile_1kw, pd.DataFrame) and not modelled_solar_profile_1kw.empty):
                             use_modelled_solar = False
                             st.warning("Could not build a modelled solar profile from the current dataset and assumptions.")
 
@@ -9046,6 +9858,7 @@ if show_battery_only:
                 )
                 df_joint_base = df_int_ev
                 df_joint_stage_seed = df_int_ev
+                df_joint_current_base_seed = df_int_base
                 if assume_no_existing_export:
                     try:
                         d0 = df_int_ev.copy()
@@ -9056,10 +9869,16 @@ if show_battery_only:
                         df_joint_base = d0
                         d0_stage = d0.copy()
                         df_joint_stage_seed = d0_stage
+                        d0_current = df_int_base.copy()
+                        reg_current = d0_current["register"].astype(str)
+                        mask_export_current = reg_current.isin(EXPORT_REGS)
+                        d0_current.loc[mask_export_current, "kwh"] = 0.0
+                        df_joint_current_base_seed = d0_current
                         st.caption(f"Baseline export removed for optimiser: {removed_export_kwh:,.1f} kWh over dataset period.")
                     except Exception:
                         df_joint_base = df_int_ev
                         df_joint_stage_seed = df_int_ev
+                        df_joint_current_base_seed = df_int_base
                         st.warning("Could not apply baseline export override; using original dataset profile.")
                 joint_load_shift_scenarios = _build_load_shift_scenarios(load_shift_params)
                 enable_solar_sweep = st.checkbox(
@@ -9090,7 +9909,7 @@ if show_battery_only:
                             key="joint_current_pv_kw",
                             help=(
                                 "Used for incremental solar capex baseline. "
-                                "Uploaded-solar mode also uses this to scale the uploaded profile."
+                                "Uploaded-solar mode also uses this to scale the uploaded / hybrid solar profile."
                             ),
                         )
                     with sp2:
@@ -9388,6 +10207,10 @@ if show_battery_only:
                                     "solar_common_intervals": int(solar_common_intervals or 0),
                                     "solar_intervals_total": int(solar_intervals_total or 0),
                                     "nem_intervals_total": int(nem_intervals_total or 0),
+                                    "solar_backfill_used": bool(solar_hybrid_meta.get("used_backfill", False)),
+                                    "solar_backfilled_intervals": int(solar_hybrid_meta.get("backfilled_intervals", 0) or 0),
+                                    "solar_backfilled_pct": round(float(solar_hybrid_meta.get("backfilled_pct", 0.0) or 0.0), 2),
+                                    "solar_backfilled_kwh": round(float(solar_hybrid_meta.get("backfilled_kwh", 0.0) or 0.0), 3),
                                 },
                                 "load_shift": {
                                     **dict(load_shift_signature),
@@ -9412,6 +10235,14 @@ if show_battery_only:
                                     "assume_no_existing_export": bool(assume_no_existing_export),
                                     "current_pv_kw": round(float(current_pv_kw), 4),
                                     "incremental_capex_per_kw": round(float(pv_cost_per_kw), 4),
+                                    "hybrid_backfill": {
+                                        "used": bool(solar_hybrid_meta.get("used_backfill", False)),
+                                        "backfilled_intervals": int(solar_hybrid_meta.get("backfilled_intervals", 0) or 0),
+                                        "backfilled_pct": round(float(solar_hybrid_meta.get("backfilled_pct", 0.0) or 0.0), 4),
+                                        "backfilled_kwh": round(float(solar_hybrid_meta.get("backfilled_kwh", 0.0) or 0.0), 4),
+                                        "calibration_factor": round(float(solar_hybrid_meta.get("calibration_factor", 0.0) or 0.0), 6),
+                                        "calibration_source": str(solar_hybrid_meta.get("calibration_source", "") or ""),
+                                    },
                                 },
                                 "solar_sweep": {
                                     "enabled": bool(enable_solar_sweep),
@@ -9452,15 +10283,27 @@ if show_battery_only:
                                     "enabled": bool(ev_summary.get("enabled", False)),
                                     "annual_km": round(float(ev_summary.get("annual_km", ev_annual_km) or 0.0), 2),
                                     "strategy": str(ev_summary.get("strategy", "off")),
+                                    "strategy_label": _format_ev_strategy_label(ev_summary.get("strategy", "off")),
                                     "consumption_kwh_per_100km": round(float(ev_consumption), 4),
                                     "charging_loss_pct": round(float(ev_loss_pct), 4),
                                     "charger_kw": round(float(ev_charger_kw), 4),
+                                    "smart_charger_active": bool(ev_summary.get("smart_charger_active", False)),
+                                    "smart_charger_capex": round(float(ev_summary.get("smart_charger_capex", 0.0) or 0.0), 2),
+                                    "uploaded_ev_inclusion_mode": str(ev_uploaded_inclusion_mode),
+                                    "uploaded_ev_inclusion_pct": round(float(ev_uploaded_inclusion_pct), 4),
+                                    "current_embedded_solar_share_pct": round(float(ev_current_solar_share_pct), 4),
+                                    "current_embedded_timer_start": ev_current_timer_start_t.strftime("%H:%M"),
+                                    "current_embedded_timer_end": ev_current_timer_end_t.strftime("%H:%M"),
+                                    "current_embedded_solar_start": ev_current_solar_start_t.strftime("%H:%M"),
+                                    "current_embedded_solar_end": ev_current_solar_end_t.strftime("%H:%M"),
+                                    "embedded_ev_restored_kwh": round(float(embedded_ev_meta.get("restored_total_kwh", 0.0) or 0.0), 4),
+                                    "embedded_ev_recovery_pct": round(float(embedded_ev_meta.get("coverage_pct", 100.0) or 100.0), 4),
                                 },
                                 "simulation": {
                                     "planned_combinations": int(run_count),
                                 },
                             }
-                            if solar_mode == "modelled":
+                            if solar_mode == "modelled" or bool(solar_hybrid_meta.get("used_backfill", False)):
                                 joint_assumptions["solar"]["modelled_profile"] = {
                                     "postcode": str(modelled_postcode),
                                     "tilt_deg": round(float(modelled_tilt_deg), 4),
@@ -9788,7 +10631,7 @@ if show_battery_only:
                         # same plan at current solar size, no battery.
                         if (solar_mode == "uploaded") and enable_solar_sweep:
                             df_current_solar_case, _, _ = apply_pv_scale_to_intervals(
-                                df_joint_base,
+                                df_joint_current_base_seed,
                                 solar_profile_for_battery,
                                 1.0,
                             )
@@ -9803,13 +10646,13 @@ if show_battery_only:
                                     * max(float(current_pv_kw), 0.0)
                                 )
                                 df_current_solar_case, _, _ = apply_modelled_pv_to_intervals(
-                                    df_joint_base,
+                                    df_joint_current_base_seed,
                                     solar_current,
                                 )
                             else:
-                                df_current_solar_case = df_joint_base
+                                df_current_solar_case = df_joint_current_base_seed
                         else:
-                            df_current_solar_case = df_joint_base
+                            df_current_solar_case = df_joint_current_base_seed
 
                         for plan_idx, p in enumerate(battery_optimizer_plans[next_plan_idx:], start=next_plan_idx + 1):
                             plan_zero_idx = int(plan_idx - 1)
@@ -9950,11 +10793,16 @@ if show_battery_only:
                                         pv_bills += max(0.0, annual_base_bill_t - float(sav)) / disc
                                         pv_bills_no_batt += annual_base_bill_t / disc
 
-                                    system_lifetime_cost = float(pv_capex + batt_cost + load_shift_capex + pv_bills)
-                                    system_saving_vs_no_batt = float(pv_bills_no_batt - (batt_cost + load_shift_capex + pv_bills))
+                                    system_lifetime_cost = float(
+                                        pv_capex + batt_cost + load_shift_capex + ev_smart_charger_capex_active + pv_bills
+                                    )
+                                    system_saving_vs_no_batt = float(
+                                        pv_bills_no_batt - (batt_cost + load_shift_capex + ev_smart_charger_capex_active + pv_bills)
+                                    )
 
                                     cand = {
                                         "Plan": p.name,
+                                        "EV charging strategy": _format_ev_strategy_label(ev_summary.get("strategy", "timer_grid")),
                                         "Load shift scenario": load_shift_label,
                                         "Load shift": ("On" if bool(load_shift_case_summary.get("enabled", False)) else "Off"),
                                         "Shifted kWh": round(float(load_shift_case_summary.get("shifted_kwh", 0.0) or 0.0), 1),
@@ -9971,6 +10819,7 @@ if show_battery_only:
                                         "Current solar/no-battery annual bill ($/yr)": float(annual_bill_current_solar),
                                         "Incremental solar capex ($)": float(pv_capex),
                                         "Load shift capex ($)": float(load_shift_capex),
+                                        "EV smart charger capex ($)": float(ev_smart_charger_capex_active),
                                         "Battery cost ($)": float(batt_cost),
                                         "Est. PV generated (solar-only, kWh)": float(solar_pv_gen_case),
                                         "Est. self-consumption (solar-only, %)": float(solar_self_cons_pct),
@@ -10213,6 +11062,7 @@ if show_battery_only:
 
                                         solar_capex_stage = 0.0
                                         load_shift_capex_stage = 0.0
+                                        ev_smart_charger_capex_stage = 0.0
                                         batt_capex_stage = 0.0
                                         if include_incremental_capex:
                                             solar_capex_stage = (
@@ -10221,11 +11071,17 @@ if show_battery_only:
                                                 else 0.0
                                             )
                                             load_shift_capex_stage = _load_shift_capex_for_params(stage_shift_params)
+                                            ev_smart_charger_capex_stage = float(ev_smart_charger_capex_active)
                                             batt_capex_stage = _battery_capex_for_size(float(batt_kwh_case))
+                                            if ev_smart_charger_capex_stage > 0.0:
+                                                note_parts.append(
+                                                    "Includes EV smart charger capex for the selected solar-priority EV mode."
+                                                )
 
                                         return {
                                             "Scenario": scenario_label,
                                             "Plan": plan_name_case,
+                                            "EV charging strategy": _format_ev_strategy_label(ev_summary.get("strategy", "timer_grid")),
                                             "Solar size (kW)": round(float(pv_kw_case), 2),
                                             "Battery size (kWh)": round(float(batt_kwh_case), 2),
                                             "Load shift": stage_shift_label,
@@ -10235,8 +11091,17 @@ if show_battery_only:
                                             "Estimated annual bill ($/yr)": round(float(annual_stage_bill), 0),
                                             "Incremental solar capex ($)": round(float(solar_capex_stage), 0),
                                             "Load shift capex ($)": round(float(load_shift_capex_stage), 0),
+                                            "EV smart charger capex ($)": round(float(ev_smart_charger_capex_stage), 0),
                                             "Battery capex ($)": round(float(batt_capex_stage), 0),
-                                            "Total incremental capex ($)": round(float(solar_capex_stage + load_shift_capex_stage + batt_capex_stage), 0),
+                                            "Total incremental capex ($)": round(
+                                                float(
+                                                    solar_capex_stage
+                                                    + load_shift_capex_stage
+                                                    + ev_smart_charger_capex_stage
+                                                    + batt_capex_stage
+                                                ),
+                                                0,
+                                            ),
                                             "Scenario notes": (" ".join(note_parts) if note_parts else "-"),
                                         }
 
@@ -10347,6 +11212,7 @@ if show_battery_only:
                         float(_coerce_float(best.get("Battery cost ($)")) or 0.0)
                         + float(_coerce_float(best.get("Incremental solar capex ($)")) or 0.0)
                         + float(_coerce_float(best.get("Load shift capex ($)")) or 0.0)
+                        + float(_coerce_float(best.get("EV smart charger capex ($)")) or 0.0)
                     )
                     joint_days_opt = float(st.session_state.get("joint_days", 0.0) or 0.0)
                     if joint_days_opt >= 330:
@@ -10366,6 +11232,7 @@ if show_battery_only:
                             float(best.get("Battery cost ($)", 0.0) or 0.0)
                             + float(best.get("Incremental solar capex ($)", 0.0) or 0.0)
                             + float(best.get("Load shift capex ($)", 0.0) or 0.0)
+                            + float(best.get("EV smart charger capex ($)", 0.0) or 0.0)
                         )
                         if sav > 0:
                             payback = bc / sav
@@ -10665,7 +11532,7 @@ if show_battery_only:
 
                     _show_dataframe_with_frozen_column(df_joint, freeze_col="Plan")
                     st.caption(
-                        "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + load-shift capex + battery cost. Lower is better."
+                        "PV lifetime cost incl battery = discounted bill stream + incremental solar capex + load-shift capex + EV smart charger capex + battery cost. Lower is better."
                     )
                     st.caption("`Battery incremental savings vs same solar` isolates battery-only impact at that solar size and load-shift scenario.")
                     st.caption("`Total savings vs current solar, no battery` includes solar-size, load-shift, and battery effects.")
@@ -10682,7 +11549,9 @@ if show_battery_only:
                             f"{stress_plans}. Review cycle assumptions and dispatch intensity."
                         )
                     if "Incremental solar capex ($)" in df_joint.columns:
-                        st.caption("Payback uses battery cost + incremental solar capex.")
+                        st.caption(
+                            "Payback uses battery cost + incremental solar capex + load-shift capex + EV smart charger capex where applicable."
+                        )
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
                     st.info("Run the joint optimiser in this tab to generate results.")
@@ -10696,6 +11565,11 @@ if show_battery_only:
                     "EV timing/charger assumptions come from the sidebar Global EV charging model. "
                     "Fields below control EV presence and annual driving in each What-if case."
                 )
+                if bool(embedded_ev_meta.get("enabled", False)):
+                    st.caption(
+                        "Because the uploaded data is assumed to already include EV charging, the Current case uses the uploaded dataset as the baseline when EV is enabled. "
+                        "What-if EV scenarios are rebuilt from an estimated no-EV base."
+                    )
                 if load_shift_summary.get("enabled"):
                     st.caption("Global hot-water / pool load shifting from the sidebar is also applied in these scenarios.")
 
@@ -10958,12 +11832,24 @@ if show_battery_only:
                             "charger_kw": round(float(ev_charger_kw), 4),
                             "charge_days": str(ev_charge_days_label),
                             "strategy": str(ev_strategy_label),
+                            "strategy_code": str(ev_strategy_code),
                             "timer_start": ev_timer_start_t.strftime("%H:%M"),
                             "timer_end": ev_timer_end_t.strftime("%H:%M"),
                             "solar_start": ev_solar_start_t.strftime("%H:%M"),
                             "solar_end": ev_solar_end_t.strftime("%H:%M"),
                             "backup_start": ev_backup_start_t.strftime("%H:%M"),
                             "backup_end": ev_backup_end_t.strftime("%H:%M"),
+                            "smart_charger_active": bool(ev_summary.get("smart_charger_active", False)),
+                            "smart_charger_capex": round(float(ev_smart_charger_capex_active), 2),
+                            "uploaded_ev_inclusion_mode": str(ev_uploaded_inclusion_mode),
+                            "uploaded_ev_inclusion_pct": round(float(ev_uploaded_inclusion_pct), 4),
+                            "current_embedded_solar_share_pct": round(float(ev_current_solar_share_pct), 4),
+                            "current_embedded_timer_start": ev_current_timer_start_t.strftime("%H:%M"),
+                            "current_embedded_timer_end": ev_current_timer_end_t.strftime("%H:%M"),
+                            "current_embedded_solar_start": ev_current_solar_start_t.strftime("%H:%M"),
+                            "current_embedded_solar_end": ev_current_solar_end_t.strftime("%H:%M"),
+                            "embedded_ev_restored_kwh": round(float(embedded_ev_meta.get("restored_total_kwh", 0.0) or 0.0), 4),
+                            "embedded_ev_recovery_pct": round(float(embedded_ev_meta.get("coverage_pct", 100.0) or 100.0), 4),
                         },
                         "global_load_shift_model": dict(load_shift_signature),
                         "battery_model": {
@@ -11015,6 +11901,7 @@ if show_battery_only:
                             return None, f"{case_name}: plan '{plan_name}' not found."
                         ev_enabled_flag = bool(ev_enabled_case)
                         ev_km_display = float(ev_km_case) if ev_enabled_flag else 0.0
+                        note_parts_case: list[str] = []
 
                         ev_case = EVParams(
                             enabled=ev_enabled_flag,
@@ -11030,8 +11917,26 @@ if show_battery_only:
                             solar_end=ev_solar_end_t.strftime("%H:%M"),
                             backup_start=ev_backup_start_t.strftime("%H:%M"),
                             backup_end=ev_backup_end_t.strftime("%H:%M"),
+                            smart_charger_capex=float(ev_smart_charger_capex),
                         )
-                        df_case_ev, _ev_case_summary = apply_ev_profile_to_intervals(df_int_base, ev_case)
+                        embedded_ev_available_for_case = bool(embedded_ev_meta.get("enabled", False))
+                        current_case_uses_uploaded_baseline = (
+                            embedded_ev_available_for_case
+                            and ev_enabled_flag
+                            and str(case_name).strip().lower().startswith("current")
+                        )
+                        if current_case_uses_uploaded_baseline:
+                            df_case_ev = df_int_base.copy()
+                            _ev_case_summary = {
+                                "enabled": True,
+                                "strategy": "uploaded_current_baseline",
+                            }
+                            note_parts_case.append(
+                                f"{case_name}: using uploaded dataset as the current EV baseline because EV is already embedded in the uploaded data."
+                            )
+                        else:
+                            ev_case_seed = df_int_no_ev_base if embedded_ev_available_for_case else df_int_base
+                            df_case_ev, _ev_case_summary = apply_ev_profile_to_intervals(ev_case_seed, ev_case)
                         load_shift_case_params = copy.deepcopy(load_shift_params)
                         if not bool(use_load_shift_case):
                             for ld in load_shift_case_params:
@@ -11065,15 +11970,19 @@ if show_battery_only:
                             modelled_solar_profile_1kw_whatif,
                         )
                         if solar_note:
-                            note = f"{case_name}: {solar_note}"
+                            note_parts_case.append(f"{case_name}: {solar_note}")
                         elif (solar_mode_case == "none") and abs(float(solar_kw) - float(base_solar_kw_for_scaling)) > 0.01:
-                            note = f"{case_name}: solar size change ignored (no uploaded/modelled solar profile available)."
+                            note_parts_case.append(
+                                f"{case_name}: solar size change ignored (no uploaded/modelled solar profile available)."
+                            )
                         if bool(load_shift_case_summary.get("enabled", False)):
                             load_shift_case_summary = _restate_load_shift_summary_for_case(
                                 df_case_no_shift,
                                 df_case,
                                 load_shift_case_summary,
                             )
+                        if note_parts_case:
+                            note = " ".join(str(v) for v in note_parts_case if str(v).strip())
 
                         baseline_case = simulate_plan(
                             df_case,
