@@ -11340,6 +11340,92 @@ if show_battery_only:
                             f"self-consumption {sc_txt}, solar coverage {cov_txt}."
                         )
 
+                    best_profile_df = None
+                    best_profile_solar = None
+                    try:
+                        best_plan_obj_profile = next(
+                            (pp for pp in battery_optimizer_plans if str(pp.name) == best_plan_name),
+                            None,
+                        )
+                        if best_plan_obj_profile is not None:
+                            if (
+                                solar_mode == "uploaded"
+                                and isinstance(solar_profile_for_battery, pd.DataFrame)
+                                and not solar_profile_for_battery.empty
+                                and float(current_pv_kw or 0.0) > 0.0
+                            ):
+                                pv_scale_best = max(float(best_solar_kw or 0.0), 0.0) / float(current_pv_kw)
+                                best_profile_df, best_profile_solar, _best_profile_meta = apply_pv_scale_to_intervals(
+                                    df_joint_base,
+                                    solar_profile_for_battery,
+                                    float(pv_scale_best),
+                                )
+                            elif (
+                                solar_mode == "modelled"
+                                and isinstance(modelled_solar_profile_1kw, pd.DataFrame)
+                                and not modelled_solar_profile_1kw.empty
+                                and float(best_solar_kw or 0.0) > 0.0
+                            ):
+                                solar_profile_best = modelled_solar_profile_1kw.copy()
+                                solar_profile_best["pv_kwh"] = (
+                                    pd.to_numeric(solar_profile_best["pv_kwh"], errors="coerce")
+                                    .fillna(0.0)
+                                    .clip(lower=0.0)
+                                    .astype(float)
+                                    * max(float(best_solar_kw or 0.0), 0.0)
+                                )
+                                best_profile_df, best_profile_solar, _best_profile_meta = apply_modelled_pv_to_intervals(
+                                    df_joint_base,
+                                    solar_profile_best,
+                                )
+                            else:
+                                best_profile_df = df_joint_base.copy()
+                                best_profile_solar = None
+
+                            best_load_shift_case_profile = next(
+                                (
+                                    rr for rr in joint_load_shift_scenarios
+                                    if str(rr.get("label", "Off") or "Off") == best_load_shift_label
+                                ),
+                                {"label": "Off", "params": []},
+                            )
+                            best_profile_df, _best_profile_shift_summary = apply_timed_load_shifts_to_intervals(
+                                best_profile_df,
+                                copy.deepcopy(best_load_shift_case_profile.get("params") or []),
+                            )
+                            if best_battery_kwh is not None and float(best_battery_kwh) > 0.0:
+                                batt_best_profile = BatteryParams(
+                                    capacity_kwh=float(best_battery_kwh),
+                                    power_kw=float(power_kw),
+                                    roundtrip_eff=float(roundtrip_eff),
+                                    reserve_frac=float(reserve_pct) / 100.0,
+                                    initial_soc_frac=float(init_soc_pct) / 100.0,
+                                    discharge_min_rate_cents=None,
+                                    charge_from_export_only=True,
+                                )
+                                wide_best_profile = _intervals_wide_from_long(best_profile_df)
+                                wide_best_profile_adj = apply_battery_to_intervals(
+                                    wide_best_profile,
+                                    best_plan_obj_profile,
+                                    batt_best_profile,
+                                    solar_profile=best_profile_solar,
+                                )
+                                best_profile_df = _intervals_long_from_wide(wide_best_profile_adj)
+                    except Exception:
+                        best_profile_df = None
+                        best_profile_solar = None
+
+                    if isinstance(best_profile_df, pd.DataFrame) and not best_profile_df.empty:
+                        st.markdown("**Average daily profile (best optimised scenario):**")
+                        plot_average_24hr_profile_import_export(
+                            best_profile_df,
+                            solar_profile=best_profile_solar,
+                        )
+                        st.caption(
+                            "Uses the optimiser-selected setup after the active EV model, solar production, load shifting, "
+                            "and battery dispatch adjustments. The chart shows average production, imports, exports, and controlled load."
+                        )
+
                     stage_df = st.session_state.get("joint_stage_df")
                     if isinstance(stage_df, pd.DataFrame) and not stage_df.empty:
                         stage_meta = st.session_state.get("joint_stage_meta") or {}

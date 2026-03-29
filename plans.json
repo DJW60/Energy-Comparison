@@ -273,7 +273,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "basic",
     "flat": {
       "cents_per_kwh": 28.39
@@ -474,7 +474,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 5.0,
     "discount_applies_to": "usage_and_supply",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "smart",
     "flat": null,
     "tou": {
@@ -540,7 +540,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "basic",
     "flat": {
       "cents_per_kwh": 28.39
@@ -639,7 +639,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 10.0,
     "discount_applies_to": "usage_and_supply",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "all",
     "flat": null,
     "tou": null,
@@ -739,7 +739,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "all",
     "flat": {
       "cents_per_kwh": 30.448
@@ -1087,7 +1087,7 @@
     "demand_min_kw": 0.0,
     "discount_pct": 0.0,
     "discount_applies_to": "none",
-    "include_in_outputs": true,
+    "include_in_outputs": false,
     "meter_type": "smart",
     "flat": null,
     "tou": {
