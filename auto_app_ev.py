@@ -11225,6 +11225,14 @@ if show_battery_only:
                     best = df_joint.iloc[0]
                     best_plan_name = str(best.get("Plan", "-") or "-")
                     best_solar_kw = _coerce_float(best.get("Optimal solar size (kW)"))
+                    if best_solar_kw is None:
+                        best_solar_kw = _coerce_float(best.get("Solar size (kW)"))
+                    if (
+                        (best_solar_kw is None or float(best_solar_kw) <= 0.0)
+                        and solar_mode == "modelled"
+                        and not enable_solar_sweep
+                    ):
+                        best_solar_kw = max(float(current_pv_kw or 0.0), 0.0)
                     best_battery_kwh = _coerce_float(best.get("Optimal battery (kWh)"))
                     best_load_shift_label = str(best.get("Load shift scenario", "Off") or "Off")
                     current_bill_opt = _coerce_float(best.get("Current solar/no-battery annual bill ($/yr)"))
@@ -11342,29 +11350,37 @@ if show_battery_only:
 
                     best_profile_df = None
                     best_profile_solar = None
+                    best_profile_solar_source = ""
                     try:
                         best_plan_obj_profile = next(
                             (pp for pp in battery_optimizer_plans if str(pp.name) == best_plan_name),
                             None,
                         )
                         if best_plan_obj_profile is not None:
+                            best_graph_solar_kw = max(float(best_solar_kw or 0.0), 0.0)
                             if (
                                 solar_mode == "uploaded"
                                 and isinstance(solar_profile_for_battery, pd.DataFrame)
                                 and not solar_profile_for_battery.empty
                                 and float(current_pv_kw or 0.0) > 0.0
                             ):
-                                pv_scale_best = max(float(best_solar_kw or 0.0), 0.0) / float(current_pv_kw)
+                                pv_scale_best = best_graph_solar_kw / float(current_pv_kw)
                                 best_profile_df, best_profile_solar, _best_profile_meta = apply_pv_scale_to_intervals(
                                     df_joint_base,
                                     solar_profile_for_battery,
                                     float(pv_scale_best),
                                 )
+                                if isinstance(best_profile_solar, pd.DataFrame) and not best_profile_solar.empty:
+                                    best_profile_solar_source = (
+                                        "uploaded solar"
+                                        if not bool(solar_hybrid_meta.get("used_backfill", False))
+                                        else "uploaded solar with calibrated modelled backfill"
+                                    )
                             elif (
                                 solar_mode == "modelled"
                                 and isinstance(modelled_solar_profile_1kw, pd.DataFrame)
                                 and not modelled_solar_profile_1kw.empty
-                                and float(best_solar_kw or 0.0) > 0.0
+                                and best_graph_solar_kw > 0.0
                             ):
                                 solar_profile_best = modelled_solar_profile_1kw.copy()
                                 solar_profile_best["pv_kwh"] = (
@@ -11372,12 +11388,14 @@ if show_battery_only:
                                     .fillna(0.0)
                                     .clip(lower=0.0)
                                     .astype(float)
-                                    * max(float(best_solar_kw or 0.0), 0.0)
+                                    * best_graph_solar_kw
                                 )
                                 best_profile_df, best_profile_solar, _best_profile_meta = apply_modelled_pv_to_intervals(
                                     df_joint_base,
                                     solar_profile_best,
                                 )
+                                if isinstance(best_profile_solar, pd.DataFrame) and not best_profile_solar.empty:
+                                    best_profile_solar_source = "modelled solar"
                             else:
                                 best_profile_df = df_joint_base.copy()
                                 best_profile_solar = None
@@ -11425,6 +11443,10 @@ if show_battery_only:
                             "Uses the optimiser-selected setup after the active EV model, solar production, load shifting, "
                             "and battery dispatch adjustments. The chart shows average production, imports, exports, and controlled load."
                         )
+                        if best_profile_solar_source:
+                            st.caption(
+                                f"Solar production trace shown here uses the {best_profile_solar_source} for the optimiser-selected solar size."
+                            )
 
                     stage_df = st.session_state.get("joint_stage_df")
                     if isinstance(stage_df, pd.DataFrame) and not stage_df.empty:
