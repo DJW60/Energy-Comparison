@@ -5359,6 +5359,133 @@ def _load_shift_capex_for_params(loads: list[TimedLoadShiftParams] | None) -> fl
     return float(total)
 
 
+def _timed_load_params_from_saved_settings(settings_raw: list[dict] | None) -> list[TimedLoadShiftParams]:
+    """Rebuild timed load-shift parameters from a saved assumptions payload."""
+    out: list[TimedLoadShiftParams] = []
+    for item in (settings_raw or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(
+                TimedLoadShiftParams(
+                    name=str(item.get("name", "Load")).strip() or "Load",
+                    enabled=bool(item.get("enabled", False)),
+                    source_register=str(item.get("source_register", "controlled") or "controlled"),
+                    daily_kwh=max(float(item.get("daily_kwh", 0.0) or 0.0), 0.0),
+                    run_days=str(item.get("run_days", "all") or "all"),
+                    timer_start=str(item.get("timer_start", "10:00") or "10:00"),
+                    timer_end=str(item.get("timer_end", "15:00") or "15:00"),
+                    max_power_kw=max(float(item.get("max_power_kw", 0.0) or 0.0), 0.0),
+                    infra_capex=max(float(item.get("infra_capex", 0.0) or 0.0), 0.0),
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _prepare_optimizer_blackout_case(
+    best_row: dict,
+    report_assumptions: dict,
+    df_int_ev: pd.DataFrame,
+    available_plans: list[Plan],
+    uploaded_solar_profile: Optional[pd.DataFrame],
+    modelled_solar_profile_1kw: Optional[pd.DataFrame],
+    fallback_load_shift_params: list[TimedLoadShiftParams] | None = None,
+    solar_kw_override: float | None = None,
+    battery_kwh_override: float | None = None,
+    load_shift_label_override: str | None = None,
+) -> tuple[dict | None, str | None]:
+    """Rebuild the optimiser-winning pre-battery case for backup modelling."""
+    if not isinstance(best_row, dict) or not best_row:
+        return None, "No optimiser winner is available yet."
+
+    plan_name = str(best_row.get("Plan", "") or "").strip()
+    plan_obj = next((pp for pp in (available_plans or []) if str(getattr(pp, "name", "")) == plan_name), None)
+    if plan_obj is None:
+        return None, f"Could not find optimiser plan '{plan_name}' in the current plan set."
+
+    if df_int_ev is None or not isinstance(df_int_ev, pd.DataFrame) or df_int_ev.empty:
+        return None, "No EV-adjusted interval dataset is available."
+
+    solar_cfg = dict(report_assumptions.get("solar") or {}) if isinstance(report_assumptions, dict) else {}
+    solar_mode = str(solar_cfg.get("source", "none") or "none").strip().lower()
+    current_pv_kw_ref = max(float(solar_cfg.get("current_pv_kw", 0.0) or 0.0), 0.0)
+    assume_no_existing_export = bool(solar_cfg.get("assume_no_existing_export", False))
+
+    df_base = df_int_ev.copy()
+    if assume_no_existing_export and not df_base.empty:
+        reg = df_base["register"].astype(str)
+        df_base.loc[reg.isin(EXPORT_REGS), "kwh"] = 0.0
+
+    best_solar_kw = (
+        max(float(solar_kw_override or 0.0), 0.0)
+        if solar_kw_override is not None
+        else max(float(best_row.get("Optimal solar size (kW)", 0.0) or 0.0), 0.0)
+    )
+    df_case_solar, solar_case, _solar_applied, solar_note = _apply_solar_case_to_intervals(
+        df_base,
+        solar_mode,
+        best_solar_kw,
+        current_pv_kw_ref,
+        uploaded_solar_profile,
+        modelled_solar_profile_1kw,
+    )
+
+    saved_load_shift_settings = (
+        list((report_assumptions.get("load_shift") or {}).get("settings") or [])
+        if isinstance(report_assumptions, dict)
+        else []
+    )
+    load_shift_params_case = _timed_load_params_from_saved_settings(saved_load_shift_settings)
+    if not load_shift_params_case:
+        load_shift_params_case = copy.deepcopy(list(fallback_load_shift_params or []))
+    load_shift_scenarios = _build_load_shift_scenarios(load_shift_params_case)
+
+    load_shift_label = (
+        str(load_shift_label_override or "Off")
+        if load_shift_label_override is not None
+        else str(best_row.get("Load shift scenario", "Off") or "Off")
+    )
+    load_shift_case = next(
+        (rr for rr in load_shift_scenarios if str(rr.get("label", "Off") or "Off") == load_shift_label),
+        {"label": "Off", "params": copy.deepcopy(load_shift_params_case)},
+    )
+    df_case, load_shift_summary = apply_timed_load_shifts_to_intervals(
+        df_case_solar,
+        copy.deepcopy(load_shift_case.get("params") or []),
+    )
+
+    dispatch_cfg = dict(report_assumptions.get("battery_dispatch") or {}) if isinstance(report_assumptions, dict) else {}
+    battery_kwh = (
+        max(float(battery_kwh_override or 0.0), 0.0)
+        if battery_kwh_override is not None
+        else max(float(best_row.get("Optimal battery (kWh)", 0.0) or 0.0), 0.0)
+    )
+    battery_power_kw = max(float(dispatch_cfg.get("power_kw", 0.0) or 0.0), 0.0)
+    reserve_frac = max(min(float(dispatch_cfg.get("reserve_pct", 0.0) or 0.0) / 100.0, 1.0), 0.0)
+    roundtrip_eff = max(min(float(dispatch_cfg.get("roundtrip_eff", 0.90) or 0.90), 1.0), 0.01)
+
+    return (
+        {
+            "plan": plan_obj,
+            "plan_name": plan_name,
+            "solar_mode": solar_mode,
+            "solar_kw": float(best_solar_kw),
+            "solar_case": solar_case,
+            "solar_note": str(solar_note or ""),
+            "load_shift_label": load_shift_label,
+            "load_shift_summary": dict(load_shift_summary or {}),
+            "df_case_pre_battery": df_case,
+            "battery_kwh": float(battery_kwh),
+            "battery_power_kw": float(battery_power_kw),
+            "battery_reserve_frac": float(reserve_frac),
+            "battery_roundtrip_eff": float(roundtrip_eff),
+        },
+        None,
+    )
+
+
 def _remove_shifted_source_energy(
     values: list[float],
     source_available: dict[int, float],
@@ -5957,6 +6084,248 @@ def apply_battery_to_intervals(
     df["soc_kwh"] = soc_vals
 
     return df
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=256)
+def estimate_whole_house_blackout_backup(
+    df_case_pre_battery: pd.DataFrame,
+    solar_profile: Optional[pd.DataFrame],
+    battery_kwh: float,
+    battery_power_kw: float,
+    reserve_frac: float,
+    roundtrip_eff: float,
+    start_soc_frac: float,
+    horizon_hours: float,
+    sample_start_minutes: float = 60.0,
+    include_solar: bool = True,
+) -> dict:
+    """Estimate whole-house backup resilience across sampled outage start times.
+
+    This is a physical outage model, not a billing model:
+    - whole-house load = general + controlled load
+    - solar serves load first during blackout
+    - excess solar charges the battery
+    - battery can serve the whole house during the blackout, regardless of tariff/register
+    """
+    empty_df = pd.DataFrame()
+    result = {
+        "ok": False,
+        "reason": "",
+        "interval_minutes": 5.0,
+        "sample_step_intervals": 1,
+        "sampled_start_count": 0,
+        "avg_daily_load_kwh": 0.0,
+        "avg_load_kw": 0.0,
+        "avg_daily_solar_kwh": 0.0,
+        "usable_start_kwh": 0.0,
+        "battery_only_runtime_hours": None,
+        "median_hours_served": 0.0,
+        "p10_hours_served": 0.0,
+        "worst_case_hours_served": 0.0,
+        "best_case_hours_served": 0.0,
+        "target_hours": float(horizon_hours or 0.0),
+        "coverage_df": empty_df,
+        "start_hour_df": empty_df,
+        "served_hours_df": empty_df,
+    }
+
+    if df_case_pre_battery is None or not isinstance(df_case_pre_battery, pd.DataFrame) or df_case_pre_battery.empty:
+        result["reason"] = "No interval profile available for blackout modelling."
+        return result
+
+    wide = _intervals_wide_from_long(df_case_pre_battery)
+    if wide.empty:
+        result["reason"] = "Could not build the interval-wide outage profile."
+        return result
+
+    wide = wide.sort_values("timestamp").reset_index(drop=True)
+    wide["timestamp"] = pd.to_datetime(wide["timestamp"], errors="coerce")
+    wide = wide.dropna(subset=["timestamp"]).reset_index(drop=True)
+    if wide.empty:
+        result["reason"] = "No valid timestamps available for blackout modelling."
+        return result
+
+    for col in ("general_kwh", "controlled_kwh", "export_kwh"):
+        if col not in wide.columns:
+            wide[col] = 0.0
+        wide[col] = pd.to_numeric(wide[col], errors="coerce").fillna(0.0).astype(float).clip(lower=0.0)
+
+    interval_minutes = _infer_interval_minutes_from_timestamps(wide["timestamp"])
+    interval_hours = max(float(interval_minutes) / 60.0, 1e-9)
+    result["interval_minutes"] = float(interval_minutes)
+
+    pv_aligned = pd.Series(0.0, index=wide.index, dtype=float)
+    solar_is_available = (
+        bool(include_solar)
+        and isinstance(solar_profile, pd.DataFrame)
+        and not solar_profile.empty
+        and {"timestamp", "pv_kwh"}.issubset(solar_profile.columns)
+    )
+    if solar_is_available:
+        sp = solar_profile[["timestamp", "pv_kwh"]].copy()
+        sp["timestamp"] = pd.to_datetime(sp["timestamp"], errors="coerce")
+        sp["pv_kwh"] = pd.to_numeric(sp["pv_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float)
+        sp = sp.dropna(subset=["timestamp"]).groupby("timestamp", as_index=False)["pv_kwh"].sum()
+        pv_map = sp.set_index("timestamp")["pv_kwh"]
+        pv_aligned = wide["timestamp"].map(pv_map).fillna(0.0).astype(float)
+
+    whole_house_load_kwh = (
+        wide["general_kwh"]
+        + wide["controlled_kwh"]
+        + pv_aligned
+        - wide["export_kwh"]
+    ).clip(lower=0.0)
+
+    date_index = wide["timestamp"].dt.normalize()
+    day_count = int(date_index.nunique())
+    total_load_kwh = float(whole_house_load_kwh.sum())
+    avg_daily_load_kwh = (total_load_kwh / day_count) if day_count > 0 else 0.0
+    avg_load_kw = (avg_daily_load_kwh / 24.0) if avg_daily_load_kwh > 0 else 0.0
+    avg_daily_solar_kwh = (float(pv_aligned.sum()) / day_count) if day_count > 0 else 0.0
+
+    cap_kwh = max(float(battery_kwh or 0.0), 0.0)
+    power_kw = max(float(battery_power_kw or 0.0), 0.0)
+    reserve_kwh = cap_kwh * max(min(float(reserve_frac or 0.0), 1.0), 0.0)
+    start_soc_kwh = cap_kwh * max(min(float(start_soc_frac or 0.0), 1.0), 0.0)
+    usable_start_kwh = max(start_soc_kwh - reserve_kwh, 0.0)
+    battery_only_runtime_hours = (usable_start_kwh / avg_load_kw) if avg_load_kw > 0 else None
+
+    charge_eff, discharge_eff = _split_roundtrip_eff(roundtrip_eff)
+    max_energy_per_interval = power_kw * interval_hours
+    horizon_hours_eff = max(float(horizon_hours or 0.0), interval_hours)
+
+    sample_step_intervals = max(int(round(float(sample_start_minutes or 60.0) / float(interval_minutes))), 1)
+    start_indices = list(range(0, len(wide), sample_step_intervals))
+
+    load_vals = whole_house_load_kwh.to_numpy(dtype=float)
+    pv_vals = pv_aligned.to_numpy(dtype=float) if solar_is_available else np.zeros(len(wide), dtype=float)
+
+    served_rows: list[dict] = []
+    served_hours_values: list[float] = []
+
+    for start_idx in start_indices:
+        available_hours = min(float(len(wide) - start_idx) * interval_hours, horizon_hours_eff)
+        if available_hours <= 1e-9:
+            continue
+
+        soc = min(max(start_soc_kwh, 0.0), cap_kwh)
+        served_hours = 0.0
+        fail_reason = ""
+        max_steps = min(int(math.ceil(horizon_hours_eff / interval_hours)), len(wide) - start_idx)
+
+        for rel_idx in range(max_steps):
+            pos = start_idx + rel_idx
+            load_kwh = max(float(load_vals[pos] or 0.0), 0.0)
+            pv_kwh = max(float(pv_vals[pos] or 0.0), 0.0)
+
+            direct_pv_to_load = min(load_kwh, pv_kwh)
+            remaining_load = max(load_kwh - direct_pv_to_load, 0.0)
+            pv_surplus = max(pv_kwh - direct_pv_to_load, 0.0)
+
+            if cap_kwh > 0.0 and pv_surplus > 0.0 and max_energy_per_interval > 0.0 and soc < cap_kwh:
+                room = cap_kwh - soc
+                charge_in = min(pv_surplus, max_energy_per_interval, room / max(charge_eff, 1e-9))
+                if charge_in > 0.0:
+                    soc += charge_in * charge_eff
+                    pv_surplus -= charge_in
+
+            served_kwh = direct_pv_to_load
+            if remaining_load > 0.0 and cap_kwh > 0.0 and max_energy_per_interval > 0.0 and soc > reserve_kwh:
+                available_to_load = (soc - reserve_kwh) * discharge_eff
+                discharge_to_load = min(remaining_load, max_energy_per_interval, available_to_load)
+                if discharge_to_load > 0.0:
+                    soc -= discharge_to_load / max(discharge_eff, 1e-9)
+                    remaining_load -= discharge_to_load
+                    served_kwh += discharge_to_load
+
+            if remaining_load > 1e-9:
+                fail_reason = "load_unserved"
+                interval_served_frac = (served_kwh / load_kwh) if load_kwh > 1e-9 else 1.0
+                served_hours += interval_hours * max(min(interval_served_frac, 1.0), 0.0)
+                break
+
+            served_hours += interval_hours
+            if served_hours + 1e-9 >= horizon_hours_eff:
+                break
+
+        served_hours = min(served_hours, available_hours, horizon_hours_eff)
+        served_hours_values.append(float(served_hours))
+        served_rows.append(
+            {
+                "start_timestamp": pd.Timestamp(wide.loc[start_idx, "timestamp"]),
+                "start_hour": int(pd.Timestamp(wide.loc[start_idx, "timestamp"]).hour),
+                "served_hours": float(served_hours),
+                "available_hours": float(available_hours),
+                "fail_reason": str(fail_reason),
+            }
+        )
+
+    if not served_rows:
+        result["reason"] = "No outage start positions could be evaluated."
+        return result
+
+    served_df = pd.DataFrame(served_rows)
+    durations = [1, 2, 4, 8, 12, 24, 48, 72]
+    durations = [float(v) for v in durations if float(v) <= float(horizon_hours_eff) + 1e-9]
+    if not durations:
+        durations = [float(horizon_hours_eff)]
+
+    coverage_rows: list[dict] = []
+    for dur in durations:
+        eligible = served_df[served_df["available_hours"] + 1e-9 >= float(dur)].copy()
+        eligible_count = int(len(eligible))
+        covered_count = int((eligible["served_hours"] + 1e-9 >= float(dur)).sum()) if eligible_count > 0 else 0
+        coverage_pct = (float(covered_count) / float(eligible_count) * 100.0) if eligible_count > 0 else np.nan
+        coverage_rows.append(
+            {
+                "Blackout duration (hrs)": float(dur),
+                "Covered starts (%)": round(float(coverage_pct), 1) if pd.notna(coverage_pct) else None,
+                "Covered starts": int(covered_count),
+                "Eligible starts": int(eligible_count),
+            }
+        )
+
+    start_hour_df = (
+        served_df.groupby("start_hour", as_index=False)["served_hours"]
+        .agg(["mean", "median", lambda s: float(np.percentile(np.asarray(s, dtype=float), 10)) if len(s) > 0 else np.nan])
+        .reset_index()
+        .rename(
+            columns={
+                "start_hour": "Start hour",
+                "mean": "Average hours served",
+                "median": "Median hours served",
+                "<lambda_0>": "P10 hours served",
+            }
+        )
+    )
+    if "Start hour" in start_hour_df.columns:
+        start_hour_df["Start hour"] = start_hour_df["Start hour"].astype(int).map(lambda h: f"{int(h):02d}:00")
+    for col in ("Average hours served", "Median hours served", "P10 hours served"):
+        if col in start_hour_df.columns:
+            start_hour_df[col] = pd.to_numeric(start_hour_df[col], errors="coerce").round(2)
+
+    served_hours_arr = np.asarray(served_hours_values, dtype=float)
+    result.update(
+        {
+            "ok": True,
+            "reason": "",
+            "sample_step_intervals": int(sample_step_intervals),
+            "sampled_start_count": int(len(served_df)),
+            "avg_daily_load_kwh": float(avg_daily_load_kwh),
+            "avg_load_kw": float(avg_load_kw),
+            "avg_daily_solar_kwh": float(avg_daily_solar_kwh),
+            "usable_start_kwh": float(usable_start_kwh),
+            "battery_only_runtime_hours": (float(battery_only_runtime_hours) if battery_only_runtime_hours is not None else None),
+            "median_hours_served": float(np.median(served_hours_arr)) if served_hours_arr.size > 0 else 0.0,
+            "p10_hours_served": float(np.percentile(served_hours_arr, 10)) if served_hours_arr.size > 0 else 0.0,
+            "worst_case_hours_served": float(np.min(served_hours_arr)) if served_hours_arr.size > 0 else 0.0,
+            "best_case_hours_served": float(np.max(served_hours_arr)) if served_hours_arr.size > 0 else 0.0,
+            "coverage_df": pd.DataFrame(coverage_rows),
+            "start_hour_df": start_hour_df,
+            "served_hours_df": served_df,
+        }
+    )
+    return result
 
 
 
@@ -9464,6 +9833,7 @@ if show_battery_only:
                 "Quick battery comparison",
                 "Battery economics (selected retailer)",
                 "Best overall retailer + solar + battery",
+                "Whole-house backup (blackout)",
                 "What-if: current vs optimised",
             ]
             battery_view = st.radio(
@@ -11815,6 +12185,320 @@ if show_battery_only:
                     st.caption("Results are cached. Change settings and rerun to refresh this table.")
                 else:
                     st.info("Run the joint optimiser in this tab to generate results.")
+            if battery_view == "Whole-house backup (blackout)":
+                st.markdown("**Whole-house backup during blackout (recommended setup):**")
+                st.caption(
+                    "Uses the last optimiser winner to estimate outage resilience from the historical interval profile. "
+                    "This is a physical backup view, not a billing/tariff view."
+                )
+                st.caption(
+                    "During blackout modelling, whole-house load includes both general and controlled load. "
+                    "Solar serves load first, then the battery. This is separate from normal billing logic where residual controlled load is not battery-offset."
+                )
+
+                best_opt = st.session_state.get("joint_best") or {}
+                blackout_results_stale = bool(locals().get("joint_results_stale", False))
+                if blackout_results_stale:
+                    st.warning(
+                        "Optimiser inputs changed since the last run, so blackout results based on that winner may be stale. "
+                        "Rerun the optimiser when ready for a fully current backup assessment."
+                    )
+
+                if not isinstance(best_opt, dict) or not best_opt:
+                    st.info("Run **Best overall retailer + solar + battery** first to generate a recommended setup for blackout analysis.")
+                else:
+                    report_assumptions = st.session_state.get("joint_report_assumptions") or {}
+                    solar_cfg_backup = dict(report_assumptions.get("solar") or {}) if isinstance(report_assumptions, dict) else {}
+                    solar_source_backup = str(solar_cfg_backup.get("source", "none") or "none").strip().lower()
+
+                    modelled_backup_profile_1kw = None
+                    modelled_backup_meta: dict = {}
+                    if solar_source_backup == "modelled":
+                        modelled_backup_profile_1kw, modelled_backup_meta = build_modelled_solar_profile_1kw(
+                            df_int,
+                            str(st.session_state.get("joint_modelled_postcode", "4000")),
+                            float(st.session_state.get("joint_modelled_tilt_deg", 20.0) or 20.0),
+                            float(st.session_state.get("joint_modelled_azimuth_deg", 0.0) or 0.0),
+                            float(st.session_state.get("joint_modelled_losses_pct", 14.0) or 14.0),
+                        )
+
+                    blackout_case, blackout_case_err = _prepare_optimizer_blackout_case(
+                        best_opt,
+                        report_assumptions,
+                        df_int_ev,
+                        battery_optimizer_plans,
+                        solar_profile_for_battery,
+                        modelled_backup_profile_1kw,
+                        fallback_load_shift_params=load_shift_params,
+                    )
+                    if blackout_case_err:
+                        st.warning(blackout_case_err)
+                    elif not isinstance(blackout_case, dict):
+                        st.warning("Could not prepare the optimiser winner for blackout analysis.")
+                    else:
+                        solar_case_backup = blackout_case.get("solar_case")
+                        solar_available_backup = (
+                            isinstance(solar_case_backup, pd.DataFrame)
+                            and not solar_case_backup.empty
+                            and {"timestamp", "pv_kwh"}.issubset(solar_case_backup.columns)
+                        )
+                        case_ts_backup = pd.to_datetime(
+                            blackout_case["df_case_pre_battery"]["timestamp"],
+                            errors="coerce",
+                        ) if "timestamp" in blackout_case["df_case_pre_battery"].columns else pd.Series(dtype="datetime64[ns]")
+                        case_interval_minutes = _infer_interval_minutes_from_timestamps(case_ts_backup)
+
+                        bk1, bk2, bk3 = st.columns(3)
+                        with bk1:
+                            blackout_start_soc_pct = st.number_input(
+                                "Start-of-outage battery SoC (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=100.0,
+                                step=5.0,
+                                key="blackout_start_soc_pct",
+                                help="Assumed battery charge level at the start of the blackout.",
+                            )
+                        with bk2:
+                            blackout_horizon_hours = st.select_slider(
+                                "Outage horizon to test (hours)",
+                                options=[4, 8, 12, 24, 48, 72],
+                                value=24,
+                                key="blackout_horizon_hours",
+                            )
+                        with bk3:
+                            blackout_sampling_label = st.selectbox(
+                                "Outage start sampling",
+                                options=["Hourly (recommended)", "Every 30 minutes", "Every interval (slower)"],
+                                index=0,
+                                key="blackout_sampling_label",
+                                help="Samples outage starts through the historical profile. Finer sampling is slower.",
+                            )
+                        include_solar_blackout = st.checkbox(
+                            "Include solar generation during blackout",
+                            value=bool(solar_available_backup),
+                            key="include_solar_blackout",
+                            disabled=not solar_available_backup,
+                            help="If enabled, solar can serve load directly and charge the battery during the blackout.",
+                        )
+                        if solar_source_backup == "modelled" and (not solar_available_backup):
+                            st.warning("Modelled solar profile could not be rebuilt for blackout analysis, so this run will behave as battery-only backup.")
+
+                        sampling_minutes_map = {
+                            "Hourly (recommended)": 60.0,
+                            "Every 30 minutes": 30.0,
+                            "Every interval (slower)": float(case_interval_minutes),
+                        }
+                        blackout_sample_minutes = float(sampling_minutes_map.get(blackout_sampling_label, 60.0))
+
+                        backup_res = estimate_whole_house_blackout_backup(
+                            blackout_case["df_case_pre_battery"],
+                            solar_case_backup,
+                            float(blackout_case.get("battery_kwh", 0.0) or 0.0),
+                            float(blackout_case.get("battery_power_kw", 0.0) or 0.0),
+                            float(blackout_case.get("battery_reserve_frac", 0.0) or 0.0),
+                            float(blackout_case.get("battery_roundtrip_eff", 0.90) or 0.90),
+                            float(blackout_start_soc_pct) / 100.0,
+                            float(blackout_horizon_hours),
+                            sample_start_minutes=float(blackout_sample_minutes),
+                            include_solar=bool(include_solar_blackout),
+                        )
+
+                        if not bool(backup_res.get("ok", False)):
+                            st.warning(str(backup_res.get("reason", "Could not evaluate blackout backup.")))
+                        else:
+                            coverage_df = backup_res.get("coverage_df")
+                            start_hour_df = backup_res.get("start_hour_df")
+                            target_row = pd.DataFrame()
+                            if isinstance(coverage_df, pd.DataFrame) and not coverage_df.empty:
+                                target_row = coverage_df[
+                                    pd.to_numeric(coverage_df["Blackout duration (hrs)"], errors="coerce")
+                                    == float(blackout_horizon_hours)
+                                ]
+                            target_coverage_pct = None
+                            if isinstance(target_row, pd.DataFrame) and not target_row.empty:
+                                target_coverage_pct = pd.to_numeric(target_row["Covered starts (%)"], errors="coerce").iloc[0]
+
+                            solar_sweep_cfg = dict(report_assumptions.get("solar_sweep") or {}) if isinstance(report_assumptions, dict) else {}
+                            battery_sweep_cfg = dict(report_assumptions.get("battery_sweep") or {}) if isinstance(report_assumptions, dict) else {}
+                            tested_solar_sizes = [
+                                max(float(v or 0.0), 0.0)
+                                for v in list(solar_sweep_cfg.get("sizes_kw") or [])
+                            ]
+                            tested_battery_sizes = [
+                                max(float(v or 0.0), 0.0)
+                                for v in list(battery_sweep_cfg.get("sizes_kwh") or [])
+                            ]
+                            gold_solar_kw = max(tested_solar_sizes) if tested_solar_sizes else float(blackout_case.get("solar_kw", 0.0) or 0.0)
+                            gold_battery_kwh = max(tested_battery_sizes) if tested_battery_sizes else float(blackout_case.get("battery_kwh", 0.0) or 0.0)
+
+                            st.caption(
+                                f"Setup assessed: {str(blackout_case.get('plan_name', 'Plan'))}, "
+                                f"{float(blackout_case.get('solar_kw', 0.0) or 0.0):.1f} kW solar, "
+                                f"{float(blackout_case.get('battery_kwh', 0.0) or 0.0):.1f} kWh battery, "
+                                f"load shift {str(blackout_case.get('load_shift_label', 'Off') or 'Off')}."
+                            )
+                            if blackout_case.get("solar_note"):
+                                st.caption(str(blackout_case.get("solar_note")))
+                            if include_solar_blackout:
+                                st.caption("Solar is assumed to remain available during the outage and can directly support whole-house load.")
+                            else:
+                                st.caption("Solar contribution is disabled for this scenario, so the result reflects battery-only backup against the whole-house load profile.")
+
+                            bm1, bm2, bm3, bm4 = st.columns(4)
+                            bm1.metric(
+                                "Usable battery at outage start",
+                                f"{float(backup_res.get('usable_start_kwh', 0.0) or 0.0):.1f} kWh",
+                            )
+                            bm2.metric(
+                                "Whole-house average load",
+                                f"{float(backup_res.get('avg_daily_load_kwh', 0.0) or 0.0):.1f} kWh/day",
+                            )
+                            bm3.metric(
+                                f"{int(float(blackout_horizon_hours))}h coverage",
+                                (
+                                    f"{float(target_coverage_pct):.0f}%"
+                                    if target_coverage_pct is not None and pd.notna(target_coverage_pct)
+                                    else "-"
+                                ),
+                            )
+                            bm4.metric(
+                                "Median hours served",
+                                f"{float(backup_res.get('median_hours_served', 0.0) or 0.0):.1f} h",
+                            )
+
+                            bm5, bm6, bm7, bm8 = st.columns(4)
+                            battery_only_runtime = backup_res.get("battery_only_runtime_hours")
+                            bm5.metric(
+                                "Battery-only runtime",
+                                (
+                                    f"{float(battery_only_runtime):.1f} h"
+                                    if battery_only_runtime is not None and pd.notna(battery_only_runtime)
+                                    else "-"
+                                ),
+                            )
+                            bm6.metric(
+                                "Worst-case hours served",
+                                f"{float(backup_res.get('worst_case_hours_served', 0.0) or 0.0):.1f} h",
+                            )
+                            bm7.metric(
+                                "P10 hours served",
+                                f"{float(backup_res.get('p10_hours_served', 0.0) or 0.0):.1f} h",
+                            )
+                            bm8.metric(
+                                "Sampled outage starts",
+                                f"{int(backup_res.get('sampled_start_count', 0) or 0):,}",
+                            )
+
+                            if include_solar_blackout:
+                                st.caption(
+                                    f"Average solar production available to the outage model is about "
+                                    f"{float(backup_res.get('avg_daily_solar_kwh', 0.0) or 0.0):.1f} kWh/day."
+                                )
+                            st.caption(
+                                f"Outage starts were sampled every {float(blackout_sample_minutes):g} minutes across the dataset. "
+                                "Coverage percentages only count start times with enough remaining historical data to observe that duration."
+                            )
+
+                            gold_matches_optimised = (
+                                abs(float(gold_solar_kw) - float(blackout_case.get("solar_kw", 0.0) or 0.0)) < 1e-9
+                                and abs(float(gold_battery_kwh) - float(blackout_case.get("battery_kwh", 0.0) or 0.0)) < 1e-9
+                            )
+                            if gold_matches_optimised:
+                                st.info(
+                                    "Gold-plated reference: the economic winner already uses the largest solar and battery sizes tested in this optimiser run, "
+                                    "so the resilience-first reference matches the optimiser sizing."
+                                )
+                            else:
+                                gold_case, gold_case_err = _prepare_optimizer_blackout_case(
+                                    best_opt,
+                                    report_assumptions,
+                                    df_int_ev,
+                                    battery_optimizer_plans,
+                                    solar_profile_for_battery,
+                                    modelled_backup_profile_1kw,
+                                    fallback_load_shift_params=load_shift_params,
+                                    solar_kw_override=float(gold_solar_kw),
+                                    battery_kwh_override=float(gold_battery_kwh),
+                                    load_shift_label_override=str(blackout_case.get("load_shift_label", "Off") or "Off"),
+                                )
+                                gold_backup_ok = False
+                                gold_target_coverage_pct = None
+                                gold_median_hours = None
+                                if gold_case_err:
+                                    st.caption(f"Gold-plated reference could not be prepared: {gold_case_err}")
+                                elif isinstance(gold_case, dict):
+                                    gold_backup_res = estimate_whole_house_blackout_backup(
+                                        gold_case["df_case_pre_battery"],
+                                        gold_case.get("solar_case"),
+                                        float(gold_case.get("battery_kwh", 0.0) or 0.0),
+                                        float(gold_case.get("battery_power_kw", 0.0) or 0.0),
+                                        float(gold_case.get("battery_reserve_frac", 0.0) or 0.0),
+                                        float(gold_case.get("battery_roundtrip_eff", 0.90) or 0.90),
+                                        float(blackout_start_soc_pct) / 100.0,
+                                        float(blackout_horizon_hours),
+                                        sample_start_minutes=float(blackout_sample_minutes),
+                                        include_solar=bool(include_solar_blackout),
+                                    )
+                                    if bool(gold_backup_res.get("ok", False)):
+                                        gold_backup_ok = True
+                                        gold_cov_df = gold_backup_res.get("coverage_df")
+                                        if isinstance(gold_cov_df, pd.DataFrame) and not gold_cov_df.empty:
+                                            gold_target_row = gold_cov_df[
+                                                pd.to_numeric(gold_cov_df["Blackout duration (hrs)"], errors="coerce")
+                                                == float(blackout_horizon_hours)
+                                            ]
+                                            if not gold_target_row.empty:
+                                                gold_target_coverage_pct = pd.to_numeric(
+                                                    gold_target_row["Covered starts (%)"], errors="coerce"
+                                                ).iloc[0]
+                                        gold_median_hours = float(gold_backup_res.get("median_hours_served", 0.0) or 0.0)
+
+                                if gold_backup_ok:
+                                    optimised_cov_text = (
+                                        f"{float(target_coverage_pct):.0f}%"
+                                        if target_coverage_pct is not None and pd.notna(target_coverage_pct)
+                                        else "-"
+                                    )
+                                    gold_cov_text = (
+                                        f"{float(gold_target_coverage_pct):.0f}%"
+                                        if gold_target_coverage_pct is not None and pd.notna(gold_target_coverage_pct)
+                                        else "-"
+                                    )
+                                    optimised_median_text = f"{float(backup_res.get('median_hours_served', 0.0) or 0.0):.1f} h"
+                                    gold_median_text = (
+                                        f"{float(gold_median_hours):.1f} h"
+                                        if gold_median_hours is not None and pd.notna(gold_median_hours)
+                                        else "-"
+                                    )
+                                    st.info(
+                                        "Gold-plated reference (economics ignored): "
+                                        f"{float(gold_solar_kw):.1f} kW solar + {float(gold_battery_kwh):.1f} kWh battery "
+                                        f"would move {int(float(blackout_horizon_hours))}h coverage from {optimised_cov_text} to {gold_cov_text}, "
+                                        f"with median hours served moving from {optimised_median_text} to {gold_median_text} "
+                                        f"compared with the optimiser winner at {float(blackout_case.get('solar_kw', 0.0) or 0.0):.1f} kW + "
+                                        f"{float(blackout_case.get('battery_kwh', 0.0) or 0.0):.1f} kWh."
+                                    )
+
+                            if isinstance(coverage_df, pd.DataFrame) and not coverage_df.empty:
+                                st.markdown("**Coverage by blackout duration:**")
+                                _show_table(coverage_df, use_container_width=True, hide_index=True)
+
+                            if isinstance(start_hour_df, pd.DataFrame) and not start_hour_df.empty:
+                                st.markdown("**Hours served by outage start time:**")
+                                _show_table(start_hour_df, use_container_width=True, hide_index=True)
+                                try:
+                                    start_hour_chart = start_hour_df.copy()
+                                    start_hour_chart["Average hours served"] = pd.to_numeric(
+                                        start_hour_chart["Average hours served"], errors="coerce"
+                                    ).fillna(0.0)
+                                    st.bar_chart(
+                                        start_hour_chart.set_index("Start hour")["Average hours served"],
+                                        height=280,
+                                    )
+                                except Exception:
+                                    pass
+
             if battery_view == "What-if: current vs optimised":
                 st.markdown("**What-if: current vs optimised:**")
                 st.caption(
