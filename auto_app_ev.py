@@ -1389,6 +1389,8 @@ def compute_average_daily_profile(df_int: pd.DataFrame, import_cols=("E1","E2"))
 def plot_average_24hr_profile_import_export(
     df_intervals: pd.DataFrame,
     solar_profile: Optional[pd.DataFrame] = None,
+    battery_profile: Optional[pd.DataFrame] = None,
+    show_battery_flows: bool = False,
 ) -> None:
     """Average 24-hour profile across ALL days (hourly totals averaged by clock-hour).
 
@@ -1477,6 +1479,34 @@ def plot_average_24hr_profile_import_export(
         hourly = hourly.merge(solar_hourly, on="hour", how="left")
         hourly["solar_kwh"] = pd.to_numeric(hourly["solar_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
+    include_battery = (
+        bool(show_battery_flows)
+        and isinstance(battery_profile, pd.DataFrame)
+        and not battery_profile.empty
+        and {"timestamp", "battery_charge_kwh", "battery_discharge_kwh"}.issubset(battery_profile.columns)
+    )
+    if include_battery:
+        bp = battery_profile.copy()
+        bp["timestamp"] = pd.to_datetime(bp["timestamp"], errors="coerce")
+        bp["battery_charge_kwh"] = pd.to_numeric(bp["battery_charge_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        bp["battery_discharge_kwh"] = pd.to_numeric(bp["battery_discharge_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        bp = bp.dropna(subset=["timestamp"])
+
+        battery_hourly_totals = (
+            bp.set_index("timestamp")[["battery_charge_kwh", "battery_discharge_kwh"]]
+            .resample("1H")
+            .sum()
+            .reset_index()
+        )
+        battery_hourly_totals["hour"] = battery_hourly_totals["timestamp"].dt.hour
+        battery_hourly = (
+            battery_hourly_totals.groupby("hour", as_index=False)[["battery_charge_kwh", "battery_discharge_kwh"]]
+            .mean()
+        )
+        hourly = hourly.merge(battery_hourly, on="hour", how="left")
+        hourly["battery_charge_kwh"] = pd.to_numeric(hourly["battery_charge_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        hourly["battery_discharge_kwh"] = pd.to_numeric(hourly["battery_discharge_kwh"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
     hourly["hour_1_24"] = hourly["hour"] + 1
 
     try:
@@ -1490,13 +1520,20 @@ def plot_average_24hr_profile_import_export(
         if include_solar:
             ax.plot(hourly["hour_1_24"], hourly["solar_kwh"], marker="o", label="Solar production")
             ax.fill_between(hourly["hour_1_24"], hourly["solar_kwh"], alpha=0.15)
+        if include_battery:
+            ax.plot(hourly["hour_1_24"], hourly["battery_charge_kwh"], marker="o", linestyle="--", label="Battery charge")
+            ax.plot(hourly["hour_1_24"], hourly["battery_discharge_kwh"], marker="o", linestyle="--", label="Battery discharge")
 
         ax.set_xticks(range(1, 25))
         ax.set_xlim(1, 24)
         ax.set_xlabel("Hour of day (1-24)")
         ax.set_ylabel("Average kWh per hour")
-        if include_solar:
+        if include_solar and include_battery:
+            ax.set_title("Average 24-hour profile (General import, CL, Export, Solar, and Battery flows)")
+        elif include_solar:
             ax.set_title("Average 24-hour profile (General import, CL, Export, and Solar production)")
+        elif include_battery:
+            ax.set_title("Average 24-hour profile (General import, CL, Export, and Battery flows)")
         else:
             ax.set_title("Average 24-hour profile (General import, CL, and Grid export)")
         ax.grid(True, alpha=0.3)
@@ -1505,7 +1542,11 @@ def plot_average_24hr_profile_import_export(
         st.pyplot(fig, clear_figure=True)
 
     except Exception:
-        chart_cols = ["general_import_kwh", "controlled_import_kwh", "export_kwh"] + (["solar_kwh"] if include_solar else [])
+        chart_cols = ["general_import_kwh", "controlled_import_kwh", "export_kwh"]
+        if include_solar:
+            chart_cols.append("solar_kwh")
+        if include_battery:
+            chart_cols.extend(["battery_charge_kwh", "battery_discharge_kwh"])
         chart_df = (
             hourly.set_index("hour_1_24")[chart_cols]
             .rename(
@@ -1514,6 +1555,8 @@ def plot_average_24hr_profile_import_export(
                     "controlled_import_kwh": "Controlled load (E2)",
                     "export_kwh": "Grid export (Solar feed)",
                     "solar_kwh": "Solar production",
+                    "battery_charge_kwh": "Battery charge",
+                    "battery_discharge_kwh": "Battery discharge",
                 }
             )
         )
@@ -3910,7 +3953,7 @@ class BatteryParams:
 
     Level 1 assumptions:
     - Charging is ONLY from PV surplus (i.e., it reduces export). No grid charging.
-    - Discharging offsets imports, prioritising general (E1) then controlled load (E2).
+    - Discharging offsets general imports only (E1). Residual controlled load (E2) is not battery-served.
     - Optional discharge threshold (c/kWh): only discharge when current import rate >= threshold.
       If not provided and the plan is TOU, we default to the highest-rate band (or a band with
       'peak' in its name if present).
@@ -5757,7 +5800,7 @@ def apply_battery_to_intervals(
 
     Returns a copy with the same columns adjusted, plus:
       - battery_charge_kwh (kWh drawn from PV surplus)
-      - battery_discharge_kwh (kWh delivered to loads)
+      - battery_discharge_kwh (kWh delivered to general load only)
       - soc_kwh (end-of-interval state of charge)
     """
     if batt is None or float(batt.capacity_kwh or 0.0) <= 0:
@@ -5876,8 +5919,8 @@ def apply_battery_to_intervals(
                     charge_kwh += energy_from_pv
                     e -= energy_from_pv
 
-        # 2) Discharge to offset imports (prioritise general then controlled)
-        import_total = g + c
+        # 2) Discharge to offset general imports only.
+        import_total = g
         if import_total > 0 and soc > reserve_kwh and max_energy_per_interval > 0:
             allow_discharge = True
             if discharge_threshold is not None:
@@ -5896,13 +5939,8 @@ def apply_battery_to_intervals(
                     soc -= energy_to_load / max(discharge_eff, 1e-9)
                     discharge_kwh += energy_to_load
 
-                    # Reduce general first, then controlled
-                    red_g = min(g, energy_to_load)
-                    g -= red_g
-                    remaining = energy_to_load - red_g
-                    if remaining > 0:
-                        red_c = min(c, remaining)
-                        c -= red_c
+                    # Controlled load remains separate unless explicitly shifted into general load upstream.
+                    g = max(g - energy_to_load, 0.0)
 
         general[i] = g
         controlled[i] = c
@@ -6290,7 +6328,7 @@ def render_help_and_glossary() -> None:
             "- `NEM12`: Australian interval metering format used for consumption/export data.\n"
             "- `TOU (Time of Use)`: Different import/export rates by time window and day type.\n"
             "- `FiT (Feed-in Tariff)`: Credit rate paid for exported energy.\n"
-            "- `Controlled load`: Typically separately metered appliances (often hot water) billed at controlled load tariffs.\n"
+            "- `Controlled load`: Typically separately metered appliances (often hot water) billed at controlled load tariffs. In this app, solar and battery do not directly offset residual controlled load unless that usage is first shifted into general load.\n"
             "- `Shoulder/Peak/Off-peak`: Named TOU rate periods.\n"
             "- `Self-consumption`: Solar generation used on-site rather than exported.\n"
             "- `Solar coverage`: Share of site load met by self-consumed solar.\n"
@@ -7038,12 +7076,81 @@ with st.sidebar.expander("Global EV charging model (all tabs)", expanded=False):
 
 load_shift_days_map = {"All days": "all", "Weekdays only": "wkday", "Weekends only": "wkend"}
 load_shift_source_map = {"Controlled load (E2)": "controlled", "General load (E1)": "general"}
+POOL_SHIFT_DEFAULT_DAILY_KWH = 1.7
+POOL_SHIFT_DEFAULT_POWER_KW = 1.02
+HOT_WATER_SHIFT_DEFAULT_DAILY_KWH = 6.0
+HOT_WATER_SHIFT_DEFAULT_POWER_KW = 3.6
+
+controlled_avg_daily_kwh_default = None
+controlled_day_count_default = 0
+hot_water_shift_daily_default = HOT_WATER_SHIFT_DEFAULT_DAILY_KWH
+try:
+    if (
+        isinstance(df_int_base, pd.DataFrame)
+        and not df_int_base.empty
+        and {"register", "timestamp", "kwh"}.issubset(df_int_base.columns)
+    ):
+        _df_load_defaults = df_int_base.copy()
+        _df_load_defaults["timestamp"] = pd.to_datetime(_df_load_defaults["timestamp"], errors="coerce")
+        _df_load_defaults["register"] = _df_load_defaults["register"].astype(str)
+        _df_load_defaults["kwh"] = pd.to_numeric(_df_load_defaults["kwh"], errors="coerce").fillna(0.0).astype(float)
+        _dataset_days = int(_df_load_defaults["timestamp"].dropna().dt.normalize().nunique())
+        _controlled_total = float(
+            _df_load_defaults.loc[_df_load_defaults["register"].isin(CONTROLLED_REGS), "kwh"].sum()
+        )
+        if _dataset_days > 0 and _controlled_total > 0.0:
+            controlled_day_count_default = int(_dataset_days)
+            controlled_avg_daily_kwh_default = float(_controlled_total / _dataset_days)
+            hot_water_shift_daily_default = max(
+                float(controlled_avg_daily_kwh_default) - float(POOL_SHIFT_DEFAULT_DAILY_KWH),
+                0.0,
+            )
+except Exception:
+    controlled_avg_daily_kwh_default = None
+    controlled_day_count_default = 0
+    hot_water_shift_daily_default = HOT_WATER_SHIFT_DEFAULT_DAILY_KWH
+
+hot_water_shift_daily_default = round(float(hot_water_shift_daily_default), 1)
+if "_load_shift_default_migration_v2" not in st.session_state:
+    try:
+        current_hw_daily = float(st.session_state.get("hot_water_shift_daily_kwh", HOT_WATER_SHIFT_DEFAULT_DAILY_KWH))
+    except Exception:
+        current_hw_daily = HOT_WATER_SHIFT_DEFAULT_DAILY_KWH
+    try:
+        current_hw_power = float(st.session_state.get("hot_water_shift_power_kw", HOT_WATER_SHIFT_DEFAULT_POWER_KW))
+    except Exception:
+        current_hw_power = HOT_WATER_SHIFT_DEFAULT_POWER_KW
+    try:
+        current_pool_daily = float(st.session_state.get("pool_shift_daily_kwh", 4.0))
+    except Exception:
+        current_pool_daily = 4.0
+    try:
+        current_pool_power = float(st.session_state.get("pool_shift_power_kw", 1.2))
+    except Exception:
+        current_pool_power = 1.2
+
+    if ("hot_water_shift_daily_kwh" not in st.session_state) or abs(current_hw_daily - HOT_WATER_SHIFT_DEFAULT_DAILY_KWH) < 1e-9:
+        st.session_state["hot_water_shift_daily_kwh"] = float(hot_water_shift_daily_default)
+    if ("hot_water_shift_power_kw" not in st.session_state) or abs(current_hw_power - HOT_WATER_SHIFT_DEFAULT_POWER_KW) < 1e-9:
+        st.session_state["hot_water_shift_power_kw"] = float(HOT_WATER_SHIFT_DEFAULT_POWER_KW)
+    if ("pool_shift_daily_kwh" not in st.session_state) or abs(current_pool_daily - 4.0) < 1e-9:
+        st.session_state["pool_shift_daily_kwh"] = float(POOL_SHIFT_DEFAULT_DAILY_KWH)
+    if ("pool_shift_power_kw" not in st.session_state) or abs(current_pool_power - 1.2) < 1e-9:
+        st.session_state["pool_shift_power_kw"] = float(POOL_SHIFT_DEFAULT_POWER_KW)
+    st.session_state["_load_shift_default_migration_v2"] = True
+
 with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False):
     st.caption(
         "Moves selected appliance energy out of the chosen source register and into a timer window across the app. "
         "Inside that window, export is reduced first and any remainder becomes general import."
     )
     st.caption("Optional infrastructure capex below is included when the optimiser selects that load-shift scenario.")
+    if controlled_avg_daily_kwh_default is not None and controlled_day_count_default > 0:
+        st.caption(
+            f"Sanity check from uploaded interval data: controlled load averages about {float(controlled_avg_daily_kwh_default):.1f} kWh/day "
+            f"across {int(controlled_day_count_default)} days. With pool default set to {float(POOL_SHIFT_DEFAULT_DAILY_KWH):.1f} kWh/day, "
+            f"hot-water default is set to about {float(hot_water_shift_daily_default):.1f} kWh/day."
+        )
     st.markdown("**Hot water**")
     hot_water_shift_enabled = st.checkbox(
         "Shift hot water to timer window",
@@ -7068,8 +7175,8 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Hot water kWh/day",
             min_value=0.0,
             max_value=40.0,
-            value=float(st.session_state.get("hot_water_shift_daily_kwh", 6.0)),
-            step=0.5,
+            value=float(st.session_state.get("hot_water_shift_daily_kwh", hot_water_shift_daily_default)),
+            step=0.1,
             key="hot_water_shift_daily_kwh",
             disabled=not hot_water_shift_enabled,
         )
@@ -7101,7 +7208,7 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Hot water max power (kW)",
             min_value=0.1,
             max_value=20.0,
-            value=float(st.session_state.get("hot_water_shift_power_kw", 3.6)),
+            value=float(st.session_state.get("hot_water_shift_power_kw", HOT_WATER_SHIFT_DEFAULT_POWER_KW)),
             step=0.1,
             key="hot_water_shift_power_kw",
             disabled=not hot_water_shift_enabled,
@@ -7142,8 +7249,8 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Pool kWh/day",
             min_value=0.0,
             max_value=40.0,
-            value=float(st.session_state.get("pool_shift_daily_kwh", 4.0)),
-            step=0.5,
+            value=float(st.session_state.get("pool_shift_daily_kwh", POOL_SHIFT_DEFAULT_DAILY_KWH)),
+            step=0.1,
             key="pool_shift_daily_kwh",
             disabled=not pool_shift_enabled,
         )
@@ -7175,8 +7282,8 @@ with st.sidebar.expander("Global load shifting model (all tabs)", expanded=False
             "Pool max power (kW)",
             min_value=0.1,
             max_value=20.0,
-            value=float(st.session_state.get("pool_shift_power_kw", 1.2)),
-            step=0.1,
+            value=float(st.session_state.get("pool_shift_power_kw", POOL_SHIFT_DEFAULT_POWER_KW)),
+            step=0.01,
             key="pool_shift_power_kw",
             disabled=not pool_shift_enabled,
             help="Used to cap how much pool energy can fit inside the timer window each interval.",
@@ -9114,6 +9221,7 @@ if show_battery_only:
                 "joint_modelled_azimuth_deg": round(float(st.session_state.get("joint_modelled_azimuth_deg", 0.0)), 4),
                 "joint_modelled_losses_pct": round(float(st.session_state.get("joint_modelled_losses_pct", 14.0)), 4),
                 "joint_assume_no_existing_export": bool(st.session_state.get("joint_assume_no_existing_export", False)),
+                "battery_dispatch_model_version": "e1_only_v1",
             }
             joint_signature_hash_current = _stable_json_digest(joint_signature_current)
             joint_checkpoint_path_current = _joint_optimizer_checkpoint_path(joint_signature_hash_current)
@@ -11350,6 +11458,7 @@ if show_battery_only:
 
                     best_profile_df = None
                     best_profile_solar = None
+                    best_profile_battery = None
                     best_profile_solar_source = ""
                     try:
                         best_plan_obj_profile = next(
@@ -11428,21 +11537,40 @@ if show_battery_only:
                                     batt_best_profile,
                                     solar_profile=best_profile_solar,
                                 )
+                                best_profile_battery = wide_best_profile_adj.copy()
                                 best_profile_df = _intervals_long_from_wide(wide_best_profile_adj)
                     except Exception:
                         best_profile_df = None
                         best_profile_solar = None
+                        best_profile_battery = None
 
                     if isinstance(best_profile_df, pd.DataFrame) and not best_profile_df.empty:
                         st.markdown("**Average daily profile (best optimised scenario):**")
+                        show_best_battery_flows = False
+                        if (
+                            best_battery_kwh is not None
+                            and float(best_battery_kwh) > 0.0
+                            and isinstance(best_profile_battery, pd.DataFrame)
+                            and not best_profile_battery.empty
+                        ):
+                            show_best_battery_flows = st.toggle(
+                                "Show battery charge/discharge",
+                                value=False,
+                                key="joint_profile_show_battery_flows",
+                                help="Adds optimiser-modelled battery charge and discharge traces to the 24-hour profile.",
+                            )
                         plot_average_24hr_profile_import_export(
                             best_profile_df,
                             solar_profile=best_profile_solar,
+                            battery_profile=best_profile_battery,
+                            show_battery_flows=show_best_battery_flows,
                         )
                         st.caption(
                             "Uses the optimiser-selected setup after the active EV model, solar production, load shifting, "
                             "and battery dispatch adjustments. The chart shows average production, imports, exports, and controlled load."
                         )
+                        if show_best_battery_flows:
+                            st.caption("Battery charge/discharge traces reflect the optimiser-modelled dispatch for the winning battery size.")
                         if best_profile_solar_source:
                             st.caption(
                                 f"Solar production trace shown here uses the {best_profile_solar_source} for the optimiser-selected solar size."
